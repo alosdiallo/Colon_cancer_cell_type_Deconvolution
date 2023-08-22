@@ -1,0 +1,462 @@
+---
+title: "Sabin_DH_analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load libraries
+```{r}
+.libPaths("/dartfs-hpc/rc/lab/V/VaickusL/anaconda_installation/envs/R2/lib/R/library")
+library(minfi)
+library(pheatmap)
+library(tidyverse)
+```
+
+# visualize cell types
+```{r}
+pheatmap(DHColon_HTD,show_colnames=T,show_rownames = F,scale = 'column', annotation_row=covar.data %>% select(MLH1,age,sex,any_mets,Distant_Mets,ln_only))
+```
+# limited heatmaps
+```{r}
+# distant metastasis
+pheatmap(mat = DHColon_HTD,
+         show_colnames = T,show_rownames = F,
+         scale = 'column',
+         annotation_row = covar.data %>% select(Distant_Mets) %>% rename("Distant Mets" = Distant_Mets))
+# lymph node metastatsis
+pheatmap(mat = DHColon_HTD,
+         show_colnames = T,show_rownames = F,
+         scale = 'column',
+         annotation_row = covar.data %>% select(ln_only) %>% rename("LymphNode Mets" = ln_only))
+# any metastasis
+pheatmap(mat = DHColon_HTD,
+         show_colnames = T,show_rownames = F,
+         scale = 'column',
+         annotation_row = covar.data %>% select(any_mets) %>% rename("Any Mets" = any_mets))
+# MLH1 mutation (Lynch Syndrome)
+pheatmap(mat = DHColon_HTD,
+         show_colnames = T,show_rownames = F,
+         scale = 'column',
+         annotation_row = covar.data %>% select(MLH1) %>% rename("Lynch" = MLH1))
+# demographic
+pheatmap(mat = DHColon_HTD,
+         show_colnames = T,show_rownames = F,
+         scale = 'column',
+         annotation_row = covar.data %>% select(age, sex))
+```
+
+
+# boxplot of mets vs cell types
+```{r}
+df.cell <- DHColon_HTD
+df.cell$patient <- rownames(df.cell)
+df.cell <- merge(df.cell,covar.data,on="patient")
+df.cell %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% filter(Distant_Mets==0) %>% ggplot(aes(x=factor(name),y=value,color=factor(ln_only))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+df.cell %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% ggplot(aes(x=factor(name),y=value,color=factor(any_mets))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+```
+
+# analysis of Distant Mets and Endothelial cells
+```{r}
+# https://www.r-econometrics.com/methods/hcrobusterrors/
+
+# Load libraries
+library("lmtest")
+library("sandwich")
+library("zoo")
+library(emmeans)
+
+# estimate models
+uni_model = glm(formula = Distant_Mets ~ Endothelial*MLH1, data = df.cell, family = binomial)
+uni_model = glm(formula = Distant_Mets ~ Endothelial, data = df.cell, family = binomial)
+
+uni_model2 = glm(formula = Distant_Mets ~ NK, data = df.cell, family = binomial)
+multi_model = glm(formula = Distant_Mets ~ Endothelial + NK + Bmem, data = df.cell, family = binomial)
+
+# check models (non robust)
+summary(uni_model)
+summary(uni_model2)
+summary(multi_model)
+
+# check models (robust)
+coeftest(uni_model, vcov = vcovHC(uni_model, type = "HC0"))
+coeftest(multi_model, vcov = vcovHC(multi_model, type = "HC0"))
+
+# F tests
+anova(uni_model, multi_model)
+waldtest(uni_model, multi_model, vcov = vcovHC(multi_model, type = "HC0"))
+
+# emmeans
+# rg<-ref_grid(uni_model,at=list(Endothelial=c(0,1)))
+# em<-emmeans(rg,~Endothelial|MLH1)#,var="Endothelial"
+# em_cont<-contrast(em)
+# summary(em)
+
+summary(uni_model)
+em<-emtrends(uni_model,~Endothelial|MLH1,var="Endothelial")
+test(em)
+
+wilcox.test(Endothelial~Distant_Mets,data=df.cell)
+wilcox.test(Endothelial~Distant_Mets,data=df.cell %>% filter(MLH1==1))
+wilcox.test(Endothelial~Distant_Mets,data=df.cell %>% filter(MLH1==0))
+#### NEXT STEPS
+## more similar analysis on more variables
+# MLH1 on Distant or Any Mets
+# Endothelial on Any Mets
+# Full model using all cell types on mets
+## new models
+# logit
+# M values?
+# mean standardized beta values?
+
+# not used ?
+beta.val.standard <- data.frame(beta.val.filtered) %>% mutate_all(~(scale(.) %>% as.vector))
+# used
+DHColon_standard <- data.frame(DHColon_HTD) %>% mutate_all(~(scale(.) %>% as.vector))
+# new df.cell
+df.cell.standard <- DHColon_standard
+df.cell.standard$patient <- rownames(df.cell.standard)
+df.cell.standard <- merge(df.cell.standard,covar.data,on="patient")
+df.cell.standard %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% filter(Distant_Mets==0) %>% ggplot(aes(x=factor(name),y=value,color=factor(ln_only))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+df.cell.standard %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% ggplot(aes(x=factor(name),y=value,color=factor(any_mets))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+# estimate models
+standard_model = glm(formula = Distant_Mets ~ Endothelial*MLH1, data = df.cell.standard , family = binomial)# %>% filter(!ln_only)
+standard_model = glm(formula = ln_only ~ Endothelial*MLH1, data = df.cell %>% filter(!Distant_Mets) , family = binomial)
+
+# check models (non robust)
+summary(standard_model)
+em<-emtrends(standard_model,~Endothelial|MLH1,var="Endothelial")
+test(em)
+
+wilcox.test(Endothelial~Distant_Mets,data=df.cell)
+wilcox.test(Endothelial~Distant_Mets,data=df.cell %>% filter(MLH1==1))
+wilcox.test(Endothelial~Distant_Mets,data=df.cell %>% filter(MLH1==0))
+
+
+```
+
+
+# visualize beta values
+```{r}
+pheatmap(beta.val.filtered[1:10000,],show_colnames=F,show_rownames = F, annotation_col=covar.data %>% select(MLH1,age,sex,any_mets,Distant_Mets,ln_only),treeheight_row=0)
+```
+## hierarchical sequestering
+# library 1 (Tumor vs. Nontumor)
+```{r}
+DHColon_L1 <- DHColon_HTD %>% transmute(tumor = Tumor,
+                                        nontumor = select(.,2:15) %>% rowSums())
+df.cell.L1 <- DHColon_L1
+df.cell.L1$patient <- rownames(df.cell.L1)
+df.cell.L1 <- merge(df.cell.L1,covar.data,on="patient")
+```
+# library 2 (Tumor, Angiogenic, Immune)
+```{r}
+DHColon_L2 <- DHColon_HTD %>% transmute(tumor = Tumor,
+                                        angiogenic = select(.,2:4) %>% rowSums(),
+                                        immune = select(.,5:15) %>% rowSums())
+df.cell.L2 <- DHColon_L2
+df.cell.L2$patient <- rownames(df.cell.L2)
+df.cell.L2 <- merge(df.cell.L2,covar.data,on="patient")
+```
+# library 3 (Tumor, Endothelial, Epithelial, Stromal, Myeloid, Lymphocyte)
+```{r}
+DHColon_L3 <- DHColon_HTD %>% transmute(tumor = Tumor,
+                                        endothelial = Endothelial,
+                                        epithelial = Epithelial,
+                                        stromal = Stromal,
+                                        myeloid = select(.,5:12) %>% rowSums(),
+                                        lymphocyte = select(.,13:15) %>% rowSums())
+df.cell.L3 <- DHColon_L3
+df.cell.L3$patient <- rownames(df.cell.L3)
+df.cell.L3 <- merge(df.cell.L3,covar.data,on="patient")
+```
+# library 4 (Tumor, Endothelial, Epithelial, Stromal, Granulocyte, NK, B Cell, T Cell)
+```{r}
+DHColon_L4 <- DHColon_HTD %>% transmute(tumor = Tumor,
+                                        endothelial = Endothelial,
+                                        epithelial = Epithelial,
+                                        stromal = Stromal,
+                                        `B cell` = Bnv + Bmem,
+                                        `T cell` = select(.,7:11) %>% rowSums(),
+                                        NK = NK,
+                                        granulocyte = select(.,13:15) %>% rowSums())
+df.cell.L4 <- DHColon_L4
+df.cell.L4$patient <- rownames(df.cell.L4)
+df.cell.L4 <- merge(df.cell.L4,covar.data,on="patient")
+
+```
+
+# visualize PCA for cell mixtures
+```{r}
+Z <- prcomp(as.matrix(t(DHColon_HTD)))
+Z <- as.data.frame(Z$rotation[,c("PC1","PC2")])
+colnames(Z) <- c("x","y")
+Z$patient <- rownames(Z)
+Z <- merge(Z,covar.data,on="patient")
+
+ggplot(Z,aes(x,y,color=factor(MLH1))) + geom_point() + theme_classic() 
+
+ggplot(Z,aes(x,y,color=factor(any_mets))) + geom_point() + theme_classic()
+```
+
+
+# Run EWAS, with example cell type proportion adjustment
+```{r}
+library(limma)
+M.val.filtered <- ifelse(beta.val.filtered>=1,1-1E-6,ifelse(beta.val.filtered<=0,1E-6,beta.val.filtered))
+M.val.filtered <- log(M.val.filtered)-log(1-M.val.filtered)
+X.cell<-model.matrix(~any_mets+age+sex+MLH1+Tumor+Epithelial+Endothelial+Stromal+Treg,data=df.cell) # note: add more cell types!
+# %>% filter(!Distant_Mets)
+X.nocell<-model.matrix(~any_mets+age+sex+MLH1,data=df.cell)
+block<-NULL
+corfit <- duplicateCorrelation(M.val.filtered[1:10000,], X.cell, block=block, ndups=2)
+fit<-lmFit(M.val.filtered,X.cell,block=block,correlation=corfit$consensus)
+eb <- eBayes(fit)
+res <- topTable(eb,coef=2,adjust="BH",n=Inf)
+res[1:10,]
+```
+
+# Visualize Volcano
+```{r}
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(EnhancedVolcano)
+strip.names<-function(x){
+  return(sapply(strsplit(x,";"), function(x) ifelse(length(x)>0,getElement(x,1),"")))
+}
+
+cpg2gene<-getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)[,c("Name","UCSC_RefGene_Name")]
+cpg2gene<-setNames(strip.names(cpg2gene$UCSC_RefGene_Name),cpg2gene$Name)
+gene.names<-cpg2gene[rownames(res)]
+
+EnhancedVolcano(res,
+    lab = gene.names,
+    x = 'logFC',
+    y = 'P.Value',
+    pCutoff = 0.05/10000,
+    FCcutoff = 1.2,
+    drawConnectors = T,
+    widthConnectors = 0.25)
+```
+
+# Pathway Analysis, WIP
+```{r}
+library(missMethyl)
+gst <- gometh(sig.cpg = rownames(res %>% filter(P.Value<=0.001)), all.cpg = rownames(res), collection = "KEGG", plot.bias = TRUE, prior.prob = TRUE)
+gst %>% filter(P.DE<=0.05)
+```
+
+# Run CellDMC, example with 10000 CpGs
+```{r}
+library(EpiDISH)
+ma.B.new<-beta.val.filtered[1:10000,]
+cell.dmc.res<-CellDMC(
+  ma.B.new,
+  pheno.v=covar.data$ln_only,
+  frac.m=as.matrix(DHColon_HTD)[,colMeans(DHColon_HTD>5)>=0.05]/100,
+  adjPMethod = "fdr",
+  adjPThresh = 5e-2,
+  cov.mod = model.matrix(~.,df.cell %>% select(age,sex,MLH1))[,-1],
+  sort = FALSE,
+  mc.cores = 1
+)
+dmc.interaction.results<-cell.dmc.res$dmct[apply(cell.dmc.res$dmct,1,function(x) any(x!=0)),]
+dmc.interaction.results
+```
+
+# Cell DMC Results
+```{r}
+col_colors<-covar.data %>% select(MLH1,age,sex,any_mets,Distant_Mets,ln_only)
+row_colors<-dmc.interaction.results
+rownames(row_colors)<-rownames(dmc.interaction.results)
+pheatmap(ma.B.new[rownames(dmc.interaction.results),],
+         annotation_row=as.data.frame(row_colors),
+         annotation_col=as.data.frame(col_colors),
+         show_rownames = F, show_colnames = F, cellwidth=5, cellheight=15, fontsize=6,treeheight_col=0,treeheight_row=0,legend=F,annotation_legend=F)
+```
+
+
+# load TCGA data
+```{r}
+# library(ChAMP)
+median.impute<-T
+cell_type_names<-c("Tumor","Endothelial","Epithelial","Stromal","Bnv","Bmem","CD4nv","CD4mem","Treg","CD8nv","CD8mem","Mono","DC","NK","Bas","Eos","Neu")
+tcga.data<-readRDS("TCGA_data.rds")
+beta.val<-t(as.matrix(tcga.data$dnam))
+if (median.impute){
+  beta.val<-apply(beta.val,1,function(x){
+    x[is.na(x)]<-median(x,na.rm=T)
+    x
+  })
+  beta.val<-t(beta.val)
+} else {
+  beta.val<-champ.impute(beta.val)
+}
+tcga.data$pheno$ln_mets<-tcga.data$pheno$ajcc_pathologic_n!="N0"
+# seems like all patients have LN METS, hmm... will investigate
+cell.type.limit.df<-tcga.data$cell_types$COAD_Deconv6 %>% select(sex,age,cell_type_names)#select(gender, ajcc_pathologic_n, ajcc_pathologic_m, ln_mets)
+pheno<-cbind(tcga.data$pheno,cell.type.limit.df)
+pheno$patient<-rownames(pheno)
+msi_results<-readRDS("msi_tcga.rds")
+msi_results$patient<-msi_results$bcr_patient_barcode
+msi_results$msi<-msi_results$mononucleotide_and_dinucleotide_marker_panel_analysis_status
+pheno<-pheno %>% merge(msi_results,by="patient",all.x=T)
+rownames(pheno)<-pheno$patient
+sample.filter<-(rowSums(is.na(pheno %>% select(cell_type_names)))==0)
+beta.val<-beta.val[,sample.filter]
+pheno<-pheno[sample.filter,]
+pheno<-pheno[colnames(beta.val),]
+
+mad.vals<-apply(beta.val,1,mad)
+beta.val.filtered<-beta.val[names(sort(rank(-mad.vals))[1:10000]),]
+```
+
+# plot cell types
+```{r}
+pheno %>% pivot_longer(cols=cell_type_names) %>% ggplot(aes(x=factor(name),y=value,color=factor(ln_mets))) + geom_boxplot()  + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+pheatmap(pheno %>% select(cell_type_names),show_colnames=T,show_rownames = F,scale = 'column', annotation_row=pheno %>% select(ln_mets,msi) %>% mutate(ln_mets=as.numeric(ln_mets)))
+```
+
+# plot beta values
+```{r}
+pheatmap(beta.val.filtered[1:10000,],show_colnames=F,show_rownames = F, annotation_col=pheno %>% select(ln_mets,msi) %>% mutate(ln_mets=as.numeric(ln_mets)),treeheight_row=0)
+```
+
+# visualize PCA for cell mixtures
+```{r}
+Z <- prcomp(as.matrix(t(pheno %>% select(cell_type_names))))
+Z<-as.data.frame(Z$rotation[,c("PC1","PC2")])
+colnames(Z)<-c("x","y")
+Z$patient<-rownames(Z)
+Z<-merge(Z,pheno,on="patient")
+
+ggplot(Z,aes(x,y,color=factor(ln_mets))) + geom_point() + facet_grid(~as.factor(msi)) + theme_classic() 
+
+```
+
+# visualize PCA for beta values
+```{r}
+Z <- prcomp(as.matrix(beta.val.filtered))
+Z<-as.data.frame(Z$rotation[,c("PC1","PC2")])
+colnames(Z)<-c("x","y")
+Z$patient<-rownames(Z)
+Z<-merge(Z,pheno,on="patient")
+
+ggplot(Z,aes(x,y,color=factor(ln_mets))) + geom_point()  + facet_grid(~as.factor(msi)) +  theme_classic()
+
+```
+
+# Run EWAS, with example cell type proportion adjustment
+```{r}
+library(limma)
+M.val.filtered <- ifelse(beta.val.filtered>=1,1-1E-6,ifelse(beta.val.filtered<=0,1E-6,beta.val.filtered))
+M.val.filtered <- log(M.val.filtered)-log(1-M.val.filtered)
+X.cell<-model.matrix(~ln_mets+age+gender+msi+Tumor+Epithelial+Endothelial+Stromal+Treg,data=pheno) # note: add more cell types!
+X.nocell<-model.matrix(~ln_mets+age+gender+msi,data=pheno)
+block<-NULL
+corfit <- duplicateCorrelation(M.val.filtered[1:10000,], X.cell, block=block, ndups=2)
+fit<-lmFit(M.val.filtered,X.cell,block=block,correlation=corfit$consensus)
+eb <- eBayes(fit)
+res <- topTable(eb,coef=2,adjust="BH",n=Inf)
+res[1:10,]
+```
+
+# Visualize Volcano
+```{r}
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(EnhancedVolcano)
+strip.names<-function(x){
+  return(sapply(strsplit(x,";"), function(x) ifelse(length(x)>0,getElement(x,1),"")))
+}
+
+cpg2gene<-getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)[,c("Name","UCSC_RefGene_Name")]
+cpg2gene<-setNames(strip.names(cpg2gene$UCSC_RefGene_Name),cpg2gene$Name)
+gene.names<-cpg2gene[rownames(res)]
+
+EnhancedVolcano(res,
+    lab = gene.names,
+    x = 'logFC',
+    y = 'P.Value',
+    pCutoff = 0.05/10000,
+    FCcutoff = 0.5,
+    drawConnectors = T,
+    widthConnectors = 0.25)
+```
+
+# Pathway Analysis, WIP
+```{r}
+library(missMethyl)
+gst <- gometh(sig.cpg = rownames(res %>% filter(P.Value<=0.001)), all.cpg = rownames(res), collection = "KEGG", plot.bias = TRUE, prior.prob = TRUE)
+gst %>% filter(P.DE<=0.05)
+```
+
+# Run CellDMC, example with 10000 CpGs
+```{r}
+library(EpiDISH)
+select<-dplyr::select
+ma.B.new<-beta.val.filtered[1:10000,]
+cell.dmc.res<-CellDMC(
+  ma.B.new,
+  pheno.v=pheno$ln_mets,
+  frac.m=as.matrix(pheno %>% select(cell_type_names))[,colMeans((pheno %>% select(cell_type_names))>5)>=0.05]/100,
+  adjPMethod = "fdr",
+  adjPThresh = 5e-2,
+  cov.mod = model.matrix(~.,pheno %>% select(age,gender))[,-1],
+  sort = FALSE,
+  mc.cores = 1
+)
+dmc.interaction.results<-cell.dmc.res$dmct[apply(cell.dmc.res$dmct,1,function(x) any(x!=0)),]
+dmc.interaction.results
+```
+
+# Cell DMC Results
+```{r}
+col_colors<-pheno %>% select(age,gender,ln_mets) %>% mutate(ln_mets=as.numeric(ln_mets))
+row_colors<-dmc.interaction.results
+rownames(row_colors)<-rownames(dmc.interaction.results)
+pheatmap(ma.B.new[rownames(dmc.interaction.results),],
+         annotation_row=as.data.frame(row_colors),
+         annotation_col=as.data.frame(col_colors),
+         show_rownames = F, show_colnames = F, cellwidth=2, cellheight=15, fontsize=6,treeheight_col=0,treeheight_row=0,legend=F,annotation_legend=F)
+```
+
+# OLD CODE
+```{r}
+#TCGA data here
+# cell types, similar covariates, matching beta, etc. metaanalysis
+# derive interactions to be tested in DH data
+if (F){
+library(reticulate)
+options(reticulate.conda_binary = "/dartfs-hpc/rc/lab/V/VaickusL/anaconda_installation/bin/conda")
+use_condaenv("detectron")
+pd<-import("pandas")
+tcga.data<-pd$read_pickle("../tcga_colon_dnam/dnam_data_TCGA_HiTIMED.pkl")
+for (nm in names(tcga.data$cell_types)){
+  tcga.data$cell_types[[nm]]<-py_to_r(tcga.data$cell_types[[nm]])
+}
+saveRDS(tcga.data,"TCGA_data.rds")
+}
+```
+
+# get MSI data
+```{r}
+library(TCGAbiolinks)
+query <- GDCquery(project = "TCGA-COAD", 
+                  data.category = "Other",
+                  legacy = TRUE,
+                  access = "open",
+                  data.type = "Auxiliary test",
+                  )  
+GDCdownload(query)
+msi_results <- GDCprepare_clinic(query, "msi")
+rownames(msi_results)<-msi_results$bcr_patient_barcode
+saveRDS(msi_results,"msi_tcga.rds")
+# TODO: save and add to pheno after matching columns
+```
+
+

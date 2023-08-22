@@ -1,0 +1,198 @@
+---
+title: "Sabin_TCGA_load"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load libraries
+```{r}
+.libPaths("/dartfs-hpc/rc/lab/V/VaickusL/anaconda_installation/envs/R2/lib/R/library")
+library(minfi)
+library(pheatmap)
+library(tidyverse)
+library(IlluminaHumanMethylationEPICmanifest)
+```
+
+# load TCGA pickle file into .rds file
+```{r}
+
+library(reticulate)
+use_python("/dartfs-hpc/rc/home/5/f004gj5/.conda/envs/py37/bin/python")
+pd<-import("pandas")
+tcga.data<-pd$read_pickle("dnam_data_TCGA_HiTIMED_v2.pkl")
+
+for (nm in names(tcga.data$cell_types)) {
+  tcga.data$cell_types[[nm]]<-py_to_r(tcga.data$cell_types[[nm]])
+}
+saveRDS(tcga.data,"TCGA_data.rds")
+```
+
+# load TCGA data 
+```{r}
+tcga.data <- readRDS("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/dh_colon_dnam/TCGA_data.rds")
+tcga.dnam <- tcga.data[["dnam"]]
+tcga.pheno <- tcga.data[["pheno"]]
+tcga.cell <- tcga.data[["cell_types"]]
+rm(tcga.data)
+```
+
+```{r}
+msi_dat<-readRDS("msi_tcga.rds")
+tcga.cell$COAD_Deconv1#$MSS
+```
+
+
+```{r}
+tcga.cells.final<-list()
+
+for (nm in names(tcga.cell)){
+  tcga.cells.final[[nm]]<-tcga.cell[[nm]][,(which(colnames(tcga.cell[[nm]])=="karyotype")+1):ncol(tcga.cell[[nm]])]#[,(ncol(tcga.cell$COAD_Deconv6)-16):ncol(tcga.cell$COAD_Deconv6)]
+}
+tcga.cells.final$COAD_Deconv6
+```
+
+# prep TCGA cell and MSI Data
+```{r}
+# grab msi and tcga cell data
+msi_dat <- msi_dat %>% rename(msi_status = 3)
+tcga.cell.prop = tcga.cells.final[[6]]
+
+# merge
+tcga.data <- merge(tcga.cell.prop, msi_dat,
+                   by = 'row.names')
+rownames(tcga.data) <- tcga.data[,1]
+tcga.data[,1] <- NULL
+
+# clean
+tcga.data <- tcga.data %>%
+  select(1:17,20) %>% 
+  filter(msi_status != "Indeterminate") %>%
+  na.omit() %>% 
+  mutate("MLH1" = ifelse(msi_status == "MSS", 1, 0))
+tcga.data
+
+tcga.mets <- tcga.pheno %>% 
+  mutate("Distant_Mets" = ifelse(tcga.pheno$ajcc_pathologic_m == "M0", 0, 1)) %>% 
+  subset(!(ajcc_pathologic_m %in% c("MX", NaN))) %>% 
+  select(3, 22, Distant_Mets)
+
+tcga.data <- merge(tcga.data, tcga.mets, by = 'row.names')
+
+tcga_cell_data <- tcga.data %>% pivot_longer(cols=colnames(tcga.cell.prop))
+
+
+
+#visualize
+tcga_boxplot <- ggplot(tcga_cell_data, aes(x=factor(name),y=value)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0)) +
+  labs(y = "Proportion", x = "Cell Type", title = "TCGA Cohort") + 
+  # scale_color_manual(name = "Distant Mets", values = c("dodgerblue2", "firebrick2")) +
+  scale_y_continuous(limits = c(0, 60)) +
+  facet_grid(~MLH1)
+# tcga_boxplot
+
+
+tcga_boxplot <- ggplot(tcga_cell_data, aes(x=factor(name),y=value,color=factor(Distant_Mets))) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0)) +
+  labs(y = "Proportion", x = "Cell Type", title = "TCGA Cohort") + 
+  scale_color_manual(name = "Distant Mets", values = c("dodgerblue2", "firebrick2")) +
+  scale_y_continuous(limits = c(0, 60)) +
+  facet_grid(~MLH1)
+#tcga_boxplot
+#ggsave("TCGA_Celltypes_Distant.png", device = "png", path = "./Sabin/", dpi = "retina",
+      # width = 12, height = 6)
+```
+
+
+# clean data
+```{r}
+median.impute <- T
+cell_type_names <- c("Tumor","Endothelial","Epithelial","Stromal","Bnv","Bmem","CD4nv","CD4mem","Treg","CD8nv","CD8mem","Mono","DC","NK","Bas","Eos","Neu")
+tcga.beta.val <- t(as.matrix(tcga.dnam))
+
+if (median.impute) {
+  tcga.beta.val <- apply(tcga.beta.val,1,function(x){
+    x[is.na(x)] <- median(x,na.rm=T)
+    x
+  })
+  tcga.beta.val <- t(tcga.beta.val)
+} else {
+  tcga.beta.val <- champ.impute(tcga.beta.val)
+}
+tcga.data$pheno$ln_mets <- tcga.data$pheno$ajcc_pathologic_n!="N0"
+# seems like all patients have LN METS, hmm... will investigate
+cell.type.limit.df <- tcga.data$cell_types$COAD_Deconv6 %>% select(sex,age,cell_type_names) #select(gender, ajcc_pathologic_n, ajcc_pathologic_m, ln_mets)
+tcga.pheno <- cbind(tcga.data$pheno,cell.type.limit.df)
+tcga.pheno$patient <- rownames(tcga.pheno)
+msi_results <- readRDS("msi_tcga.rds")
+msi_results$patient <- msi_results$bcr_patient_barcode
+msi_results$msi <- msi_results$mononucleotide_and_dinucleotide_marker_panel_analysis_status
+pheno<-pheno %>% merge(msi_results,by="patient",all.x=T)
+rownames(pheno) <- pheno$patient
+sample.filter <- (rowSums(is.na(pheno %>% select(cell_type_names)))==0)
+tcga.beta.val <- tcga.beta.val[,sample.filter]
+pheno <- pheno[sample.filter,]
+pheno <- pheno[colnames(tcga.beta.val),]
+
+tcga.mad.vals <- apply(tcga.beta.val,1,mad)
+tcga.beta.val.filtered <- tcga.beta.val[names(sort(rank(-tcga.mad.vals))[1:10000]),]
+
+saveRDS(tcga.beta.val, file="Sabin/TCGA.beta.full.rds")
+saveRDS(tcga.beta.val.filtered, file="Sabin/TCGA.beta.rds")
+rm(tcga.beta.val)
+rm(tcga.mad.vals)
+
+```
+
+# get Beta Values
+# filter to the top 10,000 sites based on median absolute deviation for now, will expand later
+```{r}
+beta.val <- getBeta(rgset)
+mad.vals <- apply(beta.val,1,mad)
+beta.val.filtered <- beta.val[names(sort(rank(-mad.vals))[1:10000]),]
+beta.val.expanded <- beta.val[names(sort(rank(-mad.vals))[1:350000]),]
+```
+
+# boxplot of mets vs cell types
+```{r}
+library(reticulate)
+# options(reticulate.conda_binary = "~/.conda/condabin/conda")
+# options(reticulate.conda_binary = "/dartfs-hpc/rc/home/5/f004gj5/anaconda3/bin/conda")
+# use_condaenv("pyth_v2", conda="/dartfs-hpc/rc/home/5/f004gj5/anaconda3/bin/conda")
+use_python("/dartfs-hpc/rc/home/5/f004gj5/.conda/envs/py37/bin/python")
+pd<-import("pandas")
+tcga.data<-pd$read_pickle("dnam_data_TCGA_HiTIMED_v2.pkl")
+
+for (nm in names(tcga.data$cell_types)) {
+  tcga.data$cell_types[[nm]]<-py_to_r(tcga.data$cell_types[[nm]])
+}
+saveRDS(tcga.data,"TCGA_data.rds")
+
+
+df.cell <- DHColon_HTD
+df.cell$patient <- rownames(df.cell)
+df.cell <- merge(df.cell,covar.data,on="patient")
+df.cell %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% filter(Distant_Mets==0) %>% ggplot(aes(x=factor(name),y=value,color=factor(ln_only))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+df.cell %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% ggplot(aes(x=factor(name),y=value,color=factor(any_mets))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+tcga_cell_data <- 
+
+
+plot <- ggplot(tcga_cell_data, aes(x=factor(name),y=value,color=factor(Distant_Mets))) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0)) +
+  labs(y = "Proportion", x = "Cell Type", title = "TCGA Cohort") + 
+  scale_color_discrete(name = "Color")
+plot
+ggsave("TCGA_Celltypes_Distant.png", device = "png", path = "./Sabin/")
+```
+

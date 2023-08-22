@@ -1,0 +1,72 @@
+---
+title: "Sabin_DH_load"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load libraries
+```{r}
+.libPaths("/dartfs-hpc/rc/lab/V/VaickusL/anaconda_installation/envs/R2/lib/R/library")
+library(minfi)
+library(pheatmap)
+library(tidyverse)
+library(IlluminaHumanMethylationEPICmanifest)
+```
+
+# load DH methylation data and cell types
+```{r}
+load("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/dh_colon_dnam/DH_Colon_HiTIMED.RDATA")
+DHColon_HTD <- DHColon_HTD[,colSums(DHColon_HTD)>0]
+```
+
+# load covariates
+```{r}
+covar.data <- read.csv("Colon_DH_manifest.csv")
+covar.data$patient <- paste(covar.data$Sentrix_ID,covar.data$Sentrix_Position,sep="_")
+rownames(covar.data) <- covar.data$patient
+```
+
+# get Beta Values
+# full beta val sample and slightly smaller sample (top 800k based on Median Absolute Deviation)
+```{r}
+beta.val.full <- getBeta(rgset)
+mad.vals <- apply(beta.val.full,1,mad)
+# beta.val.filtered <- beta.val[names(sort(rank(-mad.vals))[1:10000]),]
+beta.val.expanded <- beta.val[names(sort(rank(-mad.vals))[1:350000]),]
+beta.val <- beta.val.full[names(sort(rank(-mad.vals))[1:800000]),]
+saveRDS(beta.val.full, file="Sabin/DH.beta.full.rds")
+saveRDS(beta.val, file="Sabin/DH.beta.rds")
+rm(beta.val.full)
+rm(mad.vals)
+```
+
+# boxplot of mets vs cell types
+```{r}
+library(patchwork)
+
+df.cell <- DHColon_HTD
+df.cell$patient <- rownames(df.cell)
+df.cell <- merge(df.cell,covar.data,on="patient")
+df.cell %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% filter(Distant_Mets==0) %>% ggplot(aes(x=factor(name),y=value,color=factor(ln_only))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+df.cell %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% ggplot(aes(x=factor(name),y=value,color=factor(any_mets))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+dh_cell_data <- df.cell %>% pivot_longer(cols=colnames(DHColon_HTD))
+
+
+dh_boxplot <- ggplot(dh_cell_data %>% filter(!ln_only), aes(x=factor(name),y=value,color=factor(Distant_Mets))) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0)) +
+  labs(y = "Proportion", x = "Cell Type", title = "DHMC Cohort") + 
+  scale_color_manual(name = "Distant Mets", values = c("dodgerblue2", "firebrick2")) +
+  scale_y_continuous(limits = c(0, 60)) +
+  facet_grid(~MLH1)
+dh_boxplot
+ggsave("DH_Celltypes_Distant.png", device = "png", path = "./Sabin/", dpi = "retina",
+       width = 12, height = 6)
+```
+
