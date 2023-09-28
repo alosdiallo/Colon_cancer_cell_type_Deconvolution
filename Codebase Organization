@@ -1,0 +1,11 @@
+Codebase (located in the Dev folder)
+
+Directory: /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/dh_colon_dnam
+
+Sabin_DH_load: loads the Dartmouth Hitchcock Cohort and runs cell type proportion analysis based on Distant Mets and 
+
+Sabin_DH_analysis: heatmaps and boxplots linking mets to variables, then some estimated models linking Endothelial cells to distant mets,  then hierarchical leveling, the rest contains EWAS, cellDMC, PCA etc. but this is older and not up to date. Ignore after hierarchical clustering
+
+Sabin_DH_EWAS: starts with PCA, then EWAS with no cell type adjustment and HiTIMED’s recommended cell type adjustment. Followed by cellDMC and Pathway Analysis all WIP
+
+Results: in DNAm results folder in google drive
