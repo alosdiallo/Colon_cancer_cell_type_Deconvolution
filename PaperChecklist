@@ -1,0 +1,18 @@
+Cell proportions comparisons, by outcome
+  TCGA, DH (QC second check)
+  MSI status, indep MSI
+  Different levels of hierarchy
+  Outcome (distant, ln, any)
+EWAS, by outcome
+  w/ differing levels cell type adjustment, DH/TCGA, etc
+  volcano, relax FDR
+  Venn diagram
+Pathways, by outcome
+  relax FDR
+  comparison w/ w/o cell type
+  and/or genes
+Genomic enrichment, by outcome
+  shores, islands, sea etc
+Overall measures of dysregulation: Methylation dysregulation / REMP / CNA (not mission critical)
+Cell DMC, by outcome
+Relax FDR
