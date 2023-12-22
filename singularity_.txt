@@ -1,0 +1,10 @@
+Log onto singularity 
+
+ssh f006fpk@discovery7.hpcc.dartmouth.edu -L 9929:localhost:9929
+ssh p01  -L 9929:localhost:9929
+cd levy_lab_space/colon_work/
+conda activate R
+export PORT=9929
+export CONDA_PATH=export CONDA_PATH=/dartfs-hpc/rc/home/k/f006fpk/anaconda3/
+
+singularity exec --bind  ${CONDA_PATH}/envs/R --bind $(pwd) /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/singularity_images/rstudio.simg rserver --www-address=127.0.0.1 --www-port ${PORT} --rsession-which-r=${CONDA_PATH}/envs/R/bin/R --rsession-ld-library-path=${CONDA_PATH}/envs/R/lib
