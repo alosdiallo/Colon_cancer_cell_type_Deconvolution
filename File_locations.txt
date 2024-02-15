@@ -1,0 +1,8 @@
+From Josh
+/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/visium_colon_9_27_23/visium_data/st_data/
+/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/projects/all_visium_data/colon/*/data
+/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/data/adatas
+
+From Gokul
+/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/gene_selection/all_genes_filtered/data/adatas
+/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/Colon_ST_Training/gene_selection/all_genes_filtered/scripts/data_preprocessing.ipynb
