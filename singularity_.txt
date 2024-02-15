@@ -5,9 +5,10 @@ ssh p01  -L 9929:localhost:9929
 cd levy_lab_space/colon_work/
 conda activate R
 export PORT=9929
+export APPTAINER_TMPDIR=$(realpath ./tmp_dir/)
 export CONDA_PATH=export CONDA_PATH=/dartfs-hpc/rc/home/k/f006fpk/anaconda3/
 
-singularity exec --bind  ${CONDA_PATH}/envs/R --bind $(pwd) /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/singularity_images/rstudio.simg rserver --www-address=127.0.0.1 --www-port ${PORT} --rsession-which-r=${CONDA_PATH}/envs/R/bin/R --rsession-ld-library-path=${CONDA_PATH}/envs/R/lib
+singularity exec -B ${APPTAINER_TMPDIR}:/tmp --bind  ${CONDA_PATH}/envs/R --bind $(pwd) /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/singularity_images/rstudio.simg rserver --www-address=127.0.0.1 --www-port ${PORT} --rsession-which-r=${CONDA_PATH}/envs/R/bin/R --rsession-ld-library-path=${CONDA_PATH}/envs/R/lib
 
 
 If you get an error: ERROR system error 2 (No such file or directory) [path=/tmp/rstudio-server/secure-cookie-key
