@@ -1,0 +1,26 @@
+,Unnamed: 0,file,deident,MLH1,MSH2,diagnosis,node_stage,age,sex,stage,site,Distant_Mets,surgical,file_new,deident2,updated_blocks
+0,0,6_A8_3,6,0,1,Adenocarcinoma,0,88,F,3,Right Colon,True,00-S-16-14779-A8_3,,,
+1,1,10_A4_3,10,1,1,Adenocarcinoma,0,42,M,3,Sigmoid,False,00-S-16-23962-A4_3,,,
+2,2,11_C4_3,11,1,1,Adenocarcinoma,2a,61,F,3,Cecum,True,00-S-16-24986-C4_3,,,
+3,3,13_A7_2,13,1,1,Adenocarcinoma,0,90,F,3,Cecum,False,00-S-16-27091-A7_2,,,
+4,4,14_A4_3,14,1,1,Adenocarcinoma,0,62,F,3,Sigmoid,False,00-S-16-28130-A4_3,,,
+5,5,19_C15_3,19,1,1,Adenocarcinoma,0,62,F,3,Rectum,False,00-S-16-33974-C15_3,19_C15_3,22.0,C15
+6,6,28_A9_3,28,1,1,Adenocarcinoma,2,74,M,3,Right Colon,False,00-SP-16-45254-A9_3,,,
+7,7,33_A9_3,33,1,1,Adenocarcinoma,0,71,F,3,Rectum,False,00-SP-17-00647-A9_3,33_A9_3,26.0,A9
+8,8,36_B21_3,36,1,1,Adenocarcinoma,1a,80,M,3,Cecum,False,00-SP-17-05552-B21_3,,,
+9,9,38_A5_3,38,1,1,Adenocarcinoma,0,42,M,3,Sigmoid,False,00-SP-17-10077-A5_3,38_A5_3,27.0,A5
+10,10,39_B6_3,39,1,1,Adenocarcinoma,1b,41,M,3,Rectum,True,00-SP-17-13067-B6_3,,,
+11,11,46_A5_3,46,1,1,Adenocarcinoma,1b,81,M,3,Transverse colon,True,00-SP-17-21579-A5_3,,,
+12,12,49_A13_2,49,1,1,Adenocarcinoma,0,68,F,3,Cecum,False,00-SP-17-27241-A13_2,,,
+13,13,53_A3_3,53,1,1,Adenocarcinoma,1a,51,M,3,Rectum,True,10-SP-17-32083-A3_3,,,
+14,14,60_B4_3,60,0,1,Adenocarcinoma,1a,74,M,3,Cecum,False,10-SP-17-40629-B4_3,60_B3_3,0.0,B3
+15,15,66_A19_3,66,1,1,Adenocarcinoma,0,70,M,3,Rectum,False,10-SP-17-47770-A19_3,66_A15_3,2.0,A15
+16,16,68_A3_3,68,0,1,Adenocarcinoma,0,60,M,3,Rectum,True,10-SP-17-49575-A3_3,,,
+17,17,69_B7_3,69,1,1,Adenocarcinoma,1b,62,F,3,Rectum,True,10-SP-17-49579-B7_3,,,
+18,18,80_A12_3,80,1,1,Adenocarcinoma,0,33,F,3,Left Colon,True,10-SP-18-10770-A12_3,,,
+19,19,83_A5_3,83,1,1,Adenocarcinoma,0,73,M,3,Cecum,False,10-SP-18-11878-A5_3,,,
+20,20,85_C21_2,85,1,1,Adenocarcinoma,0,56,M,3,Rectum,False,10-SP-18-15626-C21_2,,,
+21,21,90_A7_3,90,1,1,Adenocarcinoma,0,47,F,3,Right Colon,False,10-SP-18-23696-A7_3,90_A10_3,8.0,A10
+22,22,96_A7_3,96,1,1,Adenocarcinoma,2a,62,M,3,Left Colon,False,10-SP-18-28432-A7_3,,,
+23,23,102_B6_3,102,0,1,Adenocarcinoma,2a,71,F,3,Cecum,False,10-SP-18-34180-B6_3,,,
+24,24,105_B6_3,105,1,1,Adenocarcinoma,0,44,M,3,Rectum,True,10-SP-18-35661-B6_3,,,

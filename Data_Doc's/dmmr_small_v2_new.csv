@@ -1,0 +1,58 @@
+file,deident,MLH1 (Lynch syndrome),MSH2 (Lynch syndrome),diagnosis,node_stage,age,sex,stage,site,Distant_Mets
+0_B4_3,0,1,1,Adenocarcinoma,1a,62,M,3,Sigmoid,FALSE
+2_A3_3,2,1,1,Adenocarcinoma,1b,62,M,3,Rectum,TRUE
+3_A4_3,3,1,1,Adenocarcinoma,0,76,M,3,Left Colon,FALSE
+6_A8_3,6,0,1,Adenocarcinoma,0,88,F,3,Right Colon,TRUE
+10_A4_3,10,1,1,Adenocarcinoma,0,42,M,3,Sigmoid,FALSE
+11_C4_3,11,1,1,Adenocarcinoma,2a,61,F,3,Cecum,TRUE
+13_A7_2,13,1,1,Adenocarcinoma,0,90,F,3,Cecum,FALSE
+14_A4_3,14,1,1,Adenocarcinoma,0,62,F,3,Sigmoid,FALSE
+18_G4_3,18,1,1,Adenocarcinoma,2a,52,M,3,Right colon,TRUE
+19_C15_3,19,1,1,Adenocarcinoma,0,62,F,3,Rectum,FALSE
+21_A8_3,21,1,1,Adenocarcinoma,0,61,M,3,Right Colon,FALSE
+28_A9_3,28,1,1,Adenocarcinoma,2,74,M,3,Right Colon,FALSE
+29_A3_3,29,1,1,Adenocarcinoma,1a,89,F,3,Splenic Flexure,TRUE
+30_A6_3,30,1,1,Adenocarcinoma,0,64,M,3,Cecum,FALSE
+33_A9_3,33,1,1,Adenocarcinoma,0,71,F,3,Rectum,FALSE
+34_A7_3,34,1,1,Adenocarcinoma,0,76,F,3,Hepatic Flexure,FALSE
+36_B21_3,36,1,1,Adenocarcinoma,1a,80,M,3,Cecum,FALSE
+38_A5_3,38,1,1,Adenocarcinoma,0,42,M,3,Sigmoid,FALSE
+39_B6_3,39,1,1,Adenocarcinoma,1b,41,M,3,Rectum,TRUE
+40_B10_3,40,0,1,Adenocarcinoma,1a,71,F,3,Right Colon,FALSE
+46_A5_3,46,1,1,Adenocarcinoma,1b,81,M,3,Transverse colon,TRUE
+47_A5_3,47,1,1,Adenocarcinoma,1a,81,M,3,Right Colon,TRUE
+49_A13_2,49,1,1,Adenocarcinoma,0,68,F,3,Cecum,FALSE
+51_A51_3,51,1,1,Adenocarcinoma,1a,75,M,3,Sigmoid,FALSE
+52_A4_3,52,0,1,Adenocarcinoma,1c,79,M,3,Cecum,FALSE
+53_A3_3,53,1,1,Adenocarcinoma,1a,51,M,3,Rectum,TRUE
+60_B4_3,60,0,1,Adenocarcinoma,1a,74,M,3,Cecum,FALSE
+61_A3_3,61,1,1,Adenocarcinoma,1a,43,F,3,Transverse colon,FALSE
+66_A19_3,66,1,1,Adenocarcinoma,0,70,M,3,Rectum,FALSE
+68_A3_3,68,0,1,Adenocarcinoma,0,60,M,3,Rectum,TRUE
+69_B7_3,69,1,1,Adenocarcinoma,1b,62,F,3,Rectum,TRUE
+72_A19_3,72,0,1,Adenocarcinoma,0,80,M,3,Left Colon,FALSE
+73_A10_3,73,1,1,Adenocarcinoma,0,66,M,3,Sigmoid,FALSE
+74_A3_3,74,1,1,Adenocarcinoma,0,81,F,3,Transverse colon,FALSE
+80_A12_3,80,1,1,Adenocarcinoma,0,33,F,3,Left Colon,TRUE
+81_A6_3,81,1,1,Adenocarcinoma,0,52,M,3,Cecum,FALSE
+83_A5_3,83,1,1,Adenocarcinoma,0,73,M,3,Cecum,FALSE
+85_C21_2,85,1,1,Adenocarcinoma,0,56,M,3,Rectum,FALSE
+86_A3_3,86,1,1,Adenocarcinoma,1b,59,F,3,Left Colon,FALSE
+90_A7_3,90,1,1,Adenocarcinoma,0,47,F,3,Right Colon,FALSE
+91_A3_3,91,0,1,Adenocarcinoma,0,81,M,3,Splenic flexure,FALSE
+92_F9_3,92,1,1,Adenocarcinoma,2b,52,M,3,Rectum,TRUE
+96_A7_3,96,1,1,Adenocarcinoma,2a,62,M,3,Left Colon,FALSE
+97_A7_3,97,1,1,Adenocarcinoma,1c,33,F,3,Cecum,FALSE
+100_A12_3,100,0,1,Adenocarcinoma,0,92,M,3,Cecum,FALSE
+102_B6_3,102,0,1,Adenocarcinoma,2a,71,F,3,Cecum,FALSE
+105_B6_3,105,1,1,Adenocarcinoma,0,44,M,3,Rectum,TRUE
+106_A4_3,106,0,1,Adenocarcinoma,0,93,F,3,Cecum,FALSE
+107_A5_3,107,0,1,Adenocarcinoma,1a,90,F,3,Hepatic Flexure,FALSE
+111_B6_3,111,1,1,Adenocarcinoma,0,68,F,3,Transverse Colon,FALSE
+113_A10_3,113,1,1,Adenocarcinoma,2b,43,M,3,Rectum,TRUE
+116_A5_3,116,0,1,Adenocarcinoma,1a,64,M,3,Cecum,TRUE
+117_A8_3,117,0,1,Adenocarcinoma,1b,83,M,3,Left colon,TRUE
+119_A5_4,119,0,1,Adenocarcinoma,0,72,M,3,Cecum,FALSE
+122_A3_3,122,0,1,Adenocarcinoma,2a,80,F,3,Cecum,TRUE
+127_A7_3,127,1,1,Adenocarcinoma,1b,66,F,3,Sigmoid,TRUE
+128_B3_2,128,0,1,Adenocarcinoma,0,66,F,3,Cecum,FALSE
