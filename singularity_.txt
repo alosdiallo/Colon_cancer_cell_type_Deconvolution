@@ -1,8 +1,8 @@
 Log onto singularity 
 
 ssh f006fpk@discovery7.hpcc.dartmouth.edu -L 9929:localhost:9929
-ssh p01  -L 9929:localhost:9929
-cd levy_lab_space/colon_work/
+ssh p02  -L 9929:localhost:9929
+cd /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/colon_work/adata/
 conda activate R
 export PORT=9929
 export APPTAINER_TMPDIR=$(realpath ./tmp_dir/)
@@ -10,7 +10,10 @@ export CONDA_PATH=export CONDA_PATH=/dartfs-hpc/rc/home/k/f006fpk/anaconda3/
 
 singularity exec -B ${APPTAINER_TMPDIR}:/tmp --bind  ${CONDA_PATH}/envs/R --bind $(pwd) /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/singularity_images/rstudio.simg rserver --www-address=127.0.0.1 --www-port ${PORT} --rsession-which-r=${CONDA_PATH}/envs/R/bin/R --rsession-ld-library-path=${CONDA_PATH}/envs/R/lib
 
+#make sure to add libpath
+.libPaths("/dartfs-hpc/rc/home/k/f006fpk/anaconda3/envs/R/lib/R/library")
 
+The below should be a solved problem
 If you get an error: ERROR system error 2 (No such file or directory) [path=/tmp/rstudio-server/secure-cookie-key
 
 export PORT=5556
