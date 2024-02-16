@@ -1,0 +1,2 @@
+Where libs are stored
+/dartfs-hpc/rc/home/k/f006fpk/anaconda3/envs/R/lib 
