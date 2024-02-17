@@ -1,7 +1,7 @@
 ssh f006fpk@discovery7.hpcc.dartmouth.edu -L 9927:localhost:9927
 ssh p02  -L 9927:localhost:9927
 cd /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/colon_work/adata/
-conda activate /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/ad_ml 
+conda activate /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/jupyter
 jupyter notebook --no-browser --port=9927
 Then copy the link
 
