@@ -1,7 +1,7 @@
 ssh f006fpk@discovery7.hpcc.dartmouth.edu -L 9927:localhost:9927
 ssh p02  -L 9927:localhost:9927
 cd /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/colon_work/adata/
-conda activate /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/jupyter
+conda activate /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/jp_env
 jupyter notebook --no-browser --port=9927
 Then copy the link
 
@@ -9,5 +9,4 @@ Then copy the link
 Creating a new env
 conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/jupyter python=3.7 anaconda
 
-conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/cell2loc_env python=3.9 -y
-
+conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/jp_env -c conda-forge python=3.10.3 numpy scipy matplotlib scanpy numba python-igraph
