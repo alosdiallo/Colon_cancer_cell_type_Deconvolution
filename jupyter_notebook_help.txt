@@ -8,5 +8,6 @@ Then copy the link
 
 Creating a new env
 conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/jupyter python=3.7 anaconda
+conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/spatialscope python=3.9 anaconda
 
 conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/jp_env -c conda-forge python=3.10.3 numpy scipy matplotlib scanpy numba python-igraph
