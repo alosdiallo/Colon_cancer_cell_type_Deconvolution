@@ -11,3 +11,6 @@ conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/a
 conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/spatialscope python=3.9 anaconda
 
 conda create --prefix /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/jp_env -c conda-forge python=3.10.3 numpy scipy matplotlib scanpy numba python-igraph
+
+
+https://github.com/azizilab/starfysh/blob/main/notebooks/Starfysh_tutorial_real.ipynb
