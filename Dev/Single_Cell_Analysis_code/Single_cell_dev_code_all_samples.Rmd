@@ -1,0 +1,224 @@
+---
+title: "Single_cell_colon_samples"
+author: "Alos Diallo"
+date: "2024-03-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Packages required
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(Seurat)
+library(futile.logger)
+library(ggplot2)
+library(stringr)
+library(patchwork)
+library(harmony)
+library(readr)
+library(viridis)
+library(RCurl)
+library(cowplot)
+library(phateR)
+library(compositions)
+library(tidyverse)
+library(dplyr)
+library(hdf5r)
+library(Matrix)
+library(data.table)
+library(ComplexHeatmap)
+library(SingleR)
+library(celldex)
+library(SingleCellExperiment)
+library(Matrix)
+library(reticulate)
+#library(loomR)
+library(anndata)
+library(DESeq2)
+library(viridis)
+library(textshaping)
+library(EnhancedVolcano)
+library(DataExplorer)
+```
+
+Reading in all of the data
+```{r}
+readPath.patient_3 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/3-A4/count/sample_filtered_feature_bc_matrix/'
+
+patient_3.Data <- Read10X(readPath.patient_3)
+
+readPath.patient_13 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/13-A7/count/sample_filtered_feature_bc_matrix/'
+
+patient_13.Data <- Read10X(readPath.patient_13)
+
+readPath.patient_11 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/11-C9/count/sample_filtered_feature_bc_matrix/'
+
+patient_11.Data <- Read10X(readPath.patient_11)
+
+readPath.patient_18 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/18-G4/count/sample_filtered_feature_bc_matrix/'
+
+patient_18.Data <- Read10X(readPath.patient_18)
+
+readPath.patient_40 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/40-B10/count/sample_filtered_feature_bc_matrix/'
+
+patient_40.Data <- Read10X(readPath.patient_40)
+
+readPath.patient_46 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/46-A3/count/sample_filtered_feature_bc_matrix/'
+
+patient_46.Data <- Read10X(readPath.patient_46)
+
+readPath.patient_72 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/72-A19/count/sample_filtered_feature_bc_matrix/'
+
+patient_72.Data <- Read10X(readPath.patient_72)
+
+readPath.patient_86 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/86-A3/count/sample_filtered_feature_bc_matrix/'
+
+patient_86.Data <- Read10X(readPath.patient_86)
+
+readPath.patient_106 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/106-A4/count/sample_filtered_feature_bc_matrix/'
+
+patient_106.Data <- Read10X(readPath.patient_106)
+
+readPath.patient_116 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/116-A5/count/sample_filtered_feature_bc_matrix/'
+
+patient_116.Data <- Read10X(readPath.patient_116)
+
+
+
+```
+
+Creating a function to carry out some pre-processing.
+```{r}
+process_patient_data <- function(patient_data) {
+    # Create a Seurat object
+    patient_object <- CreateSeuratObject(counts = patient_data, project = "colon_work", min.cells = 3, min.features = 200)
+    
+    # Calculate the percentage of mitochondrial gene expression
+    patient_object[["percent.mt"]] <- PercentageFeatureSet(patient_object, pattern = "^MT-")
+
+    # Quality control
+    patient_object <- subset(patient_object, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+    
+    # Normalization
+    patient_object <- NormalizeData(patient_object, normalization.method = "LogNormalize", scale.factor = 10000)
+    
+    # Find variable features
+    patient_object <- FindVariableFeatures(patient_object, selection.method = "vst", nfeatures = 2000)
+    
+    # Scaling data
+    patient_object <- ScaleData(patient_object)
+    
+    # Perform PCA
+    patient_object <- RunPCA(patient_object, features = VariableFeatures(object = patient_object))
+    
+    # Find neighbors and clusters
+    patient_object <- FindNeighbors(patient_object, dims = 1:10)
+    patient_object <- FindClusters(patient_object, resolution = 0.5)
+    
+    # Run UMAP
+    patient_object <- RunUMAP(patient_object, dims = 1:10)
+    
+    return(patient_object)
+}
+```
+
+
+```{r}
+# Assuming the patient data variables are Seurat objects and loaded in memory
+all_patients_data <- list(patient_3=patient_3.Data, patient_13=patient_13.Data, patient_11=patient_11.Data,
+                          patient_18=patient_18.Data, patient_40=patient_40.Data, patient_46=patient_46.Data,
+                          patient_72=patient_72.Data, patient_86=patient_86.Data, patient_106=patient_106.Data,
+                          patient_116=patient_116.Data)
+
+# Process each patient's data through the pipeline
+processed_data <- lapply(all_patients_data, function(data) {
+    seurat_object_colon_data <- process_patient_data(data)
+    return(seurat_object_colon_data)
+})
+```
+
+Loading my processed atlas file
+```{r}
+atlas_data <- readRDS("F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/atlas_data.rds")
+```
+
+```{r}
+options(future.globals.maxSize = 600 * 1024^2)
+```
+
+Function to transfer the annotations to the different samples
+```{r}
+transfer_annotations <- function(patient_seurat) {
+    # Find transfer anchors using the atlas as a reference
+    anchors <- FindTransferAnchors(reference = atlas_data, query = patient_seurat, dims = 1:30)
+
+    # Transfer cell type annotations from the atlas to the patient data
+    patient_seurat <- TransferData(anchorset = anchors, reference = atlas_data, query = patient_seurat, refdata = atlas_data@meta.data$cl295v11SubFull)
+
+    return(patient_seurat)
+}
+```
+
+
+```{r}
+# Ensure processed_data is a list of Seurat objects
+# Apply the function to each patient Seurat object in the list
+annotated_data <- lapply(processed_data, transfer_annotations)
+```
+```{r}
+saveRDS(annotated_data, file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/annotated_data_10_patients.rds")
+```
+
+Creating a function for the plot and labels
+```{r}
+consolidate_and_plot <- function(patient_seurat, patient_id) {
+    # Define the consolidated labels for each group
+    caf_labels <- c("cS27 (CXCL14+ CAF)", "cS28 (GREM1+ CAF)", "cS29 (MMP3+ CAF)", "cS30 (CAF CCL8 Fibro-like)", "cS31 (CAF stem niche Fibro-like)")
+    t_cell_labels <- c("cTNI01 (CD4+ IL7R+)", "cTNI02 (CD4+ IL7R+SELL+)", "cTNI10 (CD8+ IL7R+)")
+    tumor_labels <- c("cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)", "cE03 (Stem/TA-like prolif)", "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)", "cE06 (Immature Goblet)", "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)")
+
+    # Create a new column for consolidated labels
+    patient_seurat$consolidated_labels <- patient_seurat$predicted.id
+
+    # Consolidate labels
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% caf_labels] <- "CAF"
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% t_cell_labels] <- "T-Cell"
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% tumor_labels] <- "Tumor"
+
+    # Set labels to NA for cells not in the selected cell types
+    patient_seurat$consolidated_labels[!patient_seurat$consolidated_labels %in% c("Tumor", "CAF", "T-Cell")] <- NA
+
+    # Generate and return the UMAP plot with the patient info in the title
+    plot <- DimPlot(patient_seurat, reduction = "umap", group.by = "consolidated_labels", label = FALSE) + 
+            ggplot2::ggtitle(paste("Immune Environment for Patient", patient_id))
+
+    return(plot)
+}
+
+
+```
+
+
+```{r}
+plot_list <- lapply(names(annotated_data), function(patient_id) {
+    consolidate_and_plot(annotated_data[[patient_id]], patient_id)
+})
+
+plot_list
+```
+
+
+
+
+```{r}
+
+saveRDS(plot_list, file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/Plots_for_10_patients.rds")
+```
+
+
+
+
+

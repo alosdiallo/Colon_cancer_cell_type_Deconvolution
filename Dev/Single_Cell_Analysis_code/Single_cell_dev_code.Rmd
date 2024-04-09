@@ -1,0 +1,369 @@
+---
+title: "Untitled"
+author: "Alos Diallo"
+date: "2024-03-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages required
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(Seurat)
+library(futile.logger)
+library(ggplot2)
+library(stringr)
+library(patchwork)
+library(harmony)
+library(readr)
+library(viridis)
+library(RCurl)
+library(cowplot)
+library(phateR)
+library(compositions)
+library(tidyverse)
+library(dplyr)
+library(hdf5r)
+library(Matrix)
+library(data.table)
+library(ComplexHeatmap)
+library(SingleR)
+library(celldex)
+library(SingleCellExperiment)
+library(Matrix)
+library(reticulate)
+#library(loomR)
+library(anndata)
+library(DESeq2)
+library(viridis)
+library(textshaping)
+library(EnhancedVolcano)
+library(DataExplorer)
+
+
+```
+
+
+```{r}
+
+
+readPath.patient_11 <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/11-C9/count/sample_filtered_feature_bc_matrix/'
+
+patient_11.Data <- Read10X(readPath.patient_11)
+```
+
+
+
+
+```{r}
+patient_11 <- CreateSeuratObject(counts = patient_11.Data, project = "colon_work", min.cells = 3, min.features = 200)
+patient_11[["percent.mt"]] <- PercentageFeatureSet(patient_11, pattern = "^MT-")
+```
+
+```{r}
+# Quality control - adjust parameters based on your data and QC plots
+patient_11 <- subset(patient_11, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+
+
+# Visualize QC metrics as a violin plot
+VlnPlot(patient_11, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(patient_11, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(patient_11, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+# Normalization
+patient_11 <- NormalizeData(patient_11, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# Find variable features
+patient_11 <- FindVariableFeatures(patient_11, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(patient_11), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(patient_11)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+
+# Scale the data
+all.genes <- rownames(patient_11)
+patient_11 <- ScaleData(patient_11, features = all.genes)
+patient_11 <- ScaleData(patient_11, vars.to.regress = "percent.mt")
+
+# Perform PCA
+patient_11 <- RunPCA(patient_11,features = VariableFeatures(object = patient_11))
+VizDimLoadings(patient_11, dims = 1:2, reduction = "pca")
+DimPlot(patient_11, reduction = "pca") + NoLegend()
+DimHeatmap(patient_11, dims = 1, cells = 500, balanced = TRUE)
+
+
+DimHeatmap(patient_11, dims = 1:15, cells = 500, balanced = TRUE)
+
+```
+```{r}
+ElbowPlot(patient_11)
+```
+
+
+```{r}
+patient_11 <- FindNeighbors(patient_11, dims = 1:10)
+patient_11 <- FindClusters(patient_11, resolution = 0.5)
+```
+```{r}
+patient_11 <- RunUMAP(patient_11, dims = 1:10)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# individual clusters
+DimPlot(patient_11, reduction = "umap")
+saveRDS(patient_11, file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/patient_11.rds")
+
+```
+
+
+```{r}
+DimPlot(patient_11, reduction = "umap")
+```
+
+
+```{r}
+# find all markers of cluster 2
+cluster2.markers <- FindMarkers(patient_11, ident.1 = 2)
+head(cluster2.markers, n = 5)
+
+# find all markers distinguishing cluster 5 from clusters 0 and 3
+cluster5.markers <- FindMarkers(patient_11, ident.1 = 5, ident.2 = c(0, 3))
+head(cluster5.markers, n = 5)
+
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+patient_11.markers <- FindAllMarkers(patient_11, only.pos = TRUE)
+patient_11.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1)
+```
+
+```{r}
+cluster0.markers <- FindMarkers(patient_11, ident.1 = 0, logfc.threshold = 0.25, test.use = "roc", only.pos = TRUE)
+```
+mait_markers = ["TRAV1-2", "KLRB1", "CD3D", "CD3E", "CD3G", "MR1"]  
+
+```{r}
+VlnPlot(patient_11, features = c("TRAV1-2", "KLRB1", "CD3D", "CD3E", "CD3G", "MR1"))
+```
+caf_markers = ["ACTA2", "FAP", "PDGFRB"]
+
+
+```{r}
+VlnPlot(patient_11, features = c("ACTA2", "FAP", "PDGFRB"))
+```
+
+```{r}
+FeaturePlot(patient_11, features = c("TRAV1-2", "KLRB1", "CD3D", "CD3E", "CD3G", "MR1"))
+```
+
+
+caf_markers = ["ACTA2", "FAP", "PDGFRB"]
+```{r}
+FeaturePlot(patient_11, features = c("ACTA2", "FAP", "PDGFRB"))
+```
+
+tumor_markers = ["MKI67", "EPCAM"]
+```{r}
+FeaturePlot(patient_11, features = c("MKI67", "EPCAM"))
+```
+```{r}
+patient_11.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 10) %>%
+    ungroup() -> top10
+DoHeatmap(patient_11, features = top10$gene) + NoLegend()
+```
+
+A Single Cell Atlas of MMRd and MMRp Colorectal Cancer
+```{r}
+h5_file <- 'F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/GSE178341_crc10x_full_c295v4_submit.h5'
+
+# Load the data into a Seurat object
+seurat_object <- Read10X_h5(h5_file)
+
+# Create a Seurat object
+seurat_object <- CreateSeuratObject(counts = seurat_object, project = "CRC-Single-Cell")
+
+
+# Set the path to the cluster file
+cluster_file <- "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/GSE178341_crc10x_full_c295v4_submit_cluster.csv.gz"
+
+# Read the cluster data
+cluster_data <- read.csv(gzfile(cluster_file), row.names = 1)
+
+# Add the cluster information to the Seurat object's metadata
+seurat_object <- AddMetaData(seurat_object, metadata = cluster_data)
+
+# Set the path to the metadata file
+metadata_file <- "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/GSE178341_crc10x_full_c295v4_submit_metatables.csv.gz"
+
+# Read the metadata
+metadata <- read.csv(gzfile(metadata_file), row.names = 1)
+
+# Add the metadata to the Seurat object's metadata
+seurat_object <- AddMetaData(seurat_object, metadata = metadata)
+```
+
+```{r}
+# Find markers in your dataset
+markers.your_data <- FindAllMarkers(seurat_object, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# View the markers
+head(markers.your_data)
+
+```
+```{r}
+colnames(seurat_object@misc)
+v = seurat_object@meta.data
+head(v)
+```
+
+
+```{r}
+# Replace "clMidwayPr" with the exact name of the column from your metadata if different
+seurat_object <- AddMetaData(seurat_object, metadata = seurat_object@meta.data$cl295v11SubFull, col.name = "cl295v11SubFull")
+Idents(seurat_object) <- seurat_object@meta.data$cl295v11SubFull
+```
+
+```{r}
+# Run PCA
+seurat_object <- NormalizeData(seurat_object)
+seurat_object <- FindVariableFeatures(seurat_object)
+seurat_object <- ScaleData(seurat_object)
+seurat_object <- RunPCA(seurat_object)
+seurat_object <- RunUMAP(seurat_object, dims = 1:30)
+
+saveRDS(seurat_object, file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/atlas_data.rds")
+```
+
+
+
+```{r}
+DimPlot(seurat_object, label = TRUE, group.by = "cl295v11SubFull", raster = FALSE) +
+  theme(legend.text = element_text(size = 3), legend.title = element_text(size = 3)) +  # Adjust size as needed
+  NoLegend()  # Use this if you want to remove the legend entirely
+
+
+```
+```{r}
+library(ggplot2)
+
+# Generate the UMAP plot and adjust legend text size
+p <- DimPlot(seurat_object, label = TRUE, group.by = "cl295v11SubFull", raster = FALSE) +
+  theme(legend.text = element_text(size = 6),  # Adjust text size
+        legend.title = element_text(size = 7)) +  # Adjust title size
+  guides(colour = guide_legend(override.aes = list(size = 2)))  # Adjust symbol size
+
+# Print the plot
+print(p)
+```
+
+
+```{r}
+options(future.globals.maxSize = 600 * 1024^2)
+# Find transfer anchors
+anchors <- FindTransferAnchors(reference = seurat_object, query = patient_11, dims = 1:30)
+
+
+saveRDS(anchors, file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/patient_11_anchors.rds")
+
+# Transfer cell type information
+patient_11 <- TransferData(anchorset = anchors, reference = seurat_object, query = patient_11, refdata = seurat_object@meta.data$cl295v11SubFull)
+saveRDS(patient_11, file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/patient_11_processed.rds")
+```
+
+
+
+
+```{r}
+table(patient_11@meta.data$predicted.id)
+```
+```{r}
+DimPlot(patient_11, reduction = "umap", group.by = "predicted.id", label = TRUE)
+```
+```{r}
+# Create the UMAP plot without the labels on the plot points
+umap_plot <- DimPlot(patient_11, reduction = "umap", group.by = "predicted.id", label = FALSE)
+
+
+# Save the plot to a file
+ggsave("umap_plot.png", plot = umap_plot, width = 20, height = 10, dpi = 600)
+
+```
+
+```{r}
+patient_11$predicted.id
+```
+
+
+```{r}
+levels(as.factor(patient_11@meta.data$predicted.id))
+```
+Here I want to only include cell types I am interested in.
+```{r}
+# Define the consolidated labels for each group
+caf_labels <- c("cS27 (CXCL14+ CAF)", "cS28 (GREM1+ CAF)", "cS29 (MMP3+ CAF)", "cS30 (CAF CCL8 Fibro-like)", "cS31 (CAF stem niche Fibro-like)")
+t_cell_labels <- c("cTNI01 (CD4+ IL7R+)", "cTNI02 (CD4+ IL7R+SELL+)", "cTNI10 (CD8+ IL7R+)")
+tumor_labels <- c("cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)", "cE03 (Stem/TA-like prolif)", "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)", "cE06 (Immature Goblet)", "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)")
+
+# Create a new column for consolidated labels
+patient_11$consolidated_labels <- patient_11$predicted.id
+
+# Consolidate labels
+patient_11$consolidated_labels[patient_11$predicted.id %in% caf_labels] <- "CAF"
+patient_11$consolidated_labels[patient_11$predicted.id %in% t_cell_labels] <- "T-Cell"
+patient_11$consolidated_labels[patient_11$predicted.id %in% tumor_labels] <- "Tumor"
+
+# Now specify the selected cell types for the plot
+selected_cell_types <- c("Tumor", "CAF", "T-Cell")
+
+# Set labels to NA for cells not in the selected cell types
+patient_11$consolidated_labels[!patient_11$consolidated_labels %in% selected_cell_types] <- NA
+
+# Plot the UMAP with only selected labels
+DimPlot(patient_11, reduction = "umap", group.by = "consolidated_labels", label = FALSE) 
+
+
+```
+
+
+
+
+
+To consolidate labels
+"cE01 (Stem/TA-like)"                
+ [5] "cE02 (Stem/TA-like/Immature Goblet)" "cE03 (Stem/TA-like prolif)"          "cE04 (Enterocyte 1)"                 "cE05 (Enterocyte 2)"                
+ [9] "cE06 (Immature Goblet)"              "cE07 (Goblet/Enterocyte)"            "cE08 (Goblet)"                       "cE10 (Tuft)" 
+
+```{r}
+# Define a common label for similar cell types, e.g., "Tumor"
+common_label <- "Tumor"
+tumor_labels <- c("cE01 (Stem/TA-like)" , "cE02 (Stem/TA-like/Immature Goblet)", "cE03 (Stem/TA-like prolif)", "cE04 (Enterocyte 1)","cE05 (Enterocyte 2)","cE06 (Immature Goblet)","cE07 (Goblet/Enterocyte)","cE08 (Goblet)")  # Replace with the actual labels you want to group
+
+selected_cell_types <- c("Tumor")
+# Replace the detailed labels with the common label
+patient_11$consolidated_labels <- patient_11$predicted.id
+patient_11$consolidated_labels[patient_11$predicted.id %in% tumor_labels] <- common_label
+
+# Set labels to NA for cells not in the selected cell types
+patient_11$consolidated_labels[!patient_11$consolidated_labels %in% selected_cell_types] <- NA
+
+# Check if there are any non-NA labels before plotting
+if(any(!is.na(patient_11$consolidated_labels))) {
+  # Use the updated labels for plotting
+  DimPlot(patient_11, reduction = "umap", group.by = "consolidated_labels", label = FALSE)
+} else {
+  warning("All selected_labels are NA. Cannot create a DimPlot with no labels.")
+}
+```
+
+
+
+
