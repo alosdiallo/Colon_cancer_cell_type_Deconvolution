@@ -1,8 +1,8 @@
 Log onto singularity 
 
-ssh f006fpk@discovery7.hpcc.dartmouth.edu -L 9929:localhost:9929
-ssh p02  -L 9929:localhost:9929
-cd /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/colon_work/adata/
+ssh f006fpk@discovery7.hpcc.dartmouth.edu -L 9937:localhost:9937
+ssh p02  -L 9937:localhost:9937
+cd /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/colon_work/dm_data/no_match/idats
 conda activate R2
 export PORT=9929
 export APPTAINER_TMPDIR=$(realpath ./tmp_dir/)
