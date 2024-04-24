@@ -1,0 +1,460 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r message=FALSE, warning=FALSE}
+.libPaths("/dartfs-hpc/rc/home/k/f006fpk/anaconda3/envs/R2")
+
+```
+
+```{r message=FALSE, warning=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(IlluminaHumanMethylationEPICmanifest)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(limma)
+```
+
+```{r}
+covar.data <- read.csv("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/Colon_DH_manifest.csv")
+covar.data$patient <- paste(covar.data$Sentrix_ID,covar.data$Sentrix_Position,sep="_")
+rownames(covar.data) <- covar.data$patient
+```
+
+#Epic V2 which we did not use -- so don't run this.
+```{r}
+# v2_RGset = NULL
+# v2_RGset = read.metharray.exp("/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/colon_work/dm_data/no_match/idats/",recursive = TRUE) 
+# annotation(v2_RGset)["array"] = "IlluminaHumanMethylationEPICv2" 
+# annotation(v2_RGset)["annotation"] = "20a1.hg38"
+# v2_MSet <-preprocessNoob(v2_RGset)
+# v2_Betas<-getBeta(v2_MSet)
+# v2_Betas<- sesame::betasCollapseToPfx(v2_Betas)
+# output = HiTIMED_deconvolution(v2_Betas,"COAD",6,"tumor")
+# View(output)
+```
+
+Loading the data
+```{r}
+RGset_eV1 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/",recursive = TRUE) 
+MSet <-preprocessNoob(RGset_eV1)
+Betas<-getBeta(MSet)
+Betas<- sesame::betasCollapseToPfx(Betas)
+load("25_files_data_converted.RData")
+#HiTIMED_result<-HiTIMED_deconvolution(Betas,"COAD",6,"tumor")
+```
+
+putting the two datasets together
+```{r}
+merged_Betas <- merge(Betas, v2_Betas, by = "row.names")
+rownames(merged_Betas) <- merged_Betas$Row.names
+merged_Betas <- merged_Betas[,-1] 
+#save(merged_Betas, file = "all_samples.RData")
+
+```
+
+Run HiTIMED
+```{r}
+HiTIMED_result<-HiTIMED_deconvolution(merged_Betas,"COAD",6,"tumor")
+```
+```{r}
+ # moveFiles<-function(package){
+ #       olddir <- path.expand(rappdirs::user_cache_dir(appname=package))
+ #       newdir <- tools::R_user_dir(package, which="cache")
+ #       dir.create(path=newdir, recursive=TRUE)
+ #       files <- list.files(olddir, full.names =TRUE)
+ #       moveres <- vapply(files,
+ #           FUN=function(fl){
+ #           filename = basename(fl)
+ #           newname = file.path(newdir, filename)
+ #           file.rename(fl, newname)
+ #           },
+ #           FUN.VALUE = logical(1))
+ #       if(all(moveres)) unlink(olddir, recursive=TRUE)
+ #       }
+ # 
+ #       package="ExperimentHub"
+ #       moveFiles(package)
+```
+
+
+```{r}
+targets <- read.csv("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+```
+
+PLotting the HiTIMED results
+
+```{r}
+# Assuming rownames for both dataframes match and are unique
+# Convert rownames to a column in both dataframes
+#targets = covar.data
+HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+#targets$SampleID <- rownames(targets)
+
+# Merge the dataframes by the new SampleID column
+combined_data <- merge(HiTIMED_result, targets, by="SampleID")
+
+library(tidyr)
+
+# Reshape data: specifying cols to pivot and columns to keep
+long_data <- pivot_longer(combined_data,
+                          cols = c("Tumor", "Endothelial", "Epithelial", "Stromal", "Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "Mono", "DC", "NK", "Bas", "Eos", "Neu"),
+                          names_to = "CellType",
+                          values_to = "Value")
+
+
+wide_data <- long_data %>% spread(key = CellType, value = Value)
+
+
+# Ensure 'any_mets' is a factor
+#long_data$any_mets <- as.factor(long_data$any_mets)
+
+# If working with 'Distant_Mets' or 'Site', convert them to factors in the same way
+long_data$Distant_Mets <- as.factor(long_data$Distant_Mets)
+long_data$any_mets <- as.factor(long_data$any_mets)
+long_data$ln_only <- as.factor(long_data$ln_only)
+long_data$MLH1 <- as.factor(long_data$MLH1)
+# Transform MLH1 into a factor with custom labels
+long_data$MLH1 <- factor(long_data$MLH1, levels = c(0, 1), labels = c("MLH1 Negative", "MLH1 Positive"))
+
+# long_data$Site <- as.factor(long_data$Site)
+
+# For 'any_mets'
+any_mets_plot <- ggplot(long_data, aes(x=CellType, y=Value, fill=any_mets)) +
+  geom_boxplot() +
+  facet_grid(MLH1 ~ CellType, scales = "free_x") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom") +
+  labs(fill = "Any Mets", x = "Cell Type", y = "Value")
+any_mets_plot
+# For 'Distant_Mets'
+distant_mets_plot_all <- ggplot(long_data, aes(x=CellType, y=Value, fill=Distant_Mets, group=interaction(CellType, Distant_Mets))) +
+  geom_boxplot() +
+  facet_grid(MLH1 ~ CellType, scales = "free_x") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom") +
+  labs(fill = "Distant Mets", x = "Cell Type", y = "Value")
+distant_mets_plot_all 
+# For 'ln_only'
+ln_only_plot <- ggplot(long_data, aes(x=CellType, y=Value, fill=ln_only, group=interaction(CellType, ln_only))) +
+  geom_boxplot() +
+  facet_grid(MLH1 ~ CellType, scales = "free_x") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom") +
+  labs(fill = "LN Only", x = "Cell Type", y = "Value")
+
+ggsave("any_mets_all_samples_plot.png", plot = any_mets_plot, width = 12, height = 8)
+ggsave("distant_mets__all_plot.png", plot = distant_mets_plot_all, width = 12, height = 8)
+ggsave("ln_only__all_plot.png", plot = ln_only_plot, width = 12, height = 8)
+getwd()
+```
+
+
+
+
+```{r}
+Z <- prcomp(as.matrix(t(DHColon_HTD)))
+Z <- as.data.frame(Z$rotation[,c("PC1","PC2")])
+colnames(Z) <- c("x","y")
+Z$patient <- rownames(Z)
+Z <- merge(Z,covar.data,on="patient")
+
+ggplot(Z,aes(x,y,color=factor(MLH1))) + geom_point() + theme_classic() 
+
+ggplot(Z,aes(x,y,color=factor(any_mets))) + geom_point() + theme_classic()
+
+```
+```{r}
+beta.val.full <- getBeta(rgset)
+mad.vals <- apply(beta.val.full,1,mad)
+# beta.val.filtered <- beta.val[names(sort(rank(-mad.vals))[1:10000]),]
+beta.val <- beta.val.full[names(sort(rank(-mad.vals))[1:800000]),]
+beta.val.expanded <- beta.val[names(sort(rank(-mad.vals))[1:350000]),]
+
+Z <- prcomp(as.matrix(beta.val))
+Z <- as.data.frame(Z$rotation[,c("PC1","PC2")])
+colnames(Z) <- c("x","y")
+Z$patient <- rownames(Z)
+Z <- merge(Z,covar.data,on="patient")
+
+ggplot(Z,aes(x,y,color=factor(MLH1))) + geom_point()  + theme_classic()
+
+ggplot(Z,aes(x,y,color=factor(any_mets))) + geom_point() + facet_grid(~ln_only) + theme_classic()
+```
+
+
+```{r}
+library(tidyverse)
+df.cell <- DHColon_HTD
+df.cell$patient <- rownames(df.cell)
+df.cell <- merge(df.cell,covar.data,on="patient")
+df.cell %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% filter(Distant_Mets==0) %>% ggplot(aes(x=factor(name),y=value,color=factor(ln_only))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+df.cell %>% pivot_longer(cols=colnames(DHColon_HTD)) %>% ggplot(aes(x=factor(name),y=value,color=factor(any_mets))) + geom_boxplot() + facet_grid(~MLH1) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0))
+
+dh_cell_data <- df.cell %>% pivot_longer(cols=colnames(DHColon_HTD))
+```
+
+
+
+
+```{r}
+
+library(vegan)
+HiTIMED_result_minus_sample_ID = HiTIMED_result
+HiTIMED_result_minus_sample_ID$SampleID = NULL
+
+dist_matrix <- vegdist(HiTIMED_result_minus_sample_ID, method = "bray")
+perm_test_one <- adonis2(dist_matrix ~ MLH1 + Distant_Mets, data = targets)
+print(perm_test_one)
+perm_test_two <- adonis2(dist_matrix ~ MLH1 * Distant_Mets, data = targets)
+
+print(perm_test_two)
+```
+
+```{r}
+library(vegan)
+library(ggplot2)
+library(ggvegan)
+
+# Perform PCoA
+pcoa_res <- cmdscale(dist_matrix, eig = TRUE, k = 2)  # k is the number of dimensions to represent
+
+# Convert the PCoA points to a data frame
+pcoa_df <- as.data.frame(pcoa_res$points)  # Assuming 'points' contains the ordination results
+
+# If your row names are the sample identifiers, add them as a column for merging
+pcoa_df$SampleID <- rownames(pcoa_df)
+
+# Assuming 'targets' has a matching identifier column, merge the two data frames
+# Ensure that 'SampleID' in 'pcoa_df' matches the sample identifier column in 'targets'
+combined_df <- merge(pcoa_df, targets, by = "SampleID")
+
+# Now plot with ggplot2, assuming 'any_mets' is in the 'targets' data
+ggplot(combined_df, aes(x = V1, y = V2, color = Distant_Mets)) +
+    geom_point() +
+    labs(x = "PCoA Axis 1", y = "PCoA Axis 2", title = "PCoA based on DNA Methylation Data") +
+    theme_minimal()
+
+```
+
+Get TCGA data
+
+```{r}
+tcga.data <- readRDS("TCGA_data.rds")
+tcga.dnam <- tcga.data[["dnam"]]
+tcga.pheno <- tcga.data[["pheno"]]
+tcga.cell <- tcga.data[["cell_types"]]
+msi_dat<-readRDS("msi_tcga.rds")
+tcga.cell$COAD_Deconv1#$MSS
+tcga.cell$COAD_Deconv2#MASS
+
+```
+
+```{r}
+tcga.cells.final<-list()
+
+for (nm in names(tcga.cell)){
+  tcga.cells.final[[nm]]<-tcga.cell[[nm]][,(which(colnames(tcga.cell[[nm]])=="karyotype")+1):ncol(tcga.cell[[nm]])]#[,(ncol(tcga.cell$COAD_Deconv6)-16):ncol(tcga.cell$COAD_Deconv6)]
+}
+tcga.cells.final$COAD_Deconv6
+head(tcga.cells.final$COAD_Deconv6)
+```
+```{r}
+library(tidyr)
+library(ggplot2)
+
+# Convert to long format
+tcga_long_data <- pivot_longer(tcga.cells.final$COAD_Deconv6,
+                               cols = c("Tumor", "Endothelial", "Epithelial", "Stromal", "Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "Mono", "DC", "NK", "Bas", "Eos", "Neu"),
+                               names_to = "CellType",
+                               values_to = "Proportion")
+
+
+# Create boxplots of cell type proportions
+tcga_plot <- ggplot(tcga_long_data, aes(x = CellType, y = Proportion, fill = CellType)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Distribution of Cell Types in TCGA COAD Samples", x = "Cell Type", y = "Proportion (%)")
+
+print(tcga_plot)
+
+ggsave("tcga_coad_celltype_proportions.png", plot = tcga_plot, width = 12, height = 8)
+
+```
+
+```{r}
+# Select only the necessary columns from long_data
+long_data_subset <- long_data %>%
+  select(CellType, Proportion, Source)  # Assuming 'Source' is already correctly set to "HiTIMED"
+
+# Ensure tcga_long_data has the same structure and subset it correctly
+tcga_long_data$Source <- "TCGA"  # Set source if not already done
+
+# Correctly subset tcga_long_data
+tcga_data_subset <- tcga_long_data %>%
+  select(CellType, Proportion, Source)
+
+# Combine the datasets
+combined_data <- rbind(long_data_subset, tcga_data_subset)
+
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# Create a boxplot of cell type proportions, differentiated by data source
+combined_plot <- ggplot(combined_data, aes(x = CellType, y = Proportion, fill = Source)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Comparison of Cell Type Proportions between the DH Cohort and TCGA Data", x = "Cell Type", y = "Proportion (%)", fill = "Data Source")
+
+print(combined_plot)
+ggsave("combined_celltype_proportions_comparison.png", plot = combined_plot, width = 16, height = 12)
+
+
+```
+```{r}
+# Subset to relevant columns
+relevant_columns <- c("SampleID", "Tumor", "Endothelial", "Epithelial", "Stromal", "Bas","Bnv", "Bmem", "CD4nv", "CD4mem", "Treg","CD8nv", "CD8mem", "Mono", "DC", "NK", "Eos", "Neu", "age", "sex", "stage", "site", "Distant_Mets", "any_mets")
+# Normalize the 'site' variable
+combined_data$site <- tolower(gsub(" ", "", combined_data$site))
+analysis_data <- combined_data[, relevant_columns]
+
+
+# Convert to factors
+categorical_vars <- c("sex", "site", "Distant_Mets", "any_mets", "stage")  # Include any other categorical variables as needed
+analysis_data[categorical_vars] <- lapply(analysis_data[categorical_vars], factor)
+
+# Ensure 'age' is numeric
+analysis_data$age <- as.numeric(as.character(analysis_data$age))
+# Set row names of the data frame to SampleID for alignment
+row.names(analysis_data) <- analysis_data$SampleID
+
+# Check for any conversion errors or NA introductions
+sum(is.na(analysis_data))
+# Create the design matrix
+#design <- model.matrix(~0 + age + sex + site + Distant_Mets + any_mets, data=analysis_data)
+design <- model.matrix(~0 + age + sex + site + Distant_Mets + any_mets + Tumor + Endothelial + Epithelial + Stromal + Bnv + Bmem + CD4nv + CD4mem + Treg + CD8nv + CD8mem + Mono + DC + NK + Bas + Eos + Neu, data=analysis_data)
+
+
+print(dim(design))  # Verify the size of the design matrix
+print(colnames(design))  # Verify the predictor names
+
+
+print(colnames(design))  # Verify the structure of the design matrix
+
+
+# Check if the order and number of SampleID in design match merged_Betas
+if (!all(rownames(design) == colnames(merged_Betas))) {
+    stop("Sample IDs do not match between the design matrix and the beta values matrix.")
+}
+
+```
+
+```{r}
+# Proceed with lmFit
+fit1 <- lmFit(merged_Betas, design)
+summary(fit1)  # Review the analysis results
+```
+```{r}
+contMatrix1 <- makeContrasts(Post_Drug-Baseline,levels = design)
+```
+
+
+```{r}
+# Ensure merged_Betas is numeric
+if (!is.matrix(merged_Betas) || !all(sapply(merged_Betas, is.numeric))) {
+    merged_Betas <- as.matrix(merged_Betas)  # Convert to matrix if it's not already
+}
+
+# Cap and floor the beta values
+M.val <- ifelse(merged_Betas >= 1, 1 - 1E-6, ifelse(merged_Betas <= 0, 1E-6, merged_Betas))
+
+# Convert to M-values
+M.val2 <- log2(M.val / (1 - M.val))
+
+# Check the dimensions of the new M-values matrix
+dim(M.val2)
+
+
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)  # Make sure you have this library installed
+
+# Assuming beta_long and m_long have been properly formatted as shown:
+# beta_long <- melt(merged_Betas, variable.name = "Sample", value.name = "Beta_Value")
+# m_long <- melt(M.val2, variable.name = "Sample", value.name = "M_Value")
+
+# Add a column to each dataframe to distinguish between Beta and M values
+beta_long$type <- "Beta"
+m_long$type <- "M"
+
+# Combine the data frames
+combined_methylation_data <- rbind(beta_long, m_long)
+
+# Generate histograms
+ggplot(combined_methylation_data, aes(x = value, fill = type)) +
+  geom_histogram(bins = 30, alpha = 0.6) +
+  facet_wrap(~type, scales = "free_x") +
+  labs(title = "Histogram of Beta and M Values", x = "Value", y = "Count") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Beta" = "blue", "M" = "red"))
+
+# Save the plot
+ggsave("histograms.png", width = 12, height = 6)
+
+
+```
+```{r}
+library(ggplot2)
+library(gridExtra)
+
+# Assuming your data is in data frames 'beta_long' and 'm_long'
+# and has columns 'value' for the measurements and 'variable' for the sample IDs
+
+# Boxplots for Beta and M values
+bp_beta <- ggplot(beta_long, aes(x = variable, y = value)) + geom_boxplot() + theme_minimal() + ggtitle("Beta Values")
+bp_m <- ggplot(m_long, aes(x = variable, y = value)) + geom_boxplot() + theme_minimal() + ggtitle("M Values")
+
+# Histograms for Beta and M values
+hist_beta <- ggplot(beta_long, aes(x = value)) + geom_histogram(bins = 50, fill = "blue") + theme_minimal() + ggtitle("Beta Values")
+hist_m <- ggplot(m_long, aes(x = value)) + geom_histogram(bins = 50, fill = "red") + theme_minimal() + ggtitle("M Values")
+
+# Q-Q plots for Beta and M values
+qq_beta <- ggplot(beta_long, aes(sample = value)) + stat_qq() + stat_qq_line() + theme_minimal() + ggtitle("Beta Values")
+qq_m <- ggplot(m_long, aes(sample = value)) + stat_qq() + stat_qq_line() + theme_minimal() + ggtitle("M Values")
+
+# Combine the plots
+grid.arrange(bp_beta, bp_m, hist_beta, hist_m, qq_beta, qq_m, ncol = 3)
+
+```
+
+```{r}
+library(patchwork)
+
+# Combine the plots
+combined_qc_plot <- (bp_beta | bp_m) / 
+                 (hist_beta | hist_m) / 
+                 (qq_beta | qq_m) 
+
+# Display the plot
+combined_qc_plot & theme(strip.text = element_text(size = 8)) # Adjust the strip text size as needed
+
+```
+
