@@ -1,0 +1,86 @@
+---
+title: "GTEx_Single_cell_analysis"
+author: "Alos Diallo"
+date: "2024-04-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Packages required
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(Seurat)
+library(futile.logger)
+library(ggplot2)
+library(stringr)
+library(patchwork)
+library(harmony)
+library(readr)
+library(viridis)
+library(RCurl)
+library(cowplot)
+library(phateR)
+library(compositions)
+library(tidyverse)
+library(dplyr)
+library(hdf5r)
+library(Matrix)
+library(data.table)
+library(ComplexHeatmap)
+library(SingleR)
+library(celldex)
+library(SingleCellExperiment)
+library(Matrix)
+library(reticulate)
+#library(loomR)
+library(anndata)
+library(DESeq2)
+library(viridis)
+library(textshaping)
+library(EnhancedVolcano)
+library(DataExplorer)
+library(SeuratDisk)
+library(SeuratData)
+library(reticulate)
+```
+
+
+```{r}
+
+
+# ad <- anndata::read_h5ad("F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/out/GTEx_8_tissues_snRNAseq_immune_atlas_071421.public_obs.h5ad")
+# ad2 <- anndata::read_h5ad("F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/out/GTEx_8_tissues_snRNAseq_atlas_071421.public_obs.h5ad")
+
+anndata <- import("anndata")
+ad <- anndata$read_h5ad("F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/out/GTEx_8_tissues_snRNAseq_immune_atlas_071421.public_obs.h5ad")
+ad2 <- anndata$read_h5ad("F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/out/GTEx_8_tissues_snRNAseq_immune_atlas_071421.public_obs.h5ad")
+
+
+ad_file <- "F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/out/GTEx_8_tissues_snRNAseq_immune_atlas_071421.public_obs.h5ad"
+
+# Convert .h5ad to Seurat object
+seurat_obj <- Convert(ad_file, dest = "Seurat")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

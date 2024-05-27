@@ -25,6 +25,7 @@ library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 library(IlluminaHumanMethylationEPICv2manifest)
 library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
 library(limma)
+library(tidyr)
 ```
 
 Loading the datasets
@@ -54,6 +55,16 @@ merged_Betas <- merged_Betas[,-1]
 
 ```
 
+Get GTEx data
+```{r}
+GTEx_eV1 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/",recursive = TRUE) 
+MSet <-preprocessNoob(GTEx_eV1)
+Betas_GTEx <-getBeta(MSet)
+Betas_GTEx <- sesame::betasCollapseToPfx(Betas_GTEx)
+
+saveRDS(Betas_GTEx,file = "F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/GTEx_samples.rds")
+```
+
 Get TCGA data
 
 ```{r}
@@ -66,6 +77,10 @@ tcga.cell$COAD_Deconv1#$MSS
 tcga.cell$COAD_Deconv2#MASS
 
 tcga_T = t(tcga.dnam)
+
+MSet_noob_T <- preprocessNoob(tcga.dnam)
+beta_matrix_TCGA<-getBeta(MSet_noob_T)
+
 ```
 
 
@@ -107,7 +122,7 @@ tcga_result_6$Source <- "TCGA"
 
 # Combine DH and TCGA data frames for each level
 data_level_1 <- bind_rows(HiTIMED_result_1, tcga_result_1)
-data_level_2 <- bind_rows(HiTIMED_result_2, tcga_result_2)
+data_level_2 <- bind_rows(HiTIMED_result_2, tcga_result_2,HiTIMED_result_gtex2)
 data_level_3 <- bind_rows(HiTIMED_result_3, tcga_result_3)
 data_level_4 <- bind_rows(HiTIMED_result_4, tcga_result_4)
 data_level_5 <- bind_rows(HiTIMED_result_5, tcga_result_5)
@@ -125,6 +140,7 @@ data_level_6$ID <- "Level_6"
 combined_data <- bind_rows(data_level_1, data_level_2, data_level_3,
                            data_level_4, data_level_5, data_level_6)
 
+combined_data$SampleID = rownames(combined_data)
 # Reshape data to long format
 long_data <- combined_data %>%
   pivot_longer(
@@ -147,41 +163,394 @@ ggsave("Combined_HiTIMED_TCGA_boxplots.png", width = 20, height = 30)
 ```
 
 ```{r}
+
+# Combine DH and TCGA data frames for each level
+data_level_1 <- bind_rows(HiTIMED_result_1, tcga_result_1)
+data_level_2 <- bind_rows(HiTIMED_result_2, tcga_result_2)
+data_level_3 <- bind_rows(HiTIMED_result_3, tcga_result_3)
+data_level_4 <- bind_rows(HiTIMED_result_4, tcga_result_4)
+data_level_5 <- bind_rows(HiTIMED_result_5, tcga_result_5)
+data_level_6 <- bind_rows(HiTIMED_result_6, tcga_result_6)
+
+# Set a unique ID for each level and source combination
+data_level_1$ID <- "Level_1"
+data_level_2$ID <- "Level_2"
+data_level_3$ID <- "Level_3"
+data_level_4$ID <- "Level_4"
+data_level_5$ID <- "Level_5"
+data_level_6$ID <- "Level_6"
+
 # Combine DH and TCGA data frames for each level
 levels_data <- list(
-  data_level_1 = bind_rows(HiTIMED_result_1, tcga_result_1),
-  data_level_2 = bind_rows(HiTIMED_result_2, tcga_result_2),
-  data_level_3 = bind_rows(HiTIMED_result_3, tcga_result_3),
-  data_level_4 = bind_rows(HiTIMED_result_4, tcga_result_4),
-  data_level_5 = bind_rows(HiTIMED_result_5, tcga_result_5),
-  data_level_6 = bind_rows(HiTIMED_result_6, tcga_result_6)
+  data_level_1,
+  data_level_2,
+  data_level_3,
+  data_level_4,
+  data_level_5,
+  data_level_6
 )
-
+# 
 # Iterate over each level to create and save plots
 for (level in names(levels_data)) {
   # Set ID for each dataset
   levels_data[[level]]$ID <- level
-  
+  #levels_data[[level]]$SampleID <- rownames(level)
   # Reshape data to long format
   long_data <- pivot_longer(
     levels_data[[level]],
-    -c(SampleID, ID, Source),  # Exclude these columns from reshaping
+    -c(ID, Source),  # Exclude these columns from reshaping
     names_to = "CellType",
     values_to = "Proportion"
   )
-  
-  # Generate boxplot using ggplot2
+
+#   # Generate boxplot using ggplot2
+#   plot <- ggplot(long_data, aes(x = CellType, y = Proportion, fill = Source)) +
+#     geom_boxplot() +
+#     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#     labs(title = paste("Distribution of Cell Types at", level, "across DH and TCGA Results"),
+#          x = "Cell Type", y = "Proportion") +
+#     scale_fill_brewer(palette = "Set1")  # Clear color distinction
+# 
+#   # Save each plot with a unique filename
+#   plot_file_name <- paste0("Plot_", level, ".png")
+#   ggsave(plot_file_name, plot, width = 12, height = 8)
+# }
+
+
+#For figures Background and lines removed.
+ # Generate boxplot using ggplot2
   plot <- ggplot(long_data, aes(x = CellType, y = Proportion, fill = Source)) +
     geom_boxplot() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    labs(title = paste("Distribution of Cell Types at", level, "across DH and TCGA Results"), 
+    theme_minimal() +  # Cleaner theme
+    theme(
+      panel.grid.major = element_blank(),  # Remove major grid lines
+      panel.grid.minor = element_blank(),  # Remove minor grid lines
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.line = element_line(colour = "black")
+    ) +
+    labs(title = paste("Distribution of Cell Types at", level, "across DH and TCGA Results"),
          x = "Cell Type", y = "Proportion") +
     scale_fill_brewer(palette = "Set1")  # Clear color distinction
-  
+
   # Save each plot with a unique filename
   plot_file_name <- paste0("Plot_", level, ".png")
   ggsave(plot_file_name, plot, width = 12, height = 8)
 }
+```
+
+
+```{r}
+library(tidyr)
+library(dplyr)
+plot_non_tumor = NULL 
+plot_tumor = NULL
+tumor_data = NULL 
+non_tumor_data = NULL 
+
+# Combine DH and TCGA data frames for each level
+data_level_1 <- bind_rows(HiTIMED_result_1, tcga_result_1)
+data_level_2 <- bind_rows(HiTIMED_result_2, tcga_result_2)
+data_level_3 <- bind_rows(HiTIMED_result_3, tcga_result_3)
+data_level_4 <- bind_rows(HiTIMED_result_4, tcga_result_4)
+data_level_5 <- bind_rows(HiTIMED_result_5, tcga_result_5)
+data_level_6 <- bind_rows(HiTIMED_result_6, tcga_result_6)
+
+# Set a unique ID for each level and source combination
+data_level_1$ID <- "Level_1"
+data_level_2$ID <- "Level_2"
+data_level_3$ID <- "Level_3"
+data_level_4$ID <- "Level_4"
+data_level_5$ID <- "Level_5"
+data_level_6$ID <- "Level_6"
+
+# Combine DH and TCGA data frames for each level
+levels_data <- list(
+  data_level_1,
+  data_level_2,
+  data_level_3,
+  data_level_4,
+  data_level_5,
+  data_level_6
+)
+
+# Iterate over each level to create and save plots
+for (level in names(levels_data)) {
+  levels_data[[level]]$ID <- level
+  # Reshape data to long format first
+  long_data <- pivot_longer(
+    levels_data[[level]],
+    -c(ID, Source),  # Exclude these columns from reshaping
+    names_to = "CellType",
+    values_to = "Proportion"
+  )
+
+  # Now filter the long_data for tumor and non-tumor data
+  tumor_data <- filter(long_data, CellType == "Tumor")
+  non_tumor_data <- filter(long_data, CellType != "Tumor")
+
+  # Plot non-tumor
+  plot_non_tumor <- ggplot(non_tumor_data, aes(x = CellType, y = Proportion, fill = Source)) +
+    geom_boxplot() +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.line = element_line(colour = "black")
+    ) +
+    labs(title = paste("Distribution of Non-Tumor Cell Types at", level, "across DH and TCGA Results"),
+         x = "Cell Type", y = "Proportion") +
+    scale_fill_brewer(palette = "Set1")
+
+  # Save non-tumor plot
+  ggsave(paste0("Plot_", level, "_non_tumor.png"), plot_non_tumor, width = 12, height = 8)
+  plot_non_tumor
+  
+  
+  # Plot tumor
+  plot_tumor <- ggplot(tumor_data, aes(x = CellType, y = Proportion, fill = Source)) +
+    geom_boxplot() +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.line = element_line(colour = "black")
+    ) +
+    labs(title = paste("Distribution of Tumor Cell Types at", level, "across DH and TCGA Results"),
+         x = "", y = "Proportion") + # Empty x-axis title for tumor plot
+    scale_fill_brewer(palette = "Set1")
+  
+  
+    # Save tumor plot
+    ggsave(paste0("Plot_", level, "_tumor.png"), plot_tumor, width = 12, height = 8)
+    print(level)
+}
+
+
+
+#list.files()
+```
+
+```{r}
+
+Holder_main = data_level_2[,c(1:4)]
+Holder = data_level_6[,c(2:4,18)]
+Holder2 = data_level_6[,c(12,13,14,16,17,18)]
+Holder3 = data_level_6[,c(5:11,15,18)]
+
+
+```
+
+
+
+```{r}
+library(ggplot2)
+library(tidyr)
+
+# Convert your Holder dataframe to a long format
+long_data_subset <- pivot_longer(
+  Holder_main,
+  cols = c(Tumor, Immune, Angiogenic),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+long_data_subset2 <- pivot_longer(
+  Holder,
+  cols = c(Endothelial,Epithelial,Stromal),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+# Convert your Holder dataframe to a long format
+long_data_subset3 <- pivot_longer(
+  Holder2,
+  cols = c(Mono,DC,NK,Eos,Neu),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+long_data_subset4 <- pivot_longer(
+  Holder3,
+  cols = c(Bnv,Bmem,CD4nv,CD4mem,Treg,CD8nv,CD8mem,Bas),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+
+# Combine the two long-format data frames into one, with an additional column indicating the data set
+combined_long_data <- bind_rows(
+  long_data_subset %>% mutate(DataSet = "Holder"),
+  long_data_subset2 %>% mutate(DataSet = "Holder2"),
+  long_data_subset3 %>% mutate(DataSet = "Holder3"),
+  long_data_subset4 %>% mutate(DataSet = "Holder4")
+)
+
+# Generate the boxplot using ggplot2, facetted by the DataSet
+plot_subset <- ggplot(combined_long_data, aes(x = CellType, y = Proportion, fill = Source)) +
+  geom_boxplot() +
+  facet_wrap(~ DataSet, scales = "free") +  # Use 'facet_wrap' for side-by-side plots
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.line = element_line(colour = "black"),
+    strip.background = element_blank(),  # Remove the background of the facet label
+    strip.text = element_text(face = "bold")  # Bold the facet label text
+  ) +
+  labs(title = "Distribution of Select Cell Types",
+       x = "Cell Type", y = "Proportion") +
+  scale_fill_brewer(palette = "Set1")
+
+# Save the plot with a unique filename
+ggsave("Combined_CellTypes_Boxplot.png", plot_subset, width = 12, height = 8)
+
+# Display the plot in R
+print(plot_subset)
+
+
+```
+
+
+HiTIMED_result_1$Source <- "DH"
+HiTIMED_result_2$Source <- "DH"
+HiTIMED_result_3$Source <- "DH"
+HiTIMED_result_4$Source <- "DH"
+HiTIMED_result_5$Source <- "DH"
+HiTIMED_result_6$Source <- "DH"
+
+Mono,DC,NK,Eos,Neu
+```{r}
+
+Holder_main = HiTIMED_result_1
+Holder = HiTIMED_result_2
+Holder2 = HiTIMED_result_6[,c(12,13,14,16,17,18)]
+Holder3 = HiTIMED_result_6[,c(5:11,15,18)]
+
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Convert your Holder dataframe to a long format
+long_data_subset <- pivot_longer(
+  Holder_main,
+  cols = c(Tumor, Other),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+long_data_subset2 <- pivot_longer(
+  Holder,
+  cols = c(Tumor, Immune, Angiogenic),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+HiTIMED_result_three = HiTIMED_result_3
+# Convert your Holder dataframe to a long format
+long_data_subset3 <- pivot_longer(
+  Holder2,
+  cols = c(Mono,DC,NK,Eos,Neu),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+long_data_subset4 <- pivot_longer(
+  Holder3,
+  cols = c(Bnv,Bmem,CD4nv,CD4mem,Treg,CD8nv,CD8mem,Bas),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+
+# Combine the two long-format data frames into one, with an additional column indicating the data set
+combined_long_data <- bind_rows(
+  long_data_subset %>% mutate(DataSet = "Holder"),
+  long_data_subset2 %>% mutate(DataSet = "Holder2"),
+  long_data_subset3 %>% mutate(DataSet = "Holder3"),
+  long_data_subset4 %>% mutate(DataSet = "Holder4")
+)
+
+# Generate the boxplot using ggplot2, facetted by the DataSet
+plot_subset <- ggplot(combined_long_data, aes(x = CellType, y = Proportion, fill = Source)) +
+  geom_boxplot() +
+  facet_wrap(~ DataSet, scales = "free") +  # Use 'facet_wrap' for side-by-side plots
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.line = element_line(colour = "black"),
+    strip.background = element_blank(),  # Remove the background of the facet label
+    strip.text = element_text(face = "bold")  # Bold the facet label text
+  ) +
+  labs(title = "Distribution of Select Cell Types",
+       x = "Cell Type", y = "Proportion") +
+  scale_fill_brewer(palette = "Set1")
+
+# Save the plot with a unique filename
+ggsave("Combined_CellTypes_Boxplot.png", plot_subset, width = 12, height = 8)
+
+# Display the plot in R
+print(plot_subset)
+```
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Assuming rownames for both dataframes match and are unique
+# Convert rownames to a column in both dataframes
+#targets = covar.data
+HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+#targets$SampleID <- rownames(targets)
+
+# Merge the dataframes by the new SampleID column
+combined_data <- merge(HiTIMED_result, targets, by="SampleID")
+
+library(tidyr)
+
+# Reshape data: specifying cols to pivot and columns to keep
+long_data <- pivot_longer(combined_data,
+                          cols = c( "Mono", "DC", "NK", "Neu","Stromal"),
+                          names_to = "CellType",
+                          values_to = "Value")
+
+#"Tumor", "Endothelial", "Epithelial", "Stromal", "Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "Mono", "DC", "NK", "Bas", "Eos", "Neu"
+wide_data <- long_data %>% spread(key = CellType, value = Value)
+
+
+# Ensure 'any_mets' is a factor
+#long_data$any_mets <- as.factor(long_data$any_mets)
+
+# If working with 'Distant_Mets' or 'Site', convert them to factors in the same way
+long_data$Distant_Mets <- as.factor(long_data$Distant_Mets)
+long_data$any_mets <- as.factor(long_data$any_mets)
+long_data$ln_only <- as.factor(long_data$ln_only)
+long_data$MLH1 <- as.factor(long_data$MLH1)
+# Transform MLH1 into a factor with custom labels
+long_data$MLH1 <- factor(long_data$MLH1, levels = c(0, 1), labels = c("MLH1 Negative", "MLH1 Positive"))
+
+# long_data$Site <- as.factor(long_data$Site)
+
+# For 'any_mets'
+any_mets_plot <- ggplot(long_data, aes(x=CellType, y=Value, fill=any_mets)) +
+  geom_boxplot() +
+  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom") +
+  labs(fill = "Metastasis Status", x = "Cell Type", y = "Cell Type Proportion")
+any_mets_plot
+# For 'Distant_Mets'
+distant_mets_plot_all <- ggplot(long_data, aes(x=CellType, y=Value, fill=Distant_Mets, group=interaction(CellType, Distant_Mets))) +
+  geom_boxplot() +
+  facet_grid(MLH1 ~ CellType, scales = "free_x") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom") +
+  labs(fill = "Distant Mets", x = "Cell Type", y = "Cell Type Proportion")
+distant_mets_plot_all 
+
+
 ```
 
 

@@ -1,0 +1,277 @@
+---
+title: "QC_DM_Colon"
+author: "Alos Diallo"
+date: "2024-05-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(IlluminaHumanMethylationEPICmanifest)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+```
+
+
+```{r}
+idat = "F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/"
+idat2 = "F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/"
+in_dir <- system.file("", "", package = "sesameData")
+betas = openSesame(idat , func = getBetas) 
+```
+
+```{r}
+RGset_eV1 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/",recursive = TRUE) 
+```
+
+```{r}
+qcs_25 = openSesame(in_dir, prep="", func=sesameQC_calcStats)
+qcs_37 = openSesame(idat2, prep="", func=sesameQC_calcStats)
+
+qcs_25[[1]]
+qcs_37[[1]]
+
+```
+
+
+```{r}
+sesameQC_getStats(qcs_25[[1]], "frac_dt")
+sesameQC_getStats(qcs_37[[1]], "frac_dt")
+```
+```{r}
+sdfs_25 = lapply(searchIDATprefixes("F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/"), readIDATpair)
+
+sdfs_37 = lapply(searchIDATprefixes("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/"), readIDATpair)
+```
+
+```{r}
+sdf_withNA_25 = lapply(sdfs_25, pOOBAH)
+sdf_withNA_37 = lapply(sdfs_37, pOOBAH)
+
+sum(sdf_withNA_25$mask) 
+sum(sdf_withNA_37$mask) 
+
+
+```
+
+```{r}
+# Function to plot before and after for a list of SigDF objects
+plotQC <- function(sdf_list) {
+  for (i in seq_along(sdf_list)) {
+    par(mfrow=c(2,1), mar=c(3,3,2,1))
+    sesameQC_plotBetaByDesign(sdf_list[[i]], main=paste("Before (Sample", i, ")"), xlab="β")
+    sesameQC_plotBetaByDesign(noob(sdf_list[[i]]), main=paste("After (Sample", i, ")"), xlab="β")
+  }
+}
+
+# Plotting for both 25 and 37 sample sets
+plotQC(sdf_withNA_25)
+plotQC(sdf_withNA_37)
+
+```
+```{r}
+# Function to plot before and after for a list of SigDF objects with control checks
+plotQC <- function(sdf_list) {
+  for (i in seq_along(sdf_list)) {
+    par(mfrow=c(1,2), mar=c(3,3,2,1))
+    
+    # Check for normalization control probes in the controls attribute
+    controls <- attr(sdf_list[[i]], "controls")
+    
+    if (!is.null(controls) && nrow(controls) > 0) {
+      # Plot Red/Green QQ plot before correction
+      sesameQC_plotRedGrnQQ(dyeBiasCorr(sdf_list[[i]]), main=paste("Before (Sample", i, ")"))
+      
+      # Plot Red/Green QQ plot after nonlinear correction
+      sesameQC_plotRedGrnQQ(dyeBiasNL(sdf_list[[i]]), main=paste("After (Sample", i, ")"))
+    } else {
+      message(paste("Sample", i, "does not have recognized normalization control probes. Skipping correction."))
+      message("Probe IDs in current sample:")
+      print(head(sdf_list[[i]]$Probe_ID))  # Print a few probe IDs for inspection
+      
+      # Optionally, plot the original data without correction
+      sesameQC_plotRedGrnQQ(sdf_list[[i]], main=paste("Original (Sample", i, ")"))
+    }
+  }
+}
+
+# Plotting for both 25 and 37 sample sets
+plotQC(sdf_withNA_25)
+plotQC(sdf_withNA_37)
+
+
+
+```
+
+```{r}
+# Check for control probes in the first SigDF object
+control_probes_25 <- grepl("normControl", sdfs_25[[1]]$Probe_ID)
+control_probes_37 <- grepl("normControl", sdfs_37[[1]]$Probe_ID)
+
+# Summarize the findings
+summary(control_probes_25)
+summary(control_probes_37)
+
+```
+```{r}
+# Inspect the first SigDF object in detail
+str(sdfs_25[[1]])
+str(sdfs_37[[1]])
+
+```
+```{r}
+# Read IDAT files (example for one sample, repeat for all samples)
+sdf_25 <- readIDATpair("F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/207879870069_R08C01")
+sdf_37 <- readIDATpair("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/206184840151_R07C01")
+
+
+# Apply pOOBAH correction
+sdf_25_pOOBAH <- pOOBAH(sdf_25)
+sdf_37_pOOBAH <- pOOBAH(sdf_37)
+
+# Check and print control probes
+controls_25 <- attr(sdf_25_pOOBAH, "controls")
+controls_37 <- attr(sdf_37_pOOBAH, "controls")
+
+if (!is.null(controls_25)) {
+  print(head(controls_25))
+} else {
+  message("No control probes found in 25 sample data.")
+}
+
+if (!is.null(controls_37)) {
+  print(head(controls_37))
+} else {
+  message("No control probes found in 37 sample data.")
+}
+
+# Plot QC metrics (example for one sample, repeat for all samples)
+par(mfrow=c(1,2), mar=c(3,3,2,1))
+
+# Plot before correction
+sesameQC_plotRedGrnQQ(dyeBiasCorr(sdf_25_pOOBAH), main="Before (Sample 1)")
+
+# Plot after nonlinear correction
+sesameQC_plotRedGrnQQ(dyeBiasNL(sdf_25_pOOBAH), main="After (Sample 1)")
+```
+```{r}
+# Function to apply non-linear correction and plot QC
+applyNonLinearCorrection <- function(sdf_list) {
+  corrected_list <- lapply(sdf_list, function(sdf) {
+    # Apply pOOBAH correction
+    sdf_pOOBAH <- pOOBAH(sdf)
+    
+    # Apply non-linear dye bias correction
+    corrected_sdf <- dyeBiasNL(sdf_pOOBAH)
+    
+    return(corrected_sdf)
+  })
+  
+  return(corrected_list)
+}
+
+# Function to plot QC metrics
+plotQC <- function(corrected_list) {
+  for (i in seq_along(corrected_list)) {
+    par(mfrow=c(1,2), mar=c(3,3,2,1))
+    
+    # Plot Red/Green QQ plot before correction
+    sesameQC_plotRedGrnQQ(corrected_list[[i]], main=paste("Non-Linear Correction (Sample", i, ")"))
+  }
+}
+
+# Read IDAT files (example for multiple samples)
+sdfs_25 <- lapply(searchIDATprefixes("F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/"), readIDATpair)
+sdfs_37 <- lapply(searchIDATprefixes("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/"), readIDATpair)
+
+# Apply non-linear correction
+corrected_sdfs_25 <- applyNonLinearCorrection(sdfs_25)
+corrected_sdfs_37 <- applyNonLinearCorrection(sdfs_37)
+
+# Plot QC metrics
+plotQC(corrected_sdfs_25)
+plotQC(corrected_sdfs_37)
+```
+
+```{r}
+
+betas_25 <- lapply(corrected_sdfs_25, getBetas)
+betas_37 <- lapply(corrected_sdfs_37, getBetas)
+
+# Convert each list of beta values to a data frame, then combine them
+betas_matrix_25 <- do.call(cbind, betas_25)
+betas_matrix_37 <- do.call(cbind, betas_37)
+```
+
+Minifi work
+
+```{r}
+RGset_32 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/",recursive = TRUE) 
+RGset_25 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/",recursive = TRUE) 
+```
+
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+```
+
+```{r}
+snps25 <- getSnpInfo(Noob_25_m)
+snps32 <- getSnpInfo(Noob_32_m)
+```
+
+```{r}
+controlStripPlot(RGset_25, controls="BISULFITE CONVERSION I")
+controlStripPlot(RGset_32, controls="BISULFITE CONVERSION I")
+```
+```{r}
+#getQC(Noob_25_m)
+
+# Check the colData of the object
+colData(Noob_25_m)
+
+# If colData is empty or missing necessary columns, add basic information
+if (ncol(colData(Noob_25_m)) == 0) {
+    colData(Noob_25_m) <- DataFrame(sampleNames = colnames(Noob_25_m), group = rep("Group1", ncol(Noob_25_m)))
+}
+
+plotQC(Noob_25_m)
+```
+```{r}
+# Check the class of the object
+class(Noob_25_m)
+
+# Check the colData of the object
+colData(Noob_25_m)
+
+# If colData is empty or missing necessary columns, add basic information
+if (ncol(colData(Noob_25_m)) == 0) {
+    colData(Noob_25_m) <- DataFrame(sampleNames = colnames(Noob_25_m), group = rep("Group1", ncol(Noob_25_m)))
+}
+
+# Check the dimensions of the object
+dim(Noob_25_m)
+```
+ENmix code
+```{r}
+plotCtrl(RGset_32)
+plotCtrl(RGset_25)
+getwd()
+```
+

@@ -1,0 +1,120 @@
+---
+title: "Heatmaps_DM_colon"
+author: "Alos Diallo"
+date: "2024-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+m_vals <- BetaValueToMValue(merged_Betas)
+```
+
+```{r}
+# Ensure merged_Betas is numeric
+if (!is.matrix(merged_Betas) || !all(sapply(merged_Betas, is.numeric))) {
+    merged_Betas <- as.matrix(merged_Betas)  # Convert to matrix if it's not already
+}
+
+# Cap and floor the beta values
+M.val <- ifelse(merged_Betas >= 1, 1 - 1E-6, ifelse(merged_Betas <= 0, 1E-6, merged_Betas))
+
+# Convert to M-values
+M.val2 <- log2(M.val / (1 - M.val))
+
+# Check the dimensions of the new M-values matrix
+dim(M.val2)
+```
+```{r}
+combined_data <- merge(HiTIMED_result, targets, by="SampleID")
+```
+
+```{r}
+long_data <- pivot_longer(
+  combined_data,
+  cols = Tumor:Neu,  # Adjust this range according to your actual columns if needed
+  names_to = "cell_type",
+  values_to = "value"
+)
+long_data$cell_type = factor(long_data$cell_type)
+```
+
+
+```{r}
+# Make the annotation dataframe for the heatmap with 'Patient' column
+heat_annot <- data.frame(
+  row.names = combined_data$SampleID,
+  Gender = combined_data$sex,
+  Treatment= combined_data$any_mets, # Changed Treatment to Patient
+  Tumor = combined_data$Tumor,
+  Site = combined_data$site,
+  CD8 = combined_data$CD8mem
+)
+
+# Order the heat_annot dataframe by Gender
+heat_annot <- heat_annot[order(heat_annot$Site), ]
+# Define colors for annotation color bars
+patient_colors <- c("AW" = "#CEEAB9", "GF" = "#8EF9D0", "GH" = "#5BACF7", "MC" = "#E9B1F7", "NG" = "#B48BE2")
+
+ann_colors <- list(
+  Gender = c('FEMALE' = "#F21F66", 'MALE' = "#176EBD"), 
+  Treatment = c('Baseline'= "grey", 'Post_Drug'= "black"),
+  Patient = patient_colors,  # Use the patient_colors vector here
+  Tissue = c('monocyte' = "#999BB2", 'neutrophil' = "#99B2A8", 'pbmc' = "#385CA2", 't.cell' = "#8A5851", 'whole.blood' = "#AE8B75")
+)
+
+# Extracting the top CpGs using topTable
+top_cpgs <- topTable(fit2, number=Inf, coef="Post_Drug - Baseline", sort.by="p", p.value=0.05)
+
+# Filtering CpGs based on effect size and select top 1000
+selected_cpgs <- top_cpgs[abs(top_cpgs$logFC) > 0.05, ][1:10000,]
+
+# Subset betas
+selected_beta <- beta_subset[rownames(beta_subset) %in% rownames(selected_cpgs), ]
+
+selected_beta_no_na <- selected_beta[complete.cases(selected_beta), ]
+# Calculate variable of each CpG across all samples(all subjects, all tissue types)
+library(matrixStats)
+CpG_Var <- matrixStats::rowVars(selected_beta_no_na)
+rankVar <- data.frame('order' = rank(-CpG_Var), 'var'= CpG_Var)
+rankVar$top10000 <- ifelse(rankVar$order <= 10000, 'Yes', 'No')
+ggpubr::ggscatter(rankVar, x= 'order', y= 'var', color= 'top10000', palette= c('black', 'red') )
+
+# Get rank of CpGs by
+rankvar= rank(-CpG_Var)
+
+#colnames(selected_beta_no_na) <- targets$Patient[match(colnames(selected_beta_no_na), targets$Sample)]
+
+# top 10,000 cpgs
+data.topvar <- selected_beta_no_na[rankVar$top10000 == 'Yes',]
+data.topvar <- as.matrix(data.topvar)
+#(selected_beta_no_na) <- targets$Patient[match(colnames(selected_beta_no_na), targets$Sample)]
+
+
+
+# Reorder the columns of data.topvar to match the order of heat_annot by Gender
+#data.topvar <- data.topvar[, heat_annot$row.names]
+
+#6 blocks of 8 if plotting by chip there might not be enough cpg's 
+pheatmap(
+  data.topvar,
+  annotation_names_col= T,
+  show_rownames= FALSE, #CpGs
+  show_colnames= FALSE, #Samples
+  annotation_col= heat_annot, 
+  #annotation_row= row_annot,
+  annotation_colors= ann_colors,
+  cluster_cols= TRUE,
+  color= colorRampPalette(c("yellow", "blue"))(1024),
+  clustering_distance_rows= "manhattan",
+  clustering_distance_colors= "manhattan",
+  clustering_method= "average",
+  border_color= NA,
+  fontsize= 13
+)
+
+```
+

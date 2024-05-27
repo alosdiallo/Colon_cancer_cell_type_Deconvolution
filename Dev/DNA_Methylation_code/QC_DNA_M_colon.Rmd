@@ -1,0 +1,171 @@
+---
+title: "QC_DNA_M_colon"
+author: "Alos Diallo"
+date: "2024-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(IlluminaHumanMethylationEPICmanifest)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(limma)
+library(tidyr)
+library(minfi)
+library(minfiData)
+library(ENmix)
+library(ggpubr)
+library(IlluminaHumanMethylationEPICmanifest)
+library(ewastools)
+library(data.table)
+library(reshape2)  # For melting the data frame
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+require(grid)
+library(qqman)
+library(ExperimentHub)
+library("sesameData")
+library(RPMM)
+library(doParallel)
+sesameDataCache()
+libraryDataGet("FlowSorted.Blood.EPIC")
+load("C:/Users/Alos Diallo/Downloads/FlowSorted.BloodExtended.EPIC.compTable.rda")
+```
+
+```{r}
+targets <- read.csv("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+```
+
+```{r}
+load("all_samples.RData")
+```
+
+Generating M-Values
+```{r}
+# Ensure merged_Betas is numeric
+if (!is.matrix(merged_Betas) || !all(sapply(merged_Betas, is.numeric))) {
+    merged_Betas <- as.matrix(merged_Betas)  # Convert to matrix if it's not already
+}
+
+# Cap and floor the beta values
+M.val <- ifelse(merged_Betas >= 1, 1 - 1E-6, ifelse(merged_Betas <= 0, 1E-6, merged_Betas))
+
+# Convert to M-values
+M.val2 <- log2(M.val / (1 - M.val))
+
+# Check the dimensions of the new M-values matrix
+dim(M.val2)
+```
+
+
+```{r}
+library(ggplot2)
+library(reshape2)  # Make sure you have this library installed
+
+# Assuming beta_long and m_long have been properly formatted as shown:
+beta_long <- melt(merged_Betas, variable.name = "Sample", value.name = "Beta_Value")
+m_long <- melt(M.val2, variable.name = "Sample", value.name = "M_Value")
+
+# Add a column to each dataframe to distinguish between Beta and M values
+beta_long$type <- "Beta"
+m_long$type <- "M"
+
+# Combine the data frames
+combined_methylation_data <- rbind(beta_long, m_long)
+
+# Generate histograms
+ggplot(combined_methylation_data, aes(x = value, fill = type)) +
+  geom_histogram(bins = 30, alpha = 0.6) +
+  facet_wrap(~type, scales = "free_x") +
+  labs(title = "Histogram of Beta and M Values", x = "Value", y = "Count") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Beta" = "blue", "M" = "red"))
+
+# Save the plot
+ggsave("histograms.png", width = 12, height = 6)
+
+
+```
+
+```{r}
+library(ggplot2)
+library(gridExtra)
+
+# Assuming your data is in data frames 'beta_long' and 'm_long'
+# and has columns 'value' for the measurements and 'variable' for the sample IDs
+
+# Boxplots for Beta and M values
+bp_beta <- ggplot(beta_long, aes(x = variable, y = value)) + geom_boxplot() + theme_minimal() + ggtitle("Beta Values")
+bp_m <- ggplot(m_long, aes(x = variable, y = value)) + geom_boxplot() + theme_minimal() + ggtitle("M Values")
+
+# Histograms for Beta and M values
+hist_beta <- ggplot(beta_long, aes(x = value)) + geom_histogram(bins = 50, fill = "blue") + theme_minimal() + ggtitle("Beta Values")
+hist_m <- ggplot(m_long, aes(x = value)) + geom_histogram(bins = 50, fill = "red") + theme_minimal() + ggtitle("M Values")
+
+# Q-Q plots for Beta and M values
+qq_beta <- ggplot(beta_long, aes(sample = value)) + stat_qq() + stat_qq_line() + theme_minimal() + ggtitle("Beta Values")
+qq_m <- ggplot(m_long, aes(sample = value)) + stat_qq() + stat_qq_line() + theme_minimal() + ggtitle("M Values")
+
+# Combine the plots
+grid.arrange(bp_beta, bp_m, hist_beta, hist_m, qq_beta, qq_m, ncol = 3)
+
+```
+
+```{r}
+library(patchwork)
+
+# Combine the plots
+combined_qc_plot <- (bp_beta | bp_m) / 
+                 (hist_beta | hist_m) / 
+                 (qq_beta | qq_m) 
+
+# Display the plot
+combined_qc_plot & theme(strip.text = element_text(size = 8)) # Adjust the strip text size as needed
+
+```
+
+```{r}
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+```{r}
+# Prepare the list of sample IDs from your matrix's column names
+sampleNames <- colnames(merged_Betas)
+
+# Convert the beta matrix to a SigDF
+# Convert the beta matrix to SigDF
+sigDF <- matrixToSesame(data = merged_Betas, anno = anno)
+
+m_s <- BetaValueToMValue(merged_Betas)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

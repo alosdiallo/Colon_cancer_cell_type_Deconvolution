@@ -27,9 +27,9 @@ library(limma)
 ```
 
 ```{r}
-covar.data <- read.csv("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/Colon_DH_manifest.csv")
-covar.data$patient <- paste(covar.data$Sentrix_ID,covar.data$Sentrix_Position,sep="_")
-rownames(covar.data) <- covar.data$patient
+target <- read.csv("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/dm_57_samples.csv")
+target $patient <- paste(target$Sentrix_ID,target$Sentrix_Position,sep="_")
+rownames(target) <- target$patient
 ```
 
 #Epic V2 which we did not use -- so don't run this.
@@ -365,14 +365,7 @@ if (!all(rownames(design) == colnames(merged_Betas))) {
 
 ```
 
-```{r}
-# Proceed with lmFit
-fit1 <- lmFit(merged_Betas, design)
-summary(fit1)  # Review the analysis results
-```
-```{r}
-contMatrix1 <- makeContrasts(Post_Drug-Baseline,levels = design)
-```
+
 
 
 ```{r}
@@ -398,8 +391,8 @@ library(ggplot2)
 library(reshape2)  # Make sure you have this library installed
 
 # Assuming beta_long and m_long have been properly formatted as shown:
-# beta_long <- melt(merged_Betas, variable.name = "Sample", value.name = "Beta_Value")
-# m_long <- melt(M.val2, variable.name = "Sample", value.name = "M_Value")
+beta_long <- melt(merged_Betas, variable.name = "Sample", value.name = "Beta_Value")
+m_long <- melt(M.val2, variable.name = "Sample", value.name = "M_Value")
 
 # Add a column to each dataframe to distinguish between Beta and M values
 beta_long$type <- "Beta"
