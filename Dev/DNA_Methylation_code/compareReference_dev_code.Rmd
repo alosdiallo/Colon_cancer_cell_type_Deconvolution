@@ -1,0 +1,115 @@
+---
+title: "tcga_test"
+author: "Alos Diallo"
+date: "2024-05-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(minfi)
+library(sesame)
+library(sesameData)
+library(pheatmap)
+library(minfiData)
+library(IlluminaHumanMethylationEPICmanifest)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+```
+
+```{r}
+TCGA_data <- readRDS("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/TCGA_data.rds")
+```
+
+
+```{r}
+targets <- read.csv("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+```
+
+```{r}
+idat = "F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/"
+RGset_32 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/",recursive = TRUE) 
+```
+
+```{r}
+sva<-ctrlsva(RGset_32)
+surrogateVariables <- sva
+# Convert RGChannelSet to RGChannelSetExtended
+RGset_32_extended <- read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/",recursive = TRUE,extended = TRUE)
+RGset_25_extended <- read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/",recursive = TRUE,extended = TRUE) 
+
+# Run QCinfo function
+qc_info32 <- QCinfo(RGset_32_extended)
+qc_info25 <- QCinfo(RGset_25_extended)
+
+# Display QC information
+print(qc_info32)
+print(qc_info25)
+badCpG = c(qc_info32$badCpG,qc_info25$badCpG)
+# Remove any suffix after an underscore
+cleaned_badCpG <- sub("_.*", "", badCpG)
+```
+
+
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+```
+
+```{r}
+Betas_25<-getBeta(Noob_25_m)
+Betas_32<-getBeta(Noob_32_m)
+```
+
+Here I am just getting a sense for the data as a whole. Histograms, q-q plots to see what the data looks like.
+```{r}
+plot_histogram(Betas_25)
+plot_histogram(Betas_32)
+plot_qq(Betas_25, sampled_rows = 1000L)
+plot_qq(Betas_32, sampled_rows = 1000L)
+```
+
+
+```{r}
+Betas_25<- sesame::betasCollapseToPfx(Betas_25)
+Betas_32<- sesame::betasCollapseToPfx(Betas_32)
+colnames(Betas_25) = colnames(Noob_25_m)
+```
+
+```{r}
+DH_CRC_Betas <- merge(Betas_25, Betas_32, by = "row.names")
+rownames(DH_CRC_Betas) <- DH_CRC_Betas$Row.names
+DH_CRC_Betas <- DH_CRC_Betas[,-1] 
+plotMD(DH_CRC_Betas)
+
+```
+
+
+```{r}
+# Assuming 'DH_CRC_Betas' is your human beta values matrix
+betas <- DH_CRC_Betas
+reference_data <- sesameDataGet("EPIC.tissueSignature")
+
+comparison_results <- compareReference(reference_data, betas)
+
+print(comparison_results)
+```
+
+

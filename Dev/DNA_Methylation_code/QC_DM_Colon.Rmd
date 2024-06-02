@@ -275,3 +275,10 @@ plotCtrl(RGset_25)
 getwd()
 ```
 
+Here I am just getting a sense for the data as a whole. Histograms, q-q plots to see what the data looks like.
+```{r}
+plot_histogram(M.val2)
+plot_qq(M.val2, sampled_rows = 1000L)
+```
+
+

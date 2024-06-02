@@ -1,0 +1,395 @@
+---
+title: "EWAS"
+author: "Alos Diallo"
+date: "2024-05-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+```
+
+
+```{r}
+targets <- read.csv("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+```
+
+```{r}
+idat = "F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/"
+RGset_32 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/",recursive = TRUE) 
+```
+
+```{r}
+sva<-ctrlsva(RGset_32)
+surrogateVariables <- sva
+# Convert RGChannelSet to RGChannelSetExtended
+RGset_32_extended <- read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/",recursive = TRUE,extended = TRUE)
+RGset_25_extended <- read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/25_files/",recursive = TRUE,extended = TRUE) 
+
+# Run QCinfo function
+qc_info32 <- QCinfo(RGset_32_extended)
+qc_info25 <- QCinfo(RGset_25_extended)
+
+# Display QC information
+print(qc_info32)
+print(qc_info25)
+badCpG = c(qc_info32$badCpG,qc_info25$badCpG)
+# Remove any suffix after an underscore
+cleaned_badCpG <- sub("_.*", "", badCpG)
+```
+
+
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+```
+
+```{r}
+Betas_25<-getBeta(Noob_25_m)
+Betas_32<-getBeta(Noob_32_m)
+```
+
+Here I am just getting a sense for the data as a whole. Histograms, q-q plots to see what the data looks like.
+```{r}
+plot_histogram(Betas_25)
+plot_histogram(Betas_32)
+plot_qq(Betas_25, sampled_rows = 1000L)
+plot_qq(Betas_32, sampled_rows = 1000L)
+```
+
+
+```{r}
+Betas_25<- sesame::betasCollapseToPfx(Betas_25)
+Betas_32<- sesame::betasCollapseToPfx(Betas_32)
+colnames(Betas_25) = colnames(Noob_25_m)
+```
+
+```{r}
+DH_CRC_Betas <- merge(Betas_25, Betas_32, by = "row.names")
+rownames(DH_CRC_Betas) <- DH_CRC_Betas$Row.names
+DH_CRC_Betas <- DH_CRC_Betas[,-1] 
+plotMD(DH_CRC_Betas)
+
+```
+
+```{r}
+HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",6,"tumor")
+```
+
+
+Generate M values
+```{r}
+DH_CRC_M_value = BetaValueToMValue(DH_CRC_Betas)
+```
+
+
+```{r}
+# Identify good CpGs
+all_cpgs <- rownames(DH_CRC_M_value)
+good_cpgs <- setdiff(all_cpgs, cleaned_badCpG)
+# Filter the M values to keep only good CpGs
+filtered_DH_CRC_M_value <- DH_CRC_M_value[good_cpgs, ]
+DH_CRC_M_value = filtered_DH_CRC_M_value
+```
+
+
+
+```{r}
+# Assuming rownames for both dataframes match and are unique
+# Convert rownames to a column in both dataframes
+#targets = covar.data
+HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+#targets$SampleID <- rownames(targets)
+combined_data = NULL
+# Merge the dataframes by the new SampleID column
+combined_data <- merge(HiTIMED_result, targets, by="SampleID")
+# Reorder combined_data to match the order of columns in M.val2
+combined_data <- combined_data[match(colnames(DH_CRC_Betas), combined_data$SampleID), ]
+combined_data
+library(tidyr)
+
+# Find Sample IDs for rectal tumors
+rectal_samples <- combined_data$SampleID[combined_data$site == "rectum"]
+# Exclude rectal samples from combined_data
+combined_data_filtered <- combined_data[!combined_data$SampleID %in% rectal_samples, ]
+# Exclude rectal samples from DH_CRC_M_value
+DH_CRC_M_value_filtered <- DH_CRC_M_value[, !colnames(DH_CRC_M_value) %in% rectal_samples]
+
+combined_data = combined_data_filtered
+# Reshape data: specifying cols to pivot and columns to keep
+long_data <- pivot_longer(combined_data,
+                          cols = c("Tumor", "Endothelial", "Epithelial", "Stromal", "Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "Mono", "DC", "NK", "Bas", "Eos", "Neu"),
+                          names_to = "CellType",
+                          values_to = "Value")
+
+# Subset to relevant columns
+relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Stromal", "Bmem", "DC", "age", "sex", "any_mets","Distant_Mets","ln_only")
+# Normalize the 'site' variable
+combined_data$site <- tolower(gsub(" ", "", combined_data$site))
+analysis_data <- combined_data[, relevant_columns]
+
+
+# Convert to factors
+categorical_vars <- c("sex", "any_mets", "MLH1","Distant_Mets","ln_only")  # Include any other categorical variables as needed
+analysis_data[categorical_vars] <- lapply(analysis_data[categorical_vars], factor)
+
+# Ensure 'age' is numeric
+analysis_data$age <- as.numeric(as.character(analysis_data$age))
+# Set row names of the data frame to SampleID for alignment
+row.names(analysis_data) <- analysis_data$SampleID
+
+# Check for any conversion errors or NA introductions
+sum(is.na(analysis_data))
+# Create the design matrix
+#design <- model.matrix(~0 + age + sex + site + Distant_Mets + any_mets, data=analysis_data)
+#design <- model.matrix(~0 + any_mets, data=analysis_data)
+design <- model.matrix(~any_mets* MLH1 + age + sex + Tumor + Endothelial + Epithelial + Stromal + Bmem + DC, data=analysis_data)
+colnames(design) <- make.names(colnames(design), unique = TRUE)
+#analysis_data$Distant_Mets
+# adj_corfit <- duplicateCorrelation(DH_CRC_M_value_filtered, design, block=NULL, ndups=2)
+# adj_corfit$consensus.correlation
+
+print(dim(design))  # Verify the size of the design matrix
+print(colnames(design))  # Verify the predictor names
+
+
+print(colnames(design))  # Verify the structure of the design matrix
+
+
+# Check if the order and number of SampleID in design match merged_Betas
+if (!all(rownames(design) == colnames(DH_CRC_M_value))) {
+    stop("Sample IDs do not match between the design matrix and the beta values matrix.")
+}
+
+```
+
+
+relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Stromal", "Bmem", "DC", "age", "sex", "any_mets","Distant_Mets","ln_only")
+
+```{r}
+M.val2 = DH_CRC_M_value_filtered
+results = eBayes(lmFit(M.val2, design,correlation = adj_corfit$consensus.correlation))
+q.values <- qvalue(results$p.value[,'any_metsTRUE.MLH11'])
+summary(q.values)
+
+
+infomation_test = lmFit(M.val2, design,correlation = adj_corfit$consensus.correlation)
+hist(infomation_test$Amean)
+plotSA(infomation_test)
+CutOff = 2
+keep <- infomation_test$Amean > CutOff
+fit2 <- eBayes(infomation_test[keep,], trend=TRUE) 
+plotSA(fit2)
+
+
+q.values <- qvalue(fit2 $p.value[,'any_metsTRUE.MLH11'])
+summary(q.values)
+
+table_info = topTable(results, coef=2, adjust="BH",n=Inf)
+
+# Plot the distribution of expression levels
+hist(rowMeans(M.val2), main="Distribution of Mean Expression Levels", xlab="Mean Expression Level")
+
+```
+```{r}
+data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+
+# Extract log fold changes and p-values
+logFC <- results$coefficients[, 'any_metsTRUE.MLH11']
+pvals <- results$p.value[, 'any_metsTRUE.MLH11']
+```
+
+
+Volcano plot
+```{r}
+# Combine the results with the annotation data
+results_df <- data.frame(
+  probe = rownames(results),
+  logFC = logFC,
+  pval = pvals,
+  stringsAsFactors = FALSE
+)
+results_anno <- merge(results_df, anno, by.x = "probe", by.y = "Name")
+```
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+# Adjust p-values for plotting
+results_anno$logPval <- -log10(results_anno$pval)
+
+
+# Create the volcano plot
+volcano_plot <- ggplot(results_anno, aes(x = logFC, y = logPval)) +
+  geom_point(aes(color = logPval > -log10(0.001)), alpha = 0.5) +
+  scale_color_manual(values = c("black", "red")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot", x = "Log Fold Change", y = "-log10(p-value)")
+
+# Highlight significant points with p-value < 0.001
+volcano_plot <- volcano_plot + 
+  geom_text_repel(data = subset(results_anno, pval < 0.001 & abs(logFC) > 1), 
+                  aes(label = probe),
+                  size = 3, 
+                  max.overlaps = 10)
+
+print(volcano_plot)
+
+# Save the plot
+ggsave(filename = "volcano_plot.png", plot = volcano_plot, width = 12, height = 10, dpi = 600)
+
+```
+
+```{r}
+# Identify significant CpGs
+significant_cpgs <- subset(results_anno, pval < 0.001 & abs(logFC) > 1)
+
+# Select relevant columns (customize as needed to include other annotation columns)
+significant_cpgs_info <- significant_cpgs[, c("probe", "logFC", "pval", "chr", "Islands_Name", "Relation_to_Island","GencodeBasicV12_NAME")]
+
+# Print the list
+print(significant_cpgs_info)
+
+# Optionally, save the list to a file
+write.csv(significant_cpgs_info, file = "significant_cpgs_annotations.csv", row.names = FALSE)
+
+```
+
+Heatmap
+```{r}
+combined_data$sex = factor(combined_data$sex)
+combined_data$any_mets = factor(combined_data$any_mets)
+combined_data$Tumor = as.numeric(combined_data$Tumor)
+combined_data$site = factor(combined_data$site)
+combined_data$CD8mem = as.numeric(combined_data$CD8mem)
+
+# Make the annotation dataframe for the heatmap with 'SampleID' column
+heat_annot <- data.frame(
+  row.names = combined_data$SampleID,
+  Gender = combined_data$sex,
+  Metastasis = combined_data$any_mets, # Changed Treatment to any_mets
+  Site = combined_data$site
+)
+
+# Order the heat_annot dataframe by Site
+heat_annot <- heat_annot[order(heat_annot$Site), ]
+
+# Define colors for annotation color bars
+ann_colors <- list(
+  Gender = c('F' = "#F21F66", 'M' = "#176EBD"), 
+  Metastasis = c('TRUE' = "black", 'FALSE' = "grey"),
+  #Tumor = colorRampPalette(c("blue", "white", "red"))(100), # Example colors for Tumor
+  Site = c(
+    'cecum' = "#FFB6C1",
+    'rectum' = "#ADD8E6",
+    'rightcolon' = "#90EE90",
+    'leftcolon' = "#FFA07A",
+    'sigmoid' = "#DDA0DD",
+    'hepaticflexure' = "#FFD700",  # Added color for hepaticflexure
+    'splenicflexure' = "#98FB98",  # Added color for splenicflexure
+    'transversecolon' = "#8A2BE2"  # Added color for transversecolon
+  )
+  #CD8 = colorRampPalette(c("blue", "white", "red"))(100) # Gradient colors for continuous CD8
+)
+
+
+```
+
+```{r}
+
+# Extract the top CpGs using topTable
+top_cpgs <- topTable(results, coef=2, adjust="BH",n=Inf,sort.by="p")
+
+# Filtering CpGs based on effect size and select top 1000
+selected_cpgs <- top_cpgs[abs(top_cpgs$logFC) > 0.05, ][1:1000, ]
+
+# Subset betas
+selected_beta <- M.val2[rownames(M.val2) %in% rownames(selected_cpgs), ]
+selected_beta_no_na <- selected_beta[complete.cases(selected_beta), ]
+
+```
+
+
+```{r}
+library(matrixStats)
+
+# Convert selected_beta_no_na to a matrix
+selected_beta_no_na_matrix <- as.matrix(selected_beta_no_na)
+
+# Calculate variance of each CpG across all samples
+CpG_Var <- rowVars(selected_beta_no_na_matrix)
+rankVar <- data.frame('order' = rank(-CpG_Var), 'var' = CpG_Var)
+rankVar$top1000 <- ifelse(rankVar$order <= 1000, 'Yes', 'No')
+
+# Get top 1000 variable CpGs
+data.topvar <- selected_beta_no_na_matrix[rankVar$top1000 == 'Yes',]
+
+```
+
+```{r}
+library(pheatmap)
+
+# Reorder the columns of data.topvar to match the order of heat_annot
+data.topvar <- data.topvar[, rownames(heat_annot)]
+
+# Ensure no NA values in heat_annot
+heat_annot <- na.omit(heat_annot)
+
+# Order the heat_annot dataframe by Site
+heat_annot <- heat_annot[order(heat_annot$Metastasis), ]
+
+# Reorder the columns of data.topvar to match the order of heat_annot
+data.topvar <- data.topvar[, rownames(heat_annot)]
+
+# Verify the structure of heat_annot
+str(heat_annot)
+
+
+# Generate the heatmap
+heatm = pheatmap(
+  data.topvar,
+  annotation_names_col = TRUE,
+  show_rownames = FALSE, # CpGs
+  show_colnames = FALSE, # Samples
+  annotation_col = heat_annot, 
+  annotation_colors = ann_colors,
+  cluster_cols = FALSE,
+  color = colorRampPalette(c("yellow", "blue"))(1024),
+  clustering_distance_rows = "manhattan",
+  clustering_distance_cols = "manhattan",
+  clustering_method = "average",
+  border_color = NA,
+  fontsize = 13
+)
+
+print(heatm)
+ggsave(filename = "Heatmap.png", plot = heatm, width = 12, height = 10, dpi = 600)
+```
+
