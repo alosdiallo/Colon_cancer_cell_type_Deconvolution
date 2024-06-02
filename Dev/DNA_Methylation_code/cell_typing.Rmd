@@ -1,0 +1,221 @@
+---
+title: "cell_typing"
+author: "Alos Diallo"
+date: "2024-04-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(IlluminaHumanMethylationEPICmanifest)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(limma)
+library(tidyr)
+library(minfi)
+library(minfiData)
+library(ENmix)
+library(ggpubr)
+library(IlluminaHumanMethylationEPICmanifest)
+library(ewastools)
+library(data.table)
+library(reshape2)  # For melting the data frame
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+require(grid)
+library(qqman)
+library(ExperimentHub)
+library("sesameData")
+library(RPMM)
+library(doParallel)
+sesameDataCache()
+libraryDataGet("FlowSorted.Blood.EPIC")
+load("C:/Users/Alos Diallo/Downloads/FlowSorted.BloodExtended.EPIC.compTable.rda")
+```
+
+Loading the data
+```{r}
+GTEx_eV1 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/",recursive = TRUE) 
+MSet <-preprocessNoob(GTEx_eV1)
+Betas_GTEx <-getBeta(MSet)
+Betas_GTEx <- sesame::betasCollapseToPfx(Betas_GTEx)
+
+saveRDS(Betas_GTEx,file = "F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/GTEx_samples.rds")
+#load("25_files_data_converted.RData")
+#HiTIMED_result<-HiTIMED_deconvolution(Betas,"COAD",6,"tumor")
+```
+```{r}
+Pred_EPIC_DHMC <- projectCellType_CP(merged_Betas[rownames(FlowSorted.BloodExtended.EPIC.compTable),], 
+                                FlowSorted.BloodExtended.EPIC.compTable,lessThanOne =T)*100
+Pred_EPIC_DHMC 
+
+Pred_EPIC_TCGA <- projectCellType_CP(tcga_T[rownames(FlowSorted.BloodExtended.EPIC.compTable),], 
+                                FlowSorted.BloodExtended.EPIC.compTable,lessThanOne =T)*100
+Pred_EPIC_TCGA 
+
+
+Pred_EPIC_GTEx <- projectCellType_CP(beta_matrix[rownames(FlowSorted.BloodExtended.EPIC.compTable),], 
+                                FlowSorted.BloodExtended.EPIC.compTable,lessThanOne =T)*100
+Pred_EPIC_GTEx 
+```
+
+```{r}
+
+.libPaths()
+Pred_EPIC <- projectCellType_CP(merged_Betas[rownames(FlowSorted.BloodExtended.EPIC.compTable),], 
+                                FlowSorted.BloodExtended.EPIC.compTable,lessThanOne =T)*100
+```
+
+```{r}
+if (memory.limit() > 8000) 
+{ propEPIC <- projectCellType_CP(
+    getBeta(preprocessNoob(RGsetTargets))[IDOLOptimizedCpGs, ], 
+    IDOLOptimizedCpGs.compTable, 
+    contrastWBC = NULL, nonnegative = TRUE, 
+    lessThanOne = FALSE 
+) 
+head(propEPIC) 
+percEPIC <- round(propEPIC * 100, 1) }
+```
+```{r}
+HiTIMED_result_gtex <-HiTIMED_deconvolution(Betas_GTEx,"COAD",6,"tumor")
+HiTIMED_result_gtex2 <-HiTIMED_deconvolution(Betas_GTEx,"COAD",2,"tumor")
+
+HiTIMED_result_gtex2$Source <- "GTEx"
+HiTIMED_result_gtex$Source <- "GTEx"
+data_level_6 <- bind_rows(HiTIMED_result_6, tcga_result_6,HiTIMED_result_gtex)
+```
+
+
+```{r}
+Holder = data_level_2[,c(1:4)]
+Holder_main = data_level_6[,c(2:4,18)]
+Holder2 = data_level_6[,c(13,14,16,18)]
+Holder3 = data_level_6[,c(7:11,18)]
+Holder4 = data_level_6[,c(5,6,15,18)]
+Holder5 = data_level_6[,c(12,17,18)]
+```
+
+
+```{r}
+
+library(ggplot2)
+library(tidyr)
+
+# Convert your Holder dataframe to a long format
+long_data_subset <- pivot_longer(
+  Holder,
+  cols = c(Tumor, Immune, Angiogenic),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+long_data_subset2 <- pivot_longer(
+  Holder_main,
+  cols = c(Endothelial,Epithelial,Stromal),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+# Convert your Holder dataframe to a long format
+long_data_subset3 <- pivot_longer(
+  Holder2,
+  cols = c(DC,NK,Eos),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+long_data_subset4 <- pivot_longer(
+  Holder3,
+  cols = c(CD4nv,CD4mem,Treg,CD8nv,CD8mem),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+# Convert your Holder dataframe to a long format
+long_data_subset5 <- pivot_longer(
+  Holder4,
+  cols = c(Bnv,Bmem,Bas),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+long_data_subset6 <- pivot_longer(
+  Holder5,
+  cols = c(Mono,Neu),
+  names_to = "CellType",
+  values_to = "Proportion"
+)
+
+
+# Combine the two long-format data frames into one, with an additional column indicating the data set
+combined_long_data <- bind_rows(
+  long_data_subset %>% mutate(DataSet = "Holder"),
+  long_data_subset2 %>% mutate(DataSet = "Holder_main"),
+  long_data_subset3 %>% mutate(DataSet = "Holder2"),
+  long_data_subset4 %>% mutate(DataSet = "Holder3"),
+  long_data_subset5 %>% mutate(DataSet = "Holder4"),
+  long_data_subset6 %>% mutate(DataSet = "Holder5")
+
+)
+
+```
+
+```{r}
+
+library(viridis)
+
+# Define a custom color-blind friendly palette
+custom_colors <- c("#F42A90", "#56B4E9", "#756CE9", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#999999")
+
+# Generate the boxplot using ggplot2, facetted by the DataSet
+plot_subset <- ggplot(combined_long_data, aes(x = CellType, y = Proportion, fill = Source)) +
+  geom_boxplot() +
+  facet_wrap(~ DataSet, scales = "free") +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.line = element_line(colour = "black"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(title = "Distribution of Select Cell Types",
+       x = "Cell Type", y = "Proportion") +
+  scale_fill_manual(values = custom_colors)  # Apply custom color palette
+
+# Save the plot with a unique filename
+ggsave("Combined_CellTypes_Boxplot_custom.png", plot_subset, width = 12, height = 8)
+
+# Display the plot in R
+print(plot_subset)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
