@@ -1,0 +1,14 @@
+Help for cell2location
+
+##conda deactivate
+##conda env remove -n cell2loc_env
+export PYTHONNOUSERSITE="literallyanyletters"
+export PYTHONPATH=""
+conda create -y -n cell2loc_env python=3.9
+conda activate cell2loc_env
+pip install scvi-tools==1.0.4
+pip install -U "jax[cuda12_pip]==0.4.23" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install cell2location[tutorials]
+pip install jupyter notebook
+
+https://github.com/BayraktarLab/cell2location/issues/348
