@@ -20,3 +20,5 @@ conda activate /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/alos/spa
 conda install ipykernel
 python -m ipykernel install --user --name spatial_work --display-name "Python (SpatialWork)"
 
+Come back to this:
+/dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/users/Gokul_Srinivasan/anaconda3/envs
