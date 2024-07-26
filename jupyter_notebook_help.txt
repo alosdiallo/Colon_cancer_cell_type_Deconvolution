@@ -1,3 +1,4 @@
+#Make sure to not use discovery 7 as it yeilds an error.
 ssh f006fpk@discovery8 -L 9927:localhost:9927
 conda activate R2
 submit-job run-slurm-job -c "sleep 2h" -t 2 -acc qdp-alpha -p v100_vaickus --ppn 8 -n 1 -ng 0 -gsm shared
