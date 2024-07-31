@@ -24,3 +24,9 @@ export APPTAINER_TMPDIR=$(realpath ./tmpdir/)
 export CONDA_PATH=/dartfs-hpc/rc/lab/V/VaickusL/anaconda_installation/
 export CONDA_ENV=R2 
 singularity exec -B $(realpath ../) -B ${APPTAINER_TMPDIR}:/tmp --bind ${CONDA_PATH} --bind $(pwd) /dartfs/rc/nosnapshots/V/VaickusL-nb/EDIT_Students/singularity_images/rstudio.simg rserver --www-address=127.0.0.1 --www-port ${PORT} --rsession-which-r=${CONDA_PATH}/envs/${CONDA_ENV}/bin/R --rsession-ld-library-path=${CONDA_PATH}/envs/${CONDA_ENV}/lib
+
+
+
+
+singularity exec -B ${APPTAINER_TMPDIR}:/tmp --bind  ${CONDA_PATH}/envs/${CONDA_ENV} --bind $(pwd) /dartfs-hpc/rc/lab/C/ChristensenB/singularity_containers/rstudio.simg rserver --www-address=127.0.0.1 --www-port ${PORT} --rsession-which-r=${CONDA_PATH}/envs/${CONDA_ENV}/bin/R --rsession-ld-library-path=${CONDA_PATH}/envs/${CONDA_ENV}/lib
+
