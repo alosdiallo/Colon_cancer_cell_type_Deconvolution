@@ -1,0 +1,348 @@
+---
+title: "Test"
+author: "Alos Diallo"
+date: "2024-08-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(Seurat)
+library(CellChat)
+library(futile.logger)
+library(ggplot2)
+library(stringr)
+library(patchwork)
+library(harmony)
+library(readr)
+library(viridis)
+library(RCurl)
+library(cowplot)
+library(phateR)
+library(compositions)
+library(tidyverse)
+library(dplyr)
+library(hdf5r)
+library(Matrix)
+library(data.table)
+library(ComplexHeatmap)
+library(SingleR)
+library(celldex)
+library(SingleCellExperiment)
+library(reticulate)
+#library(loomR)
+library(anndata)
+library(DESeq2)
+library(viridis)
+library(textshaping)
+library(EnhancedVolcano)
+library(DataExplorer)
+```
+
+
+
+
+```{r}
+
+readPath.patient_106 <- '/Users/adiallo/Desktop/Thesis/Data_Documents/Single_cell_samples/Single Cell/106-A4/count/sample_filtered_feature_bc_matrix'
+
+patient_106.Data <- Read10X(readPath.patient_106)
+```
+
+```{r}
+# Load the Seurat object from an RDS file
+atlas <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/Visium_Data/data/atlas_data.rds")
+
+# Normalize the atlas data using LogNormalize
+atlas <- NormalizeData(atlas, normalization.method = "LogNormalize", scale.factor = 10000)
+atlas <- FindVariableFeatures(atlas, selection.method = "vst", nfeatures = 2000)
+atlas <- ScaleData(atlas)
+
+atlas_data = atlas
+```
+
+
+
+```{r}
+process_patient_data <- function(patient_data) {
+    # Create a Seurat object
+    patient_object <- CreateSeuratObject(counts = patient_data, project = "colon_work", min.cells = 3, min.features = 200)
+    
+    # Calculate the percentage of mitochondrial gene expression
+    patient_object[["percent.mt"]] <- PercentageFeatureSet(patient_object, pattern = "^MT-")
+
+    # Quality control
+    patient_object <- subset(patient_object, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+    
+    # Normalization
+    patient_object <- NormalizeData(patient_object, normalization.method = "LogNormalize", scale.factor = 10000)
+    
+    # Find variable features
+    patient_object <- FindVariableFeatures(patient_object, selection.method = "vst", nfeatures = 2000)
+    
+    # Scaling data
+    patient_object <- ScaleData(patient_object)
+    
+    # Perform PCA
+    patient_object <- RunPCA(patient_object, features = VariableFeatures(object = patient_object))
+    
+    # Find neighbors and clusters
+    patient_object <- FindNeighbors(patient_object, dims = 1:10)
+    patient_object <- FindClusters(patient_object, resolution = 0.5)
+    
+    # Run UMAP
+    patient_object <- RunUMAP(patient_object, dims = 1:10)
+    
+    return(patient_object)
+}
+```
+
+```{r}
+patient_106.Data <- process_patient_data(patient_106.Data)
+```
+
+```{r}
+options(future.globals.maxSize = 600 * 1024^2)
+```
+
+
+```{r}
+transfer_annotations <- function(patient_seurat) {
+    # Find transfer anchors using the atlas as a reference
+    anchors <- FindTransferAnchors(reference = atlas_data, query = patient_seurat, dims = 1:30)
+
+    # Transfer cell type annotations from the atlas to the patient data
+    patient_seurat <- TransferData(anchorset = anchors, reference = atlas_data, query = patient_seurat, refdata = atlas_data@meta.data$cl295v11SubFull)
+
+    return(patient_seurat)
+}
+```
+
+```{r}
+patient_106.Data = transfer_annotations(patient_106.Data)
+```
+```{r}
+# View all unique labels in the predicted.id column
+unique_labels <- unique(patient_106.Data@meta.data$predicted.id)
+print(unique_labels)
+```
+```{r}
+
+# Check the column names to ensure 'predicted.id' exists
+colnames(patient_106.Data@meta.data)
+
+# Define a mapping of original labels to consolidated labels
+consolidated_labels <- c(
+  "cB2 (B GC-like)" = "B cells",
+  "cE02 (Stem/TA-like/Immature Goblet)" = "Tumor cells",
+  "cE04 (Enterocyte 1)" = "Tumor cells",
+  "cE03 (Stem/TA-like prolif)" = "Tumor cells",
+  "cM01 (Monocyte)" = "Monocytes",
+  "cS28 (GREM1+ CAF)" = "Fibroblasts",
+  "cM02 (Macrophage-like)" = "Macrophages",
+  "cS06 (Endo lymphatic)" = "Endothelial cells",
+  "cP2 (Plasma IgG)" = "Plasma cells",
+  "cS29 (MMP3+ CAF)" = "Fibroblasts",
+  "cMA01 (Mast)" = "Mast cells",
+  "cP1 (Plasma IgA)" = "Plasma cells",
+  "cS33 (Schwann)" = "Schwann cells",
+  "cTNI08 (CD4+ Treg)" = "Treg",
+  "cE06 (Immature Goblet)" = "Tumor cells",
+  "cS04 (Endo)" = "Endothelial cells",
+  "cS17 (Pericyte)" = "Pericytes",
+  "cS30 (CAF CCL8 Fibro-like)" = "Fibroblasts",
+  "cS31 (CAF stem niche Fibro-like)" = "Fibroblasts",
+  "cTNI13 (CD8+ T IL17+)" = "CD8+ T-cells",
+  "cTNI17 (gd-like T)" = "CD8+ T-cells",
+  "cE01 (Stem/TA-like)" = "Tumor cells",
+  "cS27 (CXCL14+ CAF)" = "Fibroblasts",
+  "cTNI01 (CD4+ IL7R+)" = "CD4+ T-cells",
+  "cE05 (Enterocyte 2)" = "Tumor cells",
+  "cB3 (B CD40+ GC-like)" = "B cells",
+  "cM07 (pDC)" = "Dendritic cells",
+  "cB1 (B IGD+IgM+)" = "B cells",
+  "cTNI04 (CD4+ IL7R+CCL5+)" = "CD4+ T-cells",
+  "cS26 (Myofibro)" = "Fibroblasts",
+  "cS13 (Endo venous-like)" = "Endothelial cells",
+  "cTNI18 (gd-like T PDCD1+)" = "T cells",
+  "cTNI21 (PLZF+ T prolif)" = "T cells",
+  "cS08 (Endo arterial-like)" = "Endothelial cells",
+  "cP3 (Plasma IgG prolif)" = "Plasma cells",
+  "cM09 (mregDC)" = "Dendritic cells",
+  "cTNI14 (CD8+ CXCL13+)" = "CD8+ T-cells",
+  "cTNI26 (ILC3)" = "Innate lymphoid cells",
+  "cM10 (Granulocyte)" = "Granulocytes",
+  "cM04 (DC2)" = "Dendritic cells",
+  "cTNI05 (CD4+ IL17+)" = "CD4+ T-cells",
+  "cTNI03 (CD4+ IL7R+HSP+)" = "CD4+ T-cells",
+  "cS05 (Endo venous)" = "Endothelial cells",
+  "cS19 (Pericyte)" = "Pericytes",
+  "cTNI02 (CD4+ IL7R+SELL+)" = "CD4+ T-cells",
+  "cTNI20 (PLZF+ T)" = "T cells",
+  "cTNI10 (CD8+ IL7R+)" = "CD8+ T-cells",
+  "cS09 (Endo)" = "Endothelial cells",
+  "cTNI09 (CD4+ Treg prolif)" = "Treg",
+  "cS16 (Pericyte)" = "Pericytes",
+  "cTNI11 (CD8+GZMK+)" = "CD8+ T-cells",
+  "cS12 (Endo)" = "Endothelial cells",
+  "cE08 (Goblet)" = "Goblet cells",
+  "cTNI06 (CD4+ TFH)" = "TFH cells",
+  "cS32 (Smooth Muscle)" = "Smooth muscle cells",
+  "cS14 (Endo)" = "Endothelial cells",
+  "cS25 (Fibro CCL8+)" = "Fibroblasts",
+  "cS22 (Fibro stem cell niche)" = "Fibroblasts",
+  "cS10 (Endo tip cells)" = "Endothelial cells",
+  "cE11 (Enteroendocrine)" = "Enteroendocrine cells",
+  "cM05 (DC2 C1Q+)" = "Dendritic cells",
+  "cTNI15 (CD8+ CXCL13+ HSP+)" = "CD8+ T-cells",
+  "cTNI07 (CD4+ CXCL13+)" = "CD4+ T-cells",
+  "cTNI16 (CD8+ CXCL13+ prolif)" = "CD8+ T-cells",
+  "cTNI22 (cTNI22)" = "cTNI22",
+  "cE10 (Tuft)" = "Tuft cells",
+  "cS15 (Pericyte)" = "Pericytes",
+  "cTNI12 (CD8+ IL7R+)" = "CD8+ T-cells",
+  "cS20 (Pericyte prolif)" = "Pericytes",
+  "cS18 (Pericyte)" = "Pericytes"
+)
+
+# Apply the consolidated labels to the metadata
+patient_106.Data@meta.data$predicted.id <- consolidated_labels[patient_106.Data@meta.data$predicted.id]
+
+# Check for any NA values in the updated labels (in case some labels weren't mapped)
+if (any(is.na(patient_106.Data@meta.data$predicted.id))) {
+  print("Some labels were not mapped. Please update the consolidated_labels mapping.")
+}
+
+# Extract the updated predicted.id
+updated_labels <- patient_106.Data@meta.data$predicted.id
+
+# Ensure that the names of the annotations match the cell barcodes
+names(updated_labels) <- rownames(patient_106.Data@meta.data)
+
+# Create the updated meta data frame
+meta <- data.frame(labels = updated_labels, row.names = names(updated_labels))
+
+# Extract the normalized data matrix using the correct method for Seurat v5.0.0
+data.input <- patient_106.Data[["RNA"]]$data
+
+# Create CellChat object
+cellchat <- createCellChat(object = data.input, meta = meta, group.by = "labels")
+
+
+
+```
+
+```{r}
+CellChatDB <- CellChatDB.human 
+```
+
+```{r}
+showDatabaseCategory(CellChatDB)
+```
+
+```{r}
+dplyr::glimpse(CellChatDB$interaction)
+```
+
+```{r}
+# use a subset of CellChatDB for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") # use Secreted Signaling
+
+# Only uses the Secreted Signaling from CellChatDB v1
+#  CellChatDB.use <- subsetDB(CellChatDB, search = list(c("Secreted Signaling"), c("CellChatDB v1")), key = c("annotation", "version"))
+
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+# CellChatDB.use <- subsetDB(CellChatDB)
+
+
+# use all CellChatDB for cell-cell communication analysis
+# CellChatDB.use <- CellChatDB # simply use the default CellChatDB. We do not suggest to use it in this way because CellChatDB v2 includes "Non-protein Signaling" (i.e., metabolic and synaptic signaling). 
+
+# set the used database in the object
+cellchat@DB <- CellChatDB.use
+```
+
+```{r}
+#devtools::install_github("immunogenomics/presto")
+#Needs presto package
+# subset the expression data of signaling genes for saving computation cost
+cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+future::plan("multisession", workers = 4) # do parallel
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+#> The number of highly variable ligand-receptor pairs used for signaling inference is 692
+
+#> [1] 13.20763
+# project gene expression data onto PPI (Optional: when running it, USER should set `raw.use = FALSE` in the function `computeCommunProb()` in order to use the projected data)
+#cellchat <- CellChat::projectData(cellchat, PPI.human)
+```
+
+```{r}
+cellchat <- computeCommunProb(cellchat, type = "triMean")
+```
+Filter out cells
+```{r}
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+```
+```{r}
+cellchat <- computeCommunProbPathway(cellchat)
+```
+
+
+```{r}
+cellchat <- aggregateNet(cellchat)
+```
+
+```{r}
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+
+# Open a JPEG device
+jpeg("netVisual_circle_plot.jpg", width = 1200, height = 1200, quality = 99)
+# Generate the plot
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+
+# Close the device
+dev.off()
+
+```
+```{r}
+mat <- cellchat@net$weight
+par(mfrow = c(3,4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+```
+```{r}
+pathways.show <- c("CXCL") 
+# Hierarchy plot
+# Here we define `vertex.receive` so that the left portion of the hierarchy plot shows signaling to fibroblast and the right portion shows signaling to immune cells 
+vertex.receiver = seq(1,4) # a numeric vector. 
+netVisual_aggregate(cellchat, signaling = pathways.show,  vertex.receiver = vertex.receiver)
+# Circle plot
+par(mfrow=c(1,1))
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "circle")
+```
+```{r}
+# Chord diagram
+par(mfrow=c(1,1))
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "chord")
+```
+
+```{r}
+netVisual_bubble(cellchat, sources.use = 4, targets.use = c(5:11), remove.isolate = FALSE)
+```
+```{r}
+library(NMF)
+library(ggalluvial)
+```
+
+
