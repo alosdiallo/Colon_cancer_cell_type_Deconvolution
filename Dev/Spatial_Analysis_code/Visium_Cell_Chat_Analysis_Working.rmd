@@ -1,0 +1,556 @@
+---
+title: "Spatial_worker"
+author: "Alos Diallo"
+date: "2024-07-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+library(Seurat)
+library(zellkonverter)
+library(SingleCellExperiment)
+library(patchwork)
+library(SeuratData)
+#InstallData('pbmc3k')
+options(timeout = 1000) 
+#InstallData("pbmcMultiome.SeuratData")
+#https://github.com/satijalab/seurat/issues/5333
+library(pbmcMultiome.SeuratData)
+library(pbmc3k.SeuratData)
+#pbmc3k <- LoadData('pbmc3k')
+#pbmcMultiome <- SeuratData::LoadData("pbmcMultiome.SeuratData")
+```
+Getting PBMC reference data
+```{r message=FALSE, warning=FALSE}
+#pbmc.rna <- LoadData("pbmcMultiome", "pbmc.rna")
+pbmc.rna <- subset(pbmc.rna, seurat_annotations != "filtered")
+pbmc.rna <- NormalizeData(pbmc.rna)
+pbmc.rna <- FindVariableFeatures(pbmc.rna)
+pbmc.rna <- ScaleData(pbmc.rna)
+pbmc.rna <- RunPCA(pbmc.rna)
+pbmc.rna <- RunUMAP(pbmc.rna, dims = 1:30)
+```
+
+```{r}
+options(future.globals.maxSize = 600 * 1024^2)
+```
+
+```{r}
+
+
+# Read the .h5ad file
+sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/106_A4-60_B3_0_adata.h5ad")
+hires_image <- metadata(sce)$spatial$X106_A4.60_B3$images$hires
+
+# Assuming the image matrix is normalized, scale it to 0-255
+hires_image_scaled <- hires_image * 255
+
+# Check the structure of hires_image
+str(hires_image)
+
+# Load necessary library
+library(grid)
+
+# Visualize the RGB image using rasterImage
+grid.raster(hires_image)
+
+# Check the SingleCellExperiment object
+print(sce)
+
+# Extract the count data from the SingleCellExperiment object
+count_data <- assay(sce, "X")
+
+# Extract spatial coordinates and in_tissue information
+spatial_coords <- as.data.frame(colData(sce)[, c("array_row", "array_col", "in_tissue")])
+colnames(spatial_coords) <- c("row", "col", "in_tissue")
+spatial_coords$row <- as.numeric(as.character(spatial_coords$row))
+spatial_coords$col <- as.numeric(as.character(spatial_coords$col))
+spatial_coords$in_tissue <- as.numeric(as.character(spatial_coords$in_tissue))
+
+# Rename the columns if needed
+colnames(spatial_coords) <- c("x", "y", "in_tissue")
+
+# Ensure all columns are numeric
+spatial_coords$x <- as.numeric(spatial_coords$x)
+spatial_coords$y <- as.numeric(spatial_coords$y)
+spatial_coords$in_tissue <- as.numeric(spatial_coords$in_tissue)
+```
+
+```{r}
+# Create a list to mimic what Seurat expects for spatial data images
+image_list <- list(image = hires_image)
+
+# Add metadata about the image dimensions
+image_list$key <- "spatial"
+image_list$coordinates <- data.frame(x = spatial_coords$col, y = spatial_coords$row)
+image_list$scale.factors <- list(spot_diameter_fullres = 1)
+image_list$image <- hires_image
+
+library(tiff)
+
+# Save the image as a TIFF file
+writeTIFF(hires_image, "hires_image.tiff")
+
+
+# Define the directory and filename for the image
+image_path <- "hires_image.tiff"
+
+# Manually add the image to the Seurat object (as we have been doing)
+image_list <- list()
+image_list$image <- readTIFF(image_path, native = TRUE)
+image_list$key <- "spatial"
+image_list$coordinates <- data.frame(x = spatial_coords$col, y = spatial_coords$row)
+image_list$scale.factors <- list(spot_diameter_fullres = 1)
+
+# Add this image list to the Seurat object
+#seurat_object@images$hires <- image_list
+```
+
+Atlas 
+```{r}
+
+# Load the Seurat object from an RDS file
+atlas <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/atlas_data.rds")
+
+# Normalize the atlas data using LogNormalize
+atlas <- NormalizeData(atlas, normalization.method = "LogNormalize", scale.factor = 10000)
+atlas <- FindVariableFeatures(atlas, selection.method = "vst", nfeatures = 2000)
+atlas <- ScaleData(atlas)
+```
+
+```{r}
+
+# Create a new Seurat object using the count data
+seurat_object <- CreateSeuratObject(counts = count_data)
+
+# Add spatial coordinates as metadata
+seurat_object@meta.data <- cbind(seurat_object@meta.data, spatial_coords)
+
+# Inspect and format the metadata
+metadata <- as.data.frame(colData(sce))
+print(head(metadata))
+
+# Ensure the row names of the metadata match the cell names in the Seurat object
+rownames(metadata) <- colnames(seurat_object)
+
+# Add metadata to the Seurat object
+seurat_object <- AddMetaData(seurat_object, metadata = metadata)
+
+# Calculate the percentage of mitochondrial gene expression
+#seurat_object[["percent.mt"]] <- PercentageFeatureSet(seurat_object, pattern = "^MT-")
+
+# Quality control
+#seurat_object <- subset(seurat_object, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+    
+# Normalize the spatial data using LogNormalize
+seurat_object <- NormalizeData(seurat_object, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = 2000)
+seurat_object <- ScaleData(seurat_object)
+
+# Ensure the "counts" layer is present in the atlas
+if (!"counts" %in% names(atlas@assays$RNA)) {
+  atlas@assays$RNA@counts <- atlas@assays$RNA@data
+}
+
+# Ensure the "counts" slot is correctly set for the seurat_object
+if (!"counts" %in% slotNames(seurat_object@assays$RNA)) {
+  seurat_object <- SetAssayData(seurat_object, slot = "counts", new.data = GetAssayData(seurat_object, slot = "data"))
+}
+
+# Find transfer anchors using the atlas as a reference
+anchors <- FindTransferAnchors(reference = atlas, query = seurat_object, dims = 1:30, normalization.method = "LogNormalize")
+
+# Transfer cell type annotations from the atlas to the patient data
+seurat_object <- TransferData(anchorset = anchors, refdata = atlas@meta.data$cl295v11SubFull, query = seurat_object, prediction.assay = TRUE)
+
+# Scaling data
+seurat_object <- ScaleData(seurat_object)
+
+# Perform PCA
+seurat_object <- RunPCA(seurat_object, features = VariableFeatures(object = seurat_object))
+
+# Find neighbors and clusters
+seurat_object <- FindNeighbors(seurat_object, dims = 1:10)
+seurat_object <- FindClusters(seurat_object, resolution = 0.5)
+
+# Backup original annotations
+seurat_object$original_annotations <- seurat_object$predicted.id
+```
+
+
+
+```{r}
+# Define a mapping of original labels to consolidated labels
+consolidated_labels <- c(
+  "cB2 (B GC-like)" = "B cells",
+  "cE02 (Stem/TA-like/Immature Goblet)" = "Tumor cells",
+  "cE04 (Enterocyte 1)" = "Tumor cells",
+  "cE03 (Stem/TA-like prolif)" = "Tumor cells",
+  "cM01 (Monocyte)" = "Monocytes",
+  "cS28 (GREM1+ CAF)" = "Fibroblasts",
+  "cM02 (Macrophage-like)" = "Macrophages",
+  "cS06 (Endo lymphatic)" = "Endothelial cells",
+  "cP2 (Plasma IgG)" = "Plasma cells",
+  "cS29 (MMP3+ CAF)" = "Fibroblasts",
+  "cMA01 (Mast)" = "Mast cells",
+  "cP1 (Plasma IgA)" = "Plasma cells",
+  "cS33 (Schwann)" = "Schwann cells",
+  "cTNI08 (CD4+ Treg)" = "Treg",
+  "cE06 (Immature Goblet)" = "Tumor cells",
+  "cS04 (Endo)" = "Endothelial cells",
+  "cS17 (Pericyte)" = "Pericytes",
+  "cS30 (CAF CCL8 Fibro-like)" = "Fibroblasts",
+  "cS31 (CAF stem niche Fibro-like)" = "Fibroblasts",
+  "cTNI13 (CD8+ T IL17+)" = "CD8+ T-cells",
+  "cTNI17 (gd-like T)" = "CD8+ T-cells",
+  "cE01 (Stem/TA-like)" = "Tumor cells",
+  "cS27 (CXCL14+ CAF)" = "Fibroblasts",
+  "cTNI01 (CD4+ IL7R+)" = "CD4+ T-cells",
+  "cE05 (Enterocyte 2)" = "Tumor cells",
+  "cB3 (B CD40+ GC-like)" = "B cells",
+  "cM07 (pDC)" = "Dendritic cells",
+  "cB1 (B IGD+IgM+)" = "B cells",
+  "cTNI04 (CD4+ IL7R+CCL5+)" = "CD4+ T-cells",
+  "cS26 (Myofibro)" = "Fibroblasts",
+  "cS13 (Endo venous-like)" = "Endothelial cells",
+  "cTNI18 (gd-like T PDCD1+)" = "T cells",
+  "cTNI21 (PLZF+ T prolif)" = "T cells",
+  "cS08 (Endo arterial-like)" = "Endothelial cells",
+  "cP3 (Plasma IgG prolif)" = "Plasma cells",
+  "cM09 (mregDC)" = "Dendritic cells",
+  "cTNI14 (CD8+ CXCL13+)" = "CD8+ T-cells",
+  "cTNI26 (ILC3)" = "Innate lymphoid cells",
+  "cM10 (Granulocyte)" = "Granulocytes",
+  "cM04 (DC2)" = "Dendritic cells",
+  "cTNI05 (CD4+ IL17+)" = "CD4+ T-cells",
+  "cTNI03 (CD4+ IL7R+HSP+)" = "CD4+ T-cells",
+  "cS05 (Endo venous)" = "Endothelial cells",
+  "cS19 (Pericyte)" = "Pericytes",
+  "cTNI02 (CD4+ IL7R+SELL+)" = "CD4+ T-cells",
+  "cTNI20 (PLZF+ T)" = "T cells",
+  "cTNI10 (CD8+ IL7R+)" = "CD8+ T-cells",
+  "cS09 (Endo)" = "Endothelial cells",
+  "cTNI09 (CD4+ Treg prolif)" = "Treg",
+  "cS16 (Pericyte)" = "Pericytes",
+  "cTNI11 (CD8+GZMK+)" = "CD8+ T-cells",
+  "cS12 (Endo)" = "Endothelial cells",
+  "cE08 (Goblet)" = "Goblet cells",
+  "cTNI06 (CD4+ TFH)" = "TFH cells",
+  "cS32 (Smooth Muscle)" = "Smooth muscle cells",
+  "cS14 (Endo)" = "Endothelial cells",
+  "cS25 (Fibro CCL8+)" = "Fibroblasts",
+  "cS22 (Fibro stem cell niche)" = "Fibroblasts",
+  "cS10 (Endo tip cells)" = "Endothelial cells",
+  "cE11 (Enteroendocrine)" = "Enteroendocrine cells",
+  "cM05 (DC2 C1Q+)" = "Dendritic cells",
+  "cTNI15 (CD8+ CXCL13+ HSP+)" = "CD8+ T-cells",
+  "cTNI07 (CD4+ CXCL13+)" = "CD4+ T-cells",
+  "cTNI16 (CD8+ CXCL13+ prolif)" = "CD8+ T-cells",
+  "cTNI22 (cTNI22)" = "cTNI22",
+  "cE10 (Tuft)" = "Tuft cells",
+  "cS15 (Pericyte)" = "Pericytes",
+  "cTNI12 (CD8+ IL7R+)" = "CD8+ T-cells",
+  "cS20 (Pericyte prolif)" = "Pericytes",
+  "cS18 (Pericyte)" = "Pericytes"
+)
+```
+
+
+```{r}
+# Check what columns are available in colData
+print(colnames(colData(sce)))
+
+# Assuming you intended to extract a column named 'predicted.id' or similar:
+# Replace 'predicted.id' with the correct name found above
+predicted_id <- colData(sce)$predicted.id  # Adjust the column name as necessary
+
+# If no direct column is available, inspect the columns in 'seurat_object'
+print(colnames(seurat_object@meta.data))
+
+
+# Apply the consolidated labels to the metadata in the Seurat object
+seurat_object@meta.data$predicted.id <- consolidated_labels[seurat_object@meta.data$predicted.id]
+
+# Check for any NA values in the updated labels (in case some labels weren't mapped)
+if (any(is.na(seurat_object@meta.data$predicted.id))) {
+  print("Some labels were not mapped. Please update the consolidated_labels mapping.")
+}
+
+# Optionally, replace NA values with a specific label or remove them
+seurat_object@meta.data$predicted.id[is.na(seurat_object@meta.data$predicted.id)] <- "Unmapped"
+```
+
+
+
+```{r}
+# Create a mapping from pbmc.rna annotations to your consolidated labels
+pbmc_mapping <- c(
+  "CD14 Mono" = "Monocytes",
+  "CD16 Mono" = "Monocytes",
+  "CD4 Naive" = "CD4+ T-cells",
+  "CD4 TCM" = "CD4+ T-cells",
+  "CD4 TEM" = "CD4+ T-cells",
+  "CD8 Naive" = "CD8+ T-cells",
+  "CD8 TEM_1" = "CD8+ T-cells",
+  "CD8 TEM_2" = "CD8+ T-cells",
+  "cDC" = "Dendritic cells",
+  "gdT" = "T cells",
+  "HSPC" = "Tumor cells",
+  "Intermediate B" = "B cells",
+  "MAIT" = "T cells",
+  "Memory B" = "B cells",
+  "Naive B" = "B cells",
+  "NK" = "NK cells",
+  "pDC" = "Dendritic cells",
+  "Plasma" = "Tumor cells",
+  "Treg" = "Treg"
+)
+
+# Apply the mapping to the seurat_annotations column
+pbmc.rna@meta.data$seurat_annotations <- pbmc_mapping[pbmc.rna@meta.data$seurat_annotations]
+
+
+anchors_pbmc <- FindTransferAnchors(
+  reference = pbmc.rna,
+  query = seurat_object,
+  normalization.method = "LogNormalize",
+  reference.reduction = NULL,
+  dims = 1:50
+)
+
+# Transfer cell type annotations from the atlas to the patient data
+seurat_object <- TransferData(anchorset = anchors_pbmc, refdata = pbmc.rna@meta.data$seurat_annotations, query = seurat_object, prediction.assay = TRUE)
+```
+
+
+```{r}
+# Run UMAP
+seurat_object <- RunUMAP(seurat_object, dims = 1:10)
+
+# Visualize the transferred annotations using UMAP
+DimPlot(seurat_object, reduction = "umap", group.by = "predicted.id")
+
+#New code 
+DefaultAssay(seurat_object) <- "RNA"
+# Manually assign the image list to the Seurat object
+seurat_object@images$hires <- image_list
+
+#seurat_object@images <- NULL
+# Visualize the transferred annotations using spatial plot
+# Extract spatial coordinates and relevant metadata
+spatial_data <- seurat_object@meta.data[, c("x", "y", "predicted.id")]
+
+library(ggplot2)
+library(grid)
+
+# Read in the spatial data (if needed)
+# spatial_data <- read.csv("spatial_data.csv")
+
+# Create a custom plot
+ggplot(spatial_data, aes(x = x, y = y, color = predicted.id)) +
+  annotation_raster(hires_image, xmin = 0, xmax = ncol(hires_image), ymin = 0, ymax = nrow(hires_image)) +
+  geom_point(size = 1.6) +
+  coord_fixed() +
+  theme_minimal()
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# Extract spatial coordinates
+spatial_coords <- as.data.frame(colData(sce)[, c("array_row", "array_col")])
+colnames(spatial_coords) <- c("x", "y")
+
+# Extract predicted cell types from the Seurat object's metadata
+predicted_id <- seurat_object@meta.data$predicted.id
+
+# Combine into a single data frame
+plot_data <- data.frame(
+  x = spatial_coords$x,
+  y = spatial_coords$y,
+  predicted_id = predicted_id
+)
+
+# Plot using ggplot2
+library(ggplot2)
+library(viridis)  # Use the viridis package for colorblind-friendly palettes
+
+# Assuming plot_data is already created
+ggplot(plot_data, aes(x = x, y = y, color = predicted_id)) +
+  geom_point(size = 1.6, alpha = 0.8) +
+  scale_color_viridis(discrete = TRUE, option = "D") +  # Use a viridis palette
+  theme_minimal() +
+  labs(title = "Spatial Distribution of Consolidated Cell Types",
+       x = "Spatial Coordinate X",
+       y = "Spatial Coordinate Y") +
+  theme(legend.position = "right")
+```
+
+
+
+```{r}
+library(CellChat)
+data.input = Seurat::GetAssayData(seurat_object, slot = "data", assay = "RNA") 
+# Extract the updated predicted.id
+updated_labels <- seurat_object@meta.data$predicted.id
+
+# Ensure that the names of the annotations match the cell barcodes
+names(updated_labels) <- rownames(seurat_object@meta.data)
+
+# Create the updated meta data frame
+meta <- data.frame(labels = updated_labels, row.names = names(updated_labels))
+
+# Extract the normalized data matrix using the correct method for Seurat v5.0.0
+data.input <- seurat_object[["RNA"]]$data
+
+# Create CellChat object
+cellchat <- createCellChat(object = data.input, meta = meta, group.by = "labels")
+
+
+scalefactors = jsonlite::fromJSON(txt = file.path("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/spatial/", 'scalefactors_json.json'))
+spot.size = 65 # the theoretical spot size (um) in 10X Visium
+conversion.factor = spot.size/scalefactors$spot_diameter_fullres
+spatial.factors = data.frame(ratio = conversion.factor, tol = spot.size/2)
+
+# Recreate spatial_factors with the correct data
+spatial_factors <- data.frame(
+  ratio = 0.5686331,  # Your calculated ratio
+  tol = 32.5          # Your calculated tolerance
+)
+
+
+n <- nrow(spatial_coords)  # Or the number of groups/cells
+
+# Replicate the row without accidentally overwriting the data
+spatial_factors <- spatial_factors[rep(1, n), , drop = FALSE]
+
+# Create the CellChat object
+cellchat <- createCellChat(object = data.input, meta = meta, group.by = "labels", 
+                           datatype = "spatial", coordinates = spatial_coords, spatial.factors = spatial_factors)
+
+```
+```{r}
+CellChatDB <- CellChatDB.human 
+```
+
+```{r}
+showDatabaseCategory(CellChatDB)
+```
+
+```{r}
+dplyr::glimpse(CellChatDB$interaction)
+```
+
+```{r}
+# use a subset of CellChatDB for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") # use Secreted Signaling
+
+# Only uses the Secreted Signaling from CellChatDB v1
+#  CellChatDB.use <- subsetDB(CellChatDB, search = list(c("Secreted Signaling"), c("CellChatDB v1")), key = c("annotation", "version"))
+
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+# CellChatDB.use <- subsetDB(CellChatDB)
+
+
+# use all CellChatDB for cell-cell communication analysis
+# CellChatDB.use <- CellChatDB # simply use the default CellChatDB. We do not suggest to use it in this way because CellChatDB v2 includes "Non-protein Signaling" (i.e., metabolic and synaptic signaling). 
+
+# set the used database in the object
+cellchat@DB <- CellChatDB.use
+```
+
+```{r}
+#devtools::install_github("immunogenomics/presto")
+#Needs presto package
+# subset the expression data of signaling genes for saving computation cost
+cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+future::plan("multisession", workers = 4) # do parallel
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+#> The number of highly variable ligand-receptor pairs used for signaling inference is 692
+
+#> [1] 13.20763
+# project gene expression data onto PPI (Optional: when running it, USER should set `raw.use = FALSE` in the function `computeCommunProb()` in order to use the projected data)
+#cellchat <- CellChat::projectData(cellchat, PPI.human)
+```
+
+
+```{r}
+cellchat <- computeCommunProb(cellchat, type = "triMean", scale.distance = 1, contact.knn.k = 10)  # Replace 10 with your desired number of neighbors
+```
+Filter out cells
+```{r}
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+```
+
+```{r}
+cellchat <- computeCommunProbPathway(cellchat)
+```
+
+```{r}
+cellchat <- aggregateNet(cellchat)
+```
+
+```{r}
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+
+# Open a JPEG device
+jpeg("netVisual_circle_plot.jpg", width = 1200, height = 1200, quality = 99)
+# Generate the plot
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+
+# Close the device
+dev.off()
+
+```
+```{r}
+mat <- cellchat@net$weight
+par(mfrow = c(3,4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+```
+
+
+```{r}
+pathways.show <- c("CXCL") 
+# Hierarchy plot
+# Here we define `vertex.receive` so that the left portion of the hierarchy plot shows signaling to fibroblast and the right portion shows signaling to immune cells 
+vertex.receiver = seq(1,4) # a numeric vector. 
+netVisual_aggregate(cellchat, signaling = pathways.show,  vertex.receiver = vertex.receiver)
+# Circle plot
+par(mfrow=c(1,1))
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "circle")
+```
+
+
+```{r}
+# Chord diagram
+par(mfrow=c(1,1))
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "chord")
+```
+
+```{r}
+# Convert factor to numeric
+cellchat@images$coordinates$x_cent <- as.numeric(as.character(cellchat@images$coordinates$x_cent))
+cellchat@images$coordinates$y_cent <- as.numeric(as.character(cellchat@images$coordinates$y_cent))
+
+
+par(mfrow=c(1,1))
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "spatial", edge.width.max = 2, vertex.size.max = 1, alpha.image = 0.2, vertex.label.cex = 3.5)
+```
+
+
