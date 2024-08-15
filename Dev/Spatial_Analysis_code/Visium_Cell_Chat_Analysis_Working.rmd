@@ -26,6 +26,8 @@ library(pbmc3k.SeuratData)
 #pbmc3k <- LoadData('pbmc3k')
 #pbmcMultiome <- SeuratData::LoadData("pbmcMultiome.SeuratData")
 ```
+
+
 Getting PBMC reference data
 ```{r message=FALSE, warning=FALSE}
 #pbmc.rna <- LoadData("pbmcMultiome", "pbmc.rna")
@@ -45,8 +47,8 @@ options(future.globals.maxSize = 600 * 1024^2)
 
 
 # Read the .h5ad file
-sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/106_A4-60_B3_0_adata.h5ad")
-hires_image <- metadata(sce)$spatial$X106_A4.60_B3$images$hires
+sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/40_B10-18_G4_0_adata.h5ad")
+hires_image <- metadata(sce)$spatial$X40_B10.18_G4$images$hires
 
 # Assuming the image matrix is normalized, scale it to 0-255
 hires_image_scaled <- hires_image * 255
@@ -95,7 +97,7 @@ image_list$image <- hires_image
 library(tiff)
 
 # Save the image as a TIFF file
-writeTIFF(hires_image, "hires_image.tiff")
+writeTIFF(hires_image, "New_hires_image.tiff")
 
 
 # Define the directory and filename for the image
@@ -177,7 +179,7 @@ seurat_object <- RunPCA(seurat_object, features = VariableFeatures(object = seur
 
 # Find neighbors and clusters
 seurat_object <- FindNeighbors(seurat_object, dims = 1:10)
-seurat_object <- FindClusters(seurat_object, resolution = 0.5)
+seurat_object <- FindClusters(seurat_object, resolution = 0.8 )
 
 # Backup original annotations
 seurat_object$original_annotations <- seurat_object$predicted.id
@@ -293,23 +295,23 @@ seurat_object@meta.data$predicted.id[is.na(seurat_object@meta.data$predicted.id)
 pbmc_mapping <- c(
   "CD14 Mono" = "Monocytes",
   "CD16 Mono" = "Monocytes",
-  "CD4 Naive" = "CD4+ T-cells",
-  "CD4 TCM" = "CD4+ T-cells",
-  "CD4 TEM" = "CD4+ T-cells",
-  "CD8 Naive" = "CD8+ T-cells",
-  "CD8 TEM_1" = "CD8+ T-cells",
-  "CD8 TEM_2" = "CD8+ T-cells",
+  "CD4 Naive" = "T-cells",
+  "CD4 TCM" = "T-cells",
+  "CD4 TEM" = "T-cells",
+  "CD8 Naive" = "T-cells",
+  "CD8 TEM_1" = "T-cells",
+  "CD8 TEM_2" = "T-cells",
   "cDC" = "Dendritic cells",
-  "gdT" = "T cells",
+  "gdT" = "T-cells",
   "HSPC" = "Tumor cells",
   "Intermediate B" = "B cells",
-  "MAIT" = "T cells",
+  "MAIT" = "T-cells",
   "Memory B" = "B cells",
   "Naive B" = "B cells",
   "NK" = "NK cells",
   "pDC" = "Dendritic cells",
   "Plasma" = "Tumor cells",
-  "Treg" = "Treg"
+  "Treg" = "T-cells"
 )
 
 # Apply the mapping to the seurat_annotations column
@@ -386,7 +388,7 @@ library(viridis)  # Use the viridis package for colorblind-friendly palettes
 # Assuming plot_data is already created
 ggplot(plot_data, aes(x = x, y = y, color = predicted_id)) +
   geom_point(size = 1.6, alpha = 0.8) +
-  scale_color_viridis(discrete = TRUE, option = "D") +  # Use a viridis palette
+  #scale_color_viridis(discrete = TRUE, option = "D") +  # Use a viridis palette
   theme_minimal() +
   labs(title = "Spatial Distribution of Consolidated Cell Types",
        x = "Spatial Coordinate X",
