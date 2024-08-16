@@ -11,7 +11,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ## R Markdown
 
-```{r}
+```{r message=FALSE, warning=FALSE}
 library(Seurat)
 library(zellkonverter)
 library(SingleCellExperiment)
@@ -44,8 +44,6 @@ options(future.globals.maxSize = 600 * 1024^2)
 ```
 
 ```{r}
-
-
 # Read the .h5ad file
 sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/40_B10-18_G4_0_adata.h5ad")
 hires_image <- metadata(sce)$spatial$X40_B10.18_G4$images$hires
@@ -97,11 +95,11 @@ image_list$image <- hires_image
 library(tiff)
 
 # Save the image as a TIFF file
-writeTIFF(hires_image, "New_hires_image.tiff")
+writeTIFF(hires_image, "/Users/adiallo/Desktop/hires_image.tiff")
 
 
 # Define the directory and filename for the image
-image_path <- "hires_image.tiff"
+image_path <- "/Users/adiallo/Desktop/hires_image.tiff"
 
 # Manually add the image to the Seurat object (as we have been doing)
 image_list <- list()
@@ -178,11 +176,18 @@ seurat_object <- ScaleData(seurat_object)
 seurat_object <- RunPCA(seurat_object, features = VariableFeatures(object = seurat_object))
 
 # Find neighbors and clusters
-seurat_object <- FindNeighbors(seurat_object, dims = 1:10)
-seurat_object <- FindClusters(seurat_object, resolution = 0.8 )
+seurat_object <- FindNeighbors(seurat_object, dims = 1:20)
+seurat_object <- FindClusters(seurat_object, resolution = 0.3)
 
 # Backup original annotations
 seurat_object$original_annotations <- seurat_object$predicted.id
+
+# Run UMAP
+seurat_object <- RunUMAP(seurat_object, dims = 1:20)
+
+# Visualize the transferred annotations using UMAP
+DimPlot(seurat_object, reduction = "umap", group.by = "predicted.id")
+
 ```
 
 
@@ -326,14 +331,23 @@ anchors_pbmc <- FindTransferAnchors(
   dims = 1:50
 )
 
-# Transfer cell type annotations from the atlas to the patient data
-seurat_object <- TransferData(anchorset = anchors_pbmc, refdata = pbmc.rna@meta.data$seurat_annotations, query = seurat_object, prediction.assay = TRUE)
+# Transfer annotations
+predictions <- TransferData(anchorset = anchors_pbmc, refdata = pbmc.rna@meta.data$seurat_annotations, query = seurat_object, prediction.assay = TRUE)
+
+# Update annotations only where the original labels are not fibroblasts
+seurat_object$predicted.id <- ifelse(seurat_object$predicted.id %in% c("Fibroblasts", "CAF"), 
+                                     seurat_object$predicted.id, 
+                                     predictions$predicted.id)
+#Old but working 
+# 
+# # Transfer cell type annotations from the atlas to the patient data
+# seurat_object <- TransferData(anchorset = anchors_pbmc, refdata = pbmc.rna@meta.data$seurat_annotations, query = seurat_object, prediction.assay = TRUE)
 ```
 
 
 ```{r}
 # Run UMAP
-seurat_object <- RunUMAP(seurat_object, dims = 1:10)
+seurat_object <- RunUMAP(seurat_object, dims = 1:30)
 
 # Visualize the transferred annotations using UMAP
 DimPlot(seurat_object, reduction = "umap", group.by = "predicted.id")
@@ -490,7 +504,7 @@ cellchat <- computeCommunProb(cellchat, type = "triMean", scale.distance = 1, co
 ```
 Filter out cells
 ```{r}
-cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- filterCommunication(cellchat, min.cells = 8)
 ```
 
 ```{r}
