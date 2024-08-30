@@ -1,0 +1,90 @@
+---
+title: "SPATA2_region_selection_tool"
+author: "Alos Diallo"
+date: "2024-08-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# load required packages
+library(SPATA2)
+library(tidyverse)
+library(tidyr)
+```
+
+```{r}
+
+object <- 
+  initiateSpataObjectVisium(
+    sample_name = "106_A4_60_B3", 
+    directory_visium = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/data/106_A4_60_B3/outs" , img_ref = "hires", img_active = "hires"
+  )
+
+# show overview
+object
+
+
+```
+
+```{r}
+object <- identifyPixelContent(object)
+
+plotImageMask(object)
+
+plotPixelContent(object)
+
+plotImage(object) + 
+  ggpLayerFrameByCoords(object)
+plotImage(object, outline = TRUE, line_size = 1)
+
+object <- identifyTissueOutline(object)
+object <- identifySpatialOutliers(object, method = 'image')
+plotSurface(object, color_by = "tissue_section" ,pt_alpha = 0.4)
+plotSurface(object, color_by = 'sp_outlier')
+
+```
+```{r}
+object <- createSpatialSegmentation(object)
+plotSurface(object, color_by = "Patient") 
+```
+
+
+```{r}
+getSpatSegmVarNames(object)
+object <- runDEA(object = object, across = "Patient")
+
+plotDeaVolcano(
+  object = object,
+  across = "Patient", 
+  use_pseudolog = TRUE
+  )
+
+```
+```{r}
+plotBoxplot(object, variables = c("GDF15","KRAS","MYC","PROM1","MKI67","EPCAM","ACTA2"), across = "Patient", nrow = 2, clrp = "npg")
+
+plotBoxplot(object,variables = c("MBP","SNAP25","SEC61G"),across = "Patient")
+```
+
+
+
+
+```{r}
+
+object <- identifyTissueOutline(object, eps = "5um", minPts = 8)
+plotImage(object, outline = TRUE, line_size = 1)
+plotSurface(object, color_by = "tissue_section", pt_clrp = "tab20")
+```
+```{r}
+object_example <- identifyTissueOutline(object, eps = "125um", minPts = 4)
+plotSurface(object_example)
+plotSurface(object_example, color_by = "tissue_section")
+```
+
+```{r}
+plotSurfaceComparison(object, color_by = c("EGFR", "MYC", "ACTA2"), nrow = 1)
+```
