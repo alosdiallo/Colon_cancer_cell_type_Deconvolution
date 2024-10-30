@@ -17,20 +17,46 @@ library(zellkonverter)
 library(SingleCellExperiment)
 library(patchwork)
 library(SeuratData)
-#InstallData('pbmc3k')
 options(timeout = 1000) 
-#InstallData("pbmcMultiome.SeuratData")
+InstallData('pbmc3k')
+InstallData("pbmcMultiome")
 #https://github.com/satijalab/seurat/issues/5333
 library(pbmcMultiome.SeuratData)
 library(pbmc3k.SeuratData)
+
+#Run if below does not work
+# url <- 'http://cf.10xgenomics.com/samples/cell-exp/1.1.0/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz'
+# curl::curl_download(url = url, destfile = basename(path = url))
+# untar(tarfile = basename(path = url))
+# pbmc.data <- Seurat::Read10X(data.dir = 'filtered_gene_bc_matrices/hg19/')
+# pbmc3k <- Seurat::CreateSeuratObject(counts = pbmc.data, project = 'pbmc3k', min.cells = 3, min.features = 200)
+
+# url <- 'http://seurat.nygenome.org/src/contrib/pbmcMultiome.SeuratData_0.1.4.tar.gz'
+# curl::curl_download(url = url, destfile = basename(path = url))
+# untar(tarfile = basename(path = url))
+# pbmcMultiome.data <- Seurat::Read10X(data.dir = 'filtered_gene_bc_matrices/hg19/')
+# pbmcMultiome <- Seurat::CreateSeuratObject(counts = pbmcMultiome.data, project = 'pbmcMultiome', min.cells = 3, min.features = 200) 
+  
+# Read the data and create a Seurat object
+# data_dir = "/Users/adiallo/Desktop/Thesis/Data_Documents/filtered_gene_bc_matrices/hg19"
+# pbmc3k_data <- Read10X(data.dir = data_dir)
+# pbmc3k <- CreateSeuratObject(counts = pbmc3k_data, project = "pbmc3k", min.cells = 3, min.features = 200)
+# 
+# 
+# data_dir = "/Users/adiallo/Desktop/Thesis/Data_Documents/filtered_gene_bc_matrices_2/hg19"
+# pbmcMultiome <- Read10X(data.dir = data_dir)
+# pbmcMultiome <- CreateSeuratObject(counts = pbmcMultiome, project = "pbmc3k", min.cells = 3, min.features = 200)
+
+#Run this if the below fails
 #pbmc3k <- LoadData('pbmc3k')
-#pbmcMultiome <- SeuratData::LoadData("pbmcMultiome.SeuratData")
+# pbmcMultiome <- SeuratData::LoadData("pbmcMultiome.SeuratData")
 ```
 
 
 Getting PBMC reference data
 ```{r message=FALSE, warning=FALSE, include=FALSE}
-#pbmc.rna <- LoadData("pbmcMultiome", "pbmc.rna")
+
+pbmc.rna <- LoadData("pbmcMultiome", "pbmc.rna")
 pbmc.rna <- subset(pbmc.rna, seurat_annotations != "filtered")
 pbmc.rna <- NormalizeData(pbmc.rna)
 pbmc.rna <- FindVariableFeatures(pbmc.rna)
@@ -40,13 +66,13 @@ pbmc.rna <- RunUMAP(pbmc.rna, dims = 1:30)
 ```
 
 ```{r}
-options(future.globals.maxSize = 600 * 1024^2)
+options(future.globals.maxSize = 10 * 1024^3)  # 10 GB
 ```
 
 ```{r}
 # Read the .h5ad file
-sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/40_B10-18_G4_0_adata.h5ad")
-hires_image <- metadata(sce)$spatial$X40_B10.18_G4$images$hires
+sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/40_B10-18_G4_0_2_adata.h5ad")
+hires_image <- metadata(sce)$spatial$X28_A9.74_A3$images$hires
 
 # Assuming the image matrix is normalized, scale it to 0-255
 hires_image_scaled <- hires_image * 255
@@ -458,6 +484,8 @@ cellchat <- createCellChat(object = data.input, meta = meta, group.by = "labels"
                            datatype = "spatial", coordinates = spatial_coords, spatial.factors = spatial_factors)
 
 ```
+
+
 ```{r}
 CellChatDB <- CellChatDB.human 
 ```
@@ -536,7 +564,7 @@ dev.off()
 
 ```
 ```{r}
-pathways.show <- c("GAS") 
+pathways.show <- c("EGF") 
 mat <- cellchat@net$weight
 par(mfrow = c(3,4), xpd=TRUE)
 for (i in 1:nrow(mat)) {
@@ -548,7 +576,7 @@ for (i in 1:nrow(mat)) {
 
 
 ```{r}
-pathways.show <- c("GAS") 
+pathways.show <- c("EGF") 
 # Hierarchy plot
 # Here we define `vertex.receive` so that the left portion of the hierarchy plot shows signaling to fibroblast and the right portion shows signaling to immune cells 
 vertex.receiver = seq(1,4) # a numeric vector. 
@@ -582,7 +610,7 @@ netVisual_heatmap(cellchat, measure = "weight", color.heatmap = "Blues")
 netVisual_bubble(cellchat, remove.isolate = FALSE,signaling = "GAS")
 ```
 ```{r}
-plotGeneExpression(cellchat, signaling = "GAS", enriched.only = TRUE, type = "violin")
+plotGeneExpression(cellchat, signaling = "EGF", enriched.only = TRUE, type = "violin")
 ```
 ```{r}
 cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
@@ -615,6 +643,11 @@ spatialFeaturePlot(cellchat, features = c("GDF15","ENTPD1","SOX17","KRAS","MYC",
 spatialFeaturePlot(cellchat, features = c("CD27","CCR5","CD40","CCR6"), point.size = 0.8, color.heatmap = "Reds", direction = 1,ncol=4)
  
 spatialFeaturePlot(cellchat, features = c("TNF","IFNG"), point.size = 0.8, color.heatmap = "Reds", direction = 1,ncol=4)
+spatialFeaturePlot(cellchat, features = c("KRAS","BRAF"), point.size = 0.8, color.heatmap = "Reds", direction = 1,ncol=4)
+
+spatialFeaturePlot(cellchat, features = c("EPCAM"), point.size = 0.8, color.heatmap = "Reds", direction = 1,ncol=4)
+spatialFeaturePlot(cellchat, features = c("KRAS"), point.size = 0.8, color.heatmap = "Reds", direction = 1,ncol=4)
+spatialFeaturePlot(cellchat, features = c("BRAF"), point.size = 0.8, color.heatmap = "Reds", direction = 1,ncol=4)
 ```
 
 ```{r}
@@ -622,7 +655,7 @@ library(Seurat)
 library(ggplot2)
 
 # Example with TNF and IFNG
-gene_expression_data <- FetchData(seurat_object, vars = c("MYC", "ACTA2"))
+gene_expression_data <- FetchData(seurat_object, vars = c("KRAS", "BRAF"))
 
 # Combine with spatial coordinates
 plot_data <- cbind(spatial_coords, gene_expression_data)
@@ -630,7 +663,7 @@ plot_data <- cbind(spatial_coords, gene_expression_data)
 library(ggplot2)
 
 # Plot TNF
-p1 <- ggplot(plot_data, aes(x = x, y = y, color = MYC)) +
+p1 <- ggplot(plot_data, aes(x = x, y = y, color = KRAS)) +
   geom_point(alpha = 0.6, size = 1) +
   scale_color_gradient(low = "white", high = "red") +
   coord_fixed() +
@@ -640,7 +673,7 @@ p1 <- ggplot(plot_data, aes(x = x, y = y, color = MYC)) +
        y = "Spatial Coordinate Y")
 
 # Plot IFNG
-p2 <- ggplot(plot_data, aes(x = x, y = y, color = ACTA2)) +
+p2 <- ggplot(plot_data, aes(x = x, y = y, color = BRAF)) +
   geom_point(alpha = 0.6, size = 1) +
   scale_color_gradient(low = "white", high = "blue") +
   coord_fixed() +
@@ -659,10 +692,10 @@ library(ggnewscale)
 
 # Overlay TNF and IFNG expression with different color scales
 ggplot(plot_data, aes(x = x, y = y)) +
-  geom_point(aes(color = MYC), alpha = 0.6, size = 1) +
+  geom_point(aes(color = KRAS), alpha = 0.6, size = 1) +
   scale_color_gradient(low = "white", high = "red") +
   new_scale("color") +  # Add new color scale for the next geom
-  geom_point(aes(color = ACTA2), alpha = 0.6, size = 1) +
+  geom_point(aes(color = BRAF), alpha = 0.6, size = 1) +
   scale_color_gradient(low = "white", high = "blue") +
   coord_fixed() +
   theme_minimal() +
@@ -780,4 +813,8 @@ ggplot(plot_data, aes(x = x, y = y)) +
   labs(title = "Overlay of ACTA2 (CAF), EPCAM (CRC), and CD8A (CD8 T-cell)",
        x = "Spatial Coordinate X",
        y = "Spatial Coordinate Y")
+```
+
+```{r}
+runCellChatApp(cellchat)
 ```
