@@ -1,0 +1,60 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Install pwrEWAS package if you haven't already
+#devtools::install_github("stefangraw/pwrEWAS")
+#devtools::install_github("stefangraw/pwrEWAS.data") 
+
+```{r}
+library(pwrEWAS)
+
+# Define parameters for power calculation
+n <- 57        # Number of samples
+
+# Perform power calculation
+power_result <- pwrEWAS(minTotSampleSize = n, maxTotSampleSize = 70, NcntPer = 0.5263158,
+                        targetDelta = 0.2, targetDmCpGs = 50, J = 10000,
+                        DMmethod = "t-test (unequal var)",core = 5)
+
+# Print the results
+print(power_result$powerArray)  
+```
+```{r}
+# Load necessary library
+library(effsize)
+
+# Assume DH_CRC_Betas is your beta values matrix
+# combined_data contains metadata with SampleID and Group columns
+v = colnames(DH_CRC_Betas)
+v = v[-1]
+# Match the sample IDs in combined_data with the columns in DH_CRC_Betas
+matched_indices <- match(v, combined_data$SampleID)
+
+# Ensure the matched indices align properly
+if (any(is.na(matched_indices))) {
+  stop("Some SampleIDs in combined_data are not found in the columns of DH_CRC_Betas")
+}
+
+# Create a vector for the group information
+group_vector <- combined_data$Group[matched_indices]
+
+# Prepare a function to calculate Cohen's d for each CpG site
+calculate_cohen_d <- function(beta_values, group_vector) {
+  mets <- beta_values[group_vector == "mets"]
+  non_mets <- beta_values[group_vector == "non_mets"]
+  cohen.d(mets, non_mets, pooled=TRUE)$estimate
+}
+
+# Calculate Cohen's d for each CpG site
+cohen_d_values <- apply(DH_CRC_Betas, 1, calculate_cohen_d, group_vector)
+
+# Create a data frame to store the results
+effect_sizes <- data.frame(CpG = rownames(DH_CRC_Betas), Cohen_d = cohen_d_values)
+
+# Print the first few rows of the effect sizes
+print(head(effect_sizes))
+
+```
+

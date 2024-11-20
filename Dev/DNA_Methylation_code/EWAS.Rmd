@@ -11,7 +11,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 
 
-```{r message=FALSE, warning=FALSE}
+```{r message=FALSE, warning=FALSE, include=FALSE}
 library(minfi)
 library(sesame)
 library(pheatmap)
@@ -26,6 +26,11 @@ library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
 library(IlluminaHumanMethylationEPICmanifest)
 library(limma)
 library(qvalue)
+library(ENmix)
+library(DataExplorer)
+library(missMethyl)
+library(methylGSA)
+library(TCA)
 ```
 
 
@@ -55,8 +60,6 @@ qc_info32 <- QCinfo(RGset_32_extended)
 qc_info25 <- QCinfo(RGset_25_extended)
 
 # Display QC information
-print(qc_info32)
-print(qc_info25)
 badCpG = c(qc_info32$badCpG,qc_info25$badCpG)
 # Remove any suffix after an underscore
 cleaned_badCpG <- sub("_.*", "", badCpG)
@@ -68,10 +71,19 @@ Noob_25_m = preprocessNoob(RGset_25)
 Noob_32_m = preprocessNoob(RGset_32)
 ```
 
+
+```{r}
+qc_25 = minfiQC(Noob_25_m, fixOutliers = TRUE, verbose = FALSE)
+qc_32 = minfiQC(Noob_32_m, fixOutliers = TRUE, verbose = FALSE)
+plotQC(qc_25$qc)
+plotQC(qc_32$qc)
+```
+
 ```{r}
 Betas_25<-getBeta(Noob_25_m)
 Betas_32<-getBeta(Noob_32_m)
 ```
+
 
 Here I am just getting a sense for the data as a whole. Histograms, q-q plots to see what the data looks like.
 ```{r}
@@ -90,20 +102,121 @@ colnames(Betas_25) = colnames(Noob_25_m)
 
 ```{r}
 DH_CRC_Betas <- merge(Betas_25, Betas_32, by = "row.names")
-rownames(DH_CRC_Betas) <- DH_CRC_Betas$Row.names
-DH_CRC_Betas <- DH_CRC_Betas[,-1] 
-plotMD(DH_CRC_Betas)
+
+
+#saveRDS(DH_CRC_Betas,file = "F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/DH_CRC_Betas.rds")
+# rownames(DH_CRC_Betas) <- DH_CRC_Betas$Row.names
+# DH_CRC_Betas <- DH_CRC_Betas[,-1] 
+# plotMD(DH_CRC_Betas)
 
 ```
 
 ```{r}
-HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",6,"tumor")
+#DH_CRC_Betas = readRDS("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/DH_CRC_Betas.rds")
+
+```
+
+
+#Filter out probes -- Does not work right now
+```{r}
+# use = annotation %>% dplyr::filter(MASK_general == "FALSE" & NonCpG == "FALSE" & SexProbe == "FALSE")
+# use<-use$probeID
+# DH_CRC_Betas <- DH_CRC_Betas[use,]
+```
+
+Running HiTIMED
+```{r}
+DH_CRC_Betas_matrix <- as.matrix(DH_CRC_Betas[, -1])  # Exclude the first column (Row.names) if it's not numeric
+rownames(DH_CRC_Betas_matrix) <- DH_CRC_Betas$Row.names  # Set row names
+
+
+HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas_matrix,"COAD",6,"tumor")
+```
+EpiDISH to generate fibroblast proportions 
+```{r}
+library(EpiDISH)
+data(centEpiFibIC.m)
+cpg_sites_beta <- rownames(DH_CRC_Betas)
+cpg_sites_ref <- rownames(centEpiFibIC.m)
+
+
+# Run the EpiDISH function using the reference matrix
+results_epidish <- epidish(beta.m = DH_CRC_Betas_matrix, ref.m = centEpiFibIC.m, method = "RPC")
+
+# Extract the estimated cell type proportions
+cell_type_proportions_Fib = results_epidish$estF
+
+# Convert the matrix to a data frame without adding 'SampleID' as a column
+cell_type_proportions_Fib_df <- as.data.frame(cell_type_proportions_Fib)
+
+
+# Identify numeric columns (excluding 'SampleID')
+numeric_cols <- sapply(cell_type_proportions_Fib_df, is.numeric)
+
+# Multiply those columns by 100 to convert proportions to percentages
+cell_type_proportions_Fib_df[, numeric_cols] <- cell_type_proportions_Fib_df[, numeric_cols] * 100
+
+# View the first few rows of the data frame
+head(cell_type_proportions_Fib_df)
+
+```
+```{r}
+# Convert row names to a 'SampleID' column in EpiDISH data
+cell_type_proportions_Fib_df$SampleID <- rownames(cell_type_proportions_Fib_df)
+
+# Reset row names to default
+rownames(cell_type_proportions_Fib_df) <- NULL
+
+# Convert row names to a 'SampleID' column in HiTIMED data
+HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+
+# Reset row names to default
+rownames(HiTIMED_result) <- NULL
+
+# Select the 'Fib' column and 'SampleID' from EpiDISH data
+EpiDISH_selected <- cell_type_proportions_Fib_df[, c("SampleID", "Fib")]
+
+# Select the desired columns from HiTIMED, including 'SampleID'
+HiTIMED_selected <- HiTIMED_result[, c("SampleID", "Tumor", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "DC", "NK")]
+
+# Merge EpiDISH and HiTIMED data frames on 'SampleID'
+combined_df <- merge(EpiDISH_selected, HiTIMED_selected, by = "SampleID")
+
+# View the first few rows
+head(combined_df)
+
+```
+```{r}
+# Load required libraries
+library(ggplot2)
+library(tidyr)
+
+# Ensure your data frame 'combined_df' is in long format
+combined_long <- combined_df %>%
+  pivot_longer(cols = c("Fib", "Tumor", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "DC", "NK"),
+               names_to = "CellType", values_to = "Proportion")
+
+# View the reshaped data
+head(combined_long)
+
+# Create a stacked bar plot
+ggplot(combined_long, aes(x = SampleID, y = Proportion, fill = CellType)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Sample ID", y = "Cell Type Proportion (%)", title = "Cell Type Proportions Across Samples") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_fill_brewer(palette = "Set3")
+
 ```
 
 
 Generate M values
 ```{r}
-DH_CRC_M_value = BetaValueToMValue(DH_CRC_Betas)
+DH_CRC_M_value = BetaValueToMValue(DH_CRC_Betas_matrix)
+#saveRDS(DH_CRC_M_value,file = "F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/DH_CRC_M_value.rds")
+```
+
+```{r}
+DH_CRC_M_value = readRDS("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/DH_CRC_M_value.rds")
 ```
 
 
@@ -139,6 +252,11 @@ combined_data_filtered <- combined_data[!combined_data$SampleID %in% rectal_samp
 # Exclude rectal samples from DH_CRC_M_value
 DH_CRC_M_value_filtered <- DH_CRC_M_value[, !colnames(DH_CRC_M_value) %in% rectal_samples]
 
+M.val2 = DH_CRC_M_value_filtered
+
+mad_vals <- apply(M.val2,1,mad)
+
+
 combined_data = combined_data_filtered
 # Reshape data: specifying cols to pivot and columns to keep
 long_data <- pivot_longer(combined_data,
@@ -147,7 +265,7 @@ long_data <- pivot_longer(combined_data,
                           values_to = "Value")
 
 # Subset to relevant columns
-relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Stromal", "Bmem", "DC", "age", "sex", "any_mets","Distant_Mets","ln_only")
+relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Stromal", "Bmem", "DC", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem","age", "sex", "any_mets","Distant_Mets","ln_only")
 # Normalize the 'site' variable
 combined_data$site <- tolower(gsub(" ", "", combined_data$site))
 analysis_data <- combined_data[, relevant_columns]
@@ -167,7 +285,7 @@ sum(is.na(analysis_data))
 # Create the design matrix
 #design <- model.matrix(~0 + age + sex + site + Distant_Mets + any_mets, data=analysis_data)
 #design <- model.matrix(~0 + any_mets, data=analysis_data)
-design <- model.matrix(~any_mets* MLH1 + age + sex + Tumor + Endothelial + Epithelial + Stromal + Bmem + DC, data=analysis_data)
+design <- model.matrix(~any_mets* MLH1 + age + sex + Tumor + Endothelial + Epithelial + Stromal + CD8mem + CD4mem + Treg + DC, data=analysis_data)
 colnames(design) <- make.names(colnames(design), unique = TRUE)
 #analysis_data$Distant_Mets
 # adj_corfit <- duplicateCorrelation(DH_CRC_M_value_filtered, design, block=NULL, ndups=2)
@@ -188,10 +306,56 @@ if (!all(rownames(design) == colnames(DH_CRC_M_value))) {
 ```
 
 
-relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Stromal", "Bmem", "DC", "age", "sex", "any_mets","Distant_Mets","ln_only")
+
+
+```{r}
+# Assume M.val2 is your matrix of M-values
+# Calculate the variance for each CpG site
+variance <- apply(M.val2, 1, var)
+
+# Create a data frame for plotting
+variance_df <- data.frame(CpG = rownames(M.val2), Variance = variance)
+
+# Plot the variance histogram
+ggplot(variance_df, aes(x = Variance)) +
+  geom_histogram(bins = 50, fill = "blue", color = "black") +
+  labs(title = "Variance of M-values for CpG Sites", x = "Variance", y = "Frequency") +
+  theme_minimal()
+
+# Plot the cumulative distribution of variance
+variance_df <- variance_df[order(variance_df$Variance),]
+variance_df$Cumulative <- cumsum(variance_df$Variance)
+
+ggplot(variance_df, aes(x = seq_along(Cumulative), y = Cumulative)) +
+  geom_line(color = "blue") +
+  labs(title = "Cumulative Variance of M-values for CpG Sites", x = "Rank of CpG Sites", y = "Cumulative Variance") +
+  theme_minimal()
+
+# Set a threshold for variance
+variance_threshold <- 0.01 # Example threshold, adjust based on your visual inspection
+
+# Plot the cumulative variance with a threshold line
+ggplot(variance_df, aes(x = seq_along(Cumulative), y = Cumulative)) +
+  geom_line(color = "blue") +
+  geom_vline(xintercept = which(variance_df$Variance >= variance_threshold)[1], color = "red", linetype = "dashed") +
+  labs(title = "Cumulative Variance of M-values for CpG Sites",
+       x = "Rank of CpG Sites",
+       y = "Cumulative Variance") +
+  theme_minimal()
+```
+
 
 ```{r}
 M.val2 = DH_CRC_M_value_filtered
+M.val2 <- M.val2[names(sort(rank(-mad_vals))[1:50000]),]
+
+```
+
+
+relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Stromal", "Bmem", "DC", "age", "sex", "any_mets","Distant_Mets","ln_only")
+
+```{r}
+
 results = eBayes(lmFit(M.val2, design,correlation = adj_corfit$consensus.correlation))
 q.values <- qvalue(results$p.value[,'any_metsTRUE.MLH11'])
 summary(q.values)
@@ -215,6 +379,8 @@ table_info = topTable(results, coef=2, adjust="BH",n=Inf)
 hist(rowMeans(M.val2), main="Distribution of Mean Expression Levels", xlab="Mean Expression Level")
 
 ```
+
+
 ```{r}
 data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
 anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
@@ -266,6 +432,76 @@ print(volcano_plot)
 ggsave(filename = "volcano_plot.png", plot = volcano_plot, width = 12, height = 10, dpi = 600)
 
 ```
+
+
+```{r}
+
+# Load the EnhancedVolcano package
+library(EnhancedVolcano)
+
+# Create the enhanced volcano plot with more colors
+EnhancedVolcano(results_anno,
+                lab = results_anno$probe,
+                x = 'logFC',
+                y = 'pval',
+                pCutoff = 0.001,
+                FCcutoff = 1,
+                title = 'Enhanced Volcano Plot',
+                subtitle = 'Highlighting significant points with p-value < 0.001 and |logFC| > 1',
+                xlab = 'Log Fold Change',
+                ylab = '-log10(p-value)',
+                col = c('grey', 'blue', 'green', 'red'),
+                pointSize = 3.0,
+                labSize = 3.0,
+                legendLabels = c('NS', 'Log FC', 'p-value', 'p-value & Log FC'),
+                legendPosition = 'right',
+                legendLabSize = 10,
+                legendIconSize = 3.0,
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                colConnectors = 'grey50')
+
+
+```
+
+
+GSEA help
+https://support.bioconductor.org/p/9148654/
+```{r}
+# Assuming results_anno is already loaded and has the necessary columns
+# Load the required package
+library(methylGSA)
+# Step 1: Filter for significant p-values (e.g., p-value < 0.001)
+significant_results <- results_anno[results_anno$pval < 0.001, ]
+
+# Step 2: Combine probes with significant p-values
+v <- cbind(significant_results$probe, significant_results$pval)
+
+# Step 3: Create a named vector cpg_pval
+cpg_pval <- as.numeric(significant_results$pval)
+names(cpg_pval) <- significant_results$probe
+
+# Verify the created named vector
+head(cpg_pval)
+
+# Now run the methylglm function
+results_methylGSA <- methylglm(
+    cpg.pval = cpg_pval,          # Named vector of p-values
+    array.type = "EPIC",          # Specify the array type, "EPIC" or "450K"
+    group = "all",                # Specify the group, e.g., "all", "body", "promoter1", or "promoter2"
+    GS.type = "GO",               # Specify the gene set category, e.g., "GO", "KEGG", or "Reactome"
+    minsize = 100,                # Minimum size of gene sets to test
+    maxsize = 500,                # Maximum size of gene sets to test
+    parallel = FALSE              # Whether to use parallel processing
+)
+
+# View the results
+head(results_methylGSA)
+
+```
+
+
+
 
 ```{r}
 # Identify significant CpGs
@@ -327,11 +563,11 @@ ann_colors <- list(
 # Extract the top CpGs using topTable
 top_cpgs <- topTable(results, coef=2, adjust="BH",n=Inf,sort.by="p")
 
-# Filtering CpGs based on effect size and select top 1000
-selected_cpgs <- top_cpgs[abs(top_cpgs$logFC) > 0.05, ][1:1000, ]
+# Filtering CpGs based on effect size and select top 10000
+selected_cpgs <- top_cpgs[abs(top_cpgs$logFC) > 0.05, ][1:10000, ]
 
 # Subset betas
-selected_beta <- M.val2[rownames(M.val2) %in% rownames(selected_cpgs), ]
+selected_beta <- DH_CRC_Betas[rownames(M.val2) %in% rownames(selected_cpgs), ]
 selected_beta_no_na <- selected_beta[complete.cases(selected_beta), ]
 
 ```
@@ -342,11 +578,12 @@ library(matrixStats)
 
 # Convert selected_beta_no_na to a matrix
 selected_beta_no_na_matrix <- as.matrix(selected_beta_no_na)
+row_selected_beta_no_na_matrix <- as.matrix(selected_beta_no_na[, -1])
 
 # Calculate variance of each CpG across all samples
-CpG_Var <- rowVars(selected_beta_no_na_matrix)
+CpG_Var <- rowVars(row_selected_beta_no_na_matrix)
 rankVar <- data.frame('order' = rank(-CpG_Var), 'var' = CpG_Var)
-rankVar$top1000 <- ifelse(rankVar$order <= 1000, 'Yes', 'No')
+rankVar$top1000 <- ifelse(rankVar$order <= 10000, 'Yes', 'No')
 
 # Get top 1000 variable CpGs
 data.topvar <- selected_beta_no_na_matrix[rankVar$top1000 == 'Yes',]
@@ -359,11 +596,16 @@ library(pheatmap)
 # Reorder the columns of data.topvar to match the order of heat_annot
 data.topvar <- data.topvar[, rownames(heat_annot)]
 
+# Convert the data frame/matrix to numeric
+data.topvar_numeric <- apply(data.topvar, 2, as.numeric)
+rownames(data.topvar_numeric) <- rownames(data.topvar)  # Preserve row names if they exist
+
+
 # Ensure no NA values in heat_annot
 heat_annot <- na.omit(heat_annot)
 
 # Order the heat_annot dataframe by Site
-heat_annot <- heat_annot[order(heat_annot$Metastasis), ]
+heat_annot <- heat_annot[order(heat_annot$Site), ]
 
 # Reorder the columns of data.topvar to match the order of heat_annot
 data.topvar <- data.topvar[, rownames(heat_annot)]
@@ -374,13 +616,14 @@ str(heat_annot)
 
 # Generate the heatmap
 heatm = pheatmap(
-  data.topvar,
+  data.topvar_numeric,
   annotation_names_col = TRUE,
   show_rownames = FALSE, # CpGs
   show_colnames = FALSE, # Samples
   annotation_col = heat_annot, 
   annotation_colors = ann_colors,
   cluster_cols = FALSE,
+  cluster_rows = TRUE,
   color = colorRampPalette(c("yellow", "blue"))(1024),
   clustering_distance_rows = "manhattan",
   clustering_distance_cols = "manhattan",
@@ -392,4 +635,815 @@ heatm = pheatmap(
 print(heatm)
 ggsave(filename = "Heatmap.png", plot = heatm, width = 12, height = 10, dpi = 600)
 ```
+
+```{r}
+# Search for CpG sites associated with CD58
+cd58_cpgs <- grep("CD58", anno$UCSC_RefGene_Name, value = TRUE)
+cd58_cpgs
+
+cd2_cpgs <- grep("CD2", anno$UCSC_RefGene_Name, value = TRUE)
+cd2_cpgs
+
+CTLA4_cpgs <- grep("CTLA4", anno$UCSC_RefGene_Name, value = TRUE)
+CTLA4_cpgs
+
+PD1_cpgs <- grep("PDL1", anno$UCSC_RefGene_Name, value = TRUE)
+PD1_cpgs
+
+
+# Search for CpG sites associated with STK11
+stk11_cpgs <- grep("STK11", anno$UCSC_RefGene_Name, value = TRUE)
+
+```
+
+
+```{r}
+# Get detailed information for CD58 CpG sites
+cd58_annotations <- anno[grep("CD58", anno$UCSC_RefGene_Name), ]
+print(cd58_annotations)
+
+# Get detailed information for STK11 CpG sites
+stk11_annotations <- anno[grep("STK11", anno$UCSC_RefGene_Name), ]
+print(stk11_annotations)
+
+```
+
+CellDMC
+```{r}
+# Extract cell type proportions from combined_data
+# Ensure cell_proportions is a data frame
+cell_proportions <- as.data.frame(combined_data[, c("Endothelial", "Epithelial", "Stromal", "Bmem", "Treg", "CD8nv", "CD8mem", "Mono", "DC", "NK", "Bas", "Eos", "Neu","Tumor")])
+rownames(cell_proportions) <- combined_data$SampleID
+# Convert cell_proportions to a matrix
+cell_proportions <- as.matrix(cell_proportions)
+
+# Extract phenotypic data (e.g., metastasis status)
+phenotypic_data <- as.numeric(combined_data$any_mets) - 1
+
+# Extract covariates
+covariates <- combined_data[, c("age", "sex")]
+m_values = DH_CRC_M_value_filtered
+
+# Ensure sample IDs match between datasets
+# common_samples <- intersect(rownames(m_values), combined_data$SampleID)
+# m_values <- m_values[, common_samples]
+# cell_proportions <- cell_proportions[common_samples, ]
+# phenotypic_data <- phenotypic_data[common_samples]
+# covariates <- covariates[common_samples, ]
+
+# Create design matrix for covariates
+design_matrix <- model.matrix(~ age + sex, data = combined_data)
+
+
+# Run CellDMC
+results <- EpiDISH::CellDMC(
+    beta.m = as.matrix(m_values),       # M-values matrix
+    pheno.v = phenotypic_data,          # Phenotypic data, e.g., metastasis status
+    frac.m = cell_proportions,          # Cell type proportions matrix
+    adjPMethod = "fdr",                 # Adjust p-values using FDR
+    adjPThresh = 0.05,                  # Threshold for calling DMCTs
+    cov.mod = design_matrix,            # Design matrix for covariates
+    sort = FALSE,                       # Do not sort the results
+    mc.cores = 4                        # Number of cores to use
+)
+
+```
+
+
+
+
+
+```{r}
+library(ggplot2)
+
+# Extract the coe component from results
+coe <- results$coe
+
+# Function to create a volcano plot for a given cell type
+create_volcano_plot <- function(cell_type, coe) {
+  data <- coe[[cell_type]]
+  plot_data <- data.frame(
+    CpG = rownames(data),
+    logFC = data$Estimate,
+    pval = data$p,
+    adjP = data$adjP
+  )
+  plot_data$significant <- plot_data$p < 0.001
+  
+  ggplot(plot_data, aes(x = logFC, y = -log10(pval), color = significant)) +
+    geom_point() +
+    scale_color_manual(values = c("grey", "red")) +
+    theme_minimal() +
+    labs(title = paste("Volcano Plot for", cell_type), x = "Log Fold Change", y = "-log10(p-value)")
+}
+
+# Example for "Endothelial" cell type
+cell_type <- "CD8mem"
+create_volcano_plot(cell_type, coe)
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# Example for a specific CpG site and cell type
+cpg_site <- "cg00000029"  # Replace with your CpG site of interest
+cell_type <- "CD8mem"  # Replace with your cell type of interest
+
+# Ensure the data frame is properly constructed
+plot_data <- data.frame(
+  Methylation = as.numeric(m_values[cpg_site, ]),
+  Phenotype = as.factor(phenotypic_data),
+  CellType = as.numeric(cell_proportions[, cell_type])
+)
+
+# Check the structure of plot_data
+str(plot_data)
+
+# Create the boxplot
+ggplot(plot_data, aes(x = Phenotype, y = Methylation)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  theme_minimal() +
+  labs(title = paste("Methylation Levels for", cpg_site, "in", cell_type, "Cells"),
+       x = "Phenotype", y = "Methylation Level")
+
+
+```
+
+
+
+
+```{r}
+library(ggplot2)
+
+# Assuming anno is your annotation data frame with row names as CpG site names
+cd58_indices <- grep("CD58", anno$UCSC_RefGene_Name)
+cd2_indices <- grep("CD2", anno$UCSC_RefGene_Name)
+CTLA4_indices <- grep("CTLA4", anno$UCSC_RefGene_Name)
+PD1_indices <- grep("PDL1", anno$UCSC_RefGene_Name)
+stk11_indices <- grep("STK11", anno$UCSC_RefGene_Name)
+
+# Extract CpG site names
+cd58_cpgs <- rownames(anno)[cd58_indices]
+cd2_cpgs <- rownames(anno)[cd2_indices]
+CTLA4_cpgs <- rownames(anno)[CTLA4_indices]
+PD1_cpgs <- rownames(anno)[PD1_indices]
+stk11_cpgs <- rownames(anno)[stk11_indices]
+
+# Combine all CpG sites into a single list
+immune_evasion_cpg_list <- unique(c(cd58_cpgs,cd2_cpgs,stk11_cpgs,PD1_cpgs,CTLA4_cpgs))
+
+# Specify the desired cell type
+cell_type <- "CD8mem"  # Set the desired cell type
+
+# Filter cell proportions for the desired cell type
+cell_proportions_filtered <- cell_proportions[, cell_type, drop = FALSE]
+
+# Combine methylation data for all CpG sites into a single data frame for the selected cell type
+immune_evasion_data <- do.call(rbind, lapply(immune_evasion_cpg_list, function(cpg) {
+  data.frame(
+    CpG = cpg,
+    Methylation = as.numeric(m_values[cpg, ]),
+    Phenotype = as.factor(phenotypic_data),
+    CellType = as.numeric(cell_proportions_filtered)
+  )
+}))
+
+# Create a single boxplot grouped by Phenotype
+ggplot(immune_evasion_data, aes(x = Phenotype, y = Methylation)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  theme_minimal() +
+  labs(title = paste("Methylation Levels for Immune Evasion-Related CpG Sites in", cell_type, "Cells"),
+       x = "Phenotype (any_mets)", y = "Methylation Level") +
+  theme(legend.position = "none")  # Hide legend if not needed
+
+
+
+```
+
+
+
+```{r}
+library(ggplot2)
+library(EnhancedVolcano)
+library(pheatmap)
+
+# Assuming results is your CellDMC result object and anno is your annotation data frame with row names as CpG site names
+cd58_indices <- grep("CD58", anno$UCSC_RefGene_Name)
+cd2_indices <- grep("CD2", anno$UCSC_RefGene_Name)
+CTLA4_indices <- grep("CTLA4", anno$UCSC_RefGene_Name)
+PD1_indices <- grep("PD1", anno$UCSC_RefGene_Name)
+PDL1_indices <- grep("CD274", anno$UCSC_RefGene_Name) # PD-L1
+stk11_indices <- grep("STK11", anno$UCSC_RefGene_Name)
+SOX17_indices <- grep("SOX17", anno$UCSC_RefGene_Name)
+STC1_indices <- grep("STC1", anno$UCSC_RefGene_Name)
+PIK3CD_indices <- grep("PIK3CD", anno$UCSC_RefGene_Name)
+LAG3_indices <- grep("LAG3", anno$UCSC_RefGene_Name)
+HAVCR2_indices <- grep("HAVCR2", anno$UCSC_RefGene_Name) # TIM-3
+TIGIT_indices <- grep("TIGIT", anno$UCSC_RefGene_Name)
+BTLA_indices <- grep("BTLA", anno$UCSC_RefGene_Name)
+VISTA_indices <- grep("VISTA", anno$UCSC_RefGene_Name)
+GAL9_indices <- grep("LGALS9", anno$UCSC_RefGene_Name) # Galectin-9
+NRP1_indices <- grep("NRP1", anno$UCSC_RefGene_Name)
+IDO1_indices <- grep("IDO1", anno$UCSC_RefGene_Name)
+CMTM6_indices <- grep("CMTM6", anno$UCSC_RefGene_Name)
+TGFB1_indices <- grep("TGFB1", anno$UCSC_RefGene_Name)
+VEGFA_indices <- grep("VEGFA", anno$UCSC_RefGene_Name)
+FAP_indices <- grep("FAP", anno$UCSC_RefGene_Name)
+CXCL12_indices <- grep("CXCL12", anno$UCSC_RefGene_Name)
+IL6_indices <- grep("IL6", anno$UCSC_RefGene_Name)
+MMP2_indices <- grep("MMP2", anno$UCSC_RefGene_Name)
+MMP9_indices <- grep("MMP9", anno$UCSC_RefGene_Name)
+
+# Extract CpG site names
+cd58_cpgs <- rownames(anno)[cd58_indices]
+cd2_cpgs <- rownames(anno)[cd2_indices]
+CTLA4_cpgs <- rownames(anno)[CTLA4_indices]
+PD1_cpgs <- rownames(anno)[PD1_indices]
+PDL1_cpgs <- rownames(anno)[PDL1_indices]
+stk11_cpgs <- rownames(anno)[stk11_indices]
+SOX17_cpgs <- rownames(anno)[SOX17_indices]
+STC1_cpgs <- rownames(anno)[STC1_indices]
+PIK3CD_cpgs <- rownames(anno)[PIK3CD_indices]
+LAG3_cpgs <- rownames(anno)[LAG3_indices]
+HAVCR2_cpgs <- rownames(anno)[HAVCR2_indices]
+TIGIT_cpgs <- rownames(anno)[TIGIT_indices]
+BTLA_cpgs <- rownames(anno)[BTLA_indices]
+VISTA_cpgs <- rownames(anno)[VISTA_indices]
+GAL9_cpgs <- rownames(anno)[GAL9_indices]
+NRP1_cpgs <- rownames(anno)[NRP1_indices]
+IDO1_cpgs <- rownames(anno)[IDO1_indices]
+CMTM6_cpgs <- rownames(anno)[CMTM6_indices]
+TGFB1_cpgs <- rownames(anno)[TGFB1_indices]
+VEGFA_cpgs <- rownames(anno)[VEGFA_indices]
+FAP_cpgs <- rownames(anno)[FAP_indices]
+CXCL12_cpgs <- rownames(anno)[CXCL12_indices]
+IL6_cpgs <- rownames(anno)[IL6_indices]
+MMP2_cpgs <- rownames(anno)[MMP2_indices]
+MMP9_cpgs <- rownames(anno)[MMP9_indices]
+
+# Combine all CpG sites into a single list for each cell type
+
+# T-cells
+t_cells_immune_evasion_cpg_list <- unique(c(cd58_cpgs, cd2_cpgs, CTLA4_cpgs, PD1_cpgs, PDL1_cpgs, stk11_cpgs, SOX17_cpgs, STC1_cpgs, PIK3CD_cpgs, LAG3_cpgs, HAVCR2_cpgs, TIGIT_cpgs, BTLA_cpgs, VISTA_cpgs, GAL9_cpgs, NRP1_cpgs))
+
+# Tumor
+tumor_immune_evasion_cpg_list <- unique(c(PDL1_cpgs, CTLA4_cpgs, cd58_cpgs, cd2_cpgs, stk11_cpgs, SOX17_cpgs, STC1_cpgs, PIK3CD_cpgs, IDO1_cpgs, CMTM6_cpgs, VISTA_cpgs, GAL9_cpgs, NRP1_cpgs, TGFB1_cpgs, VEGFA_cpgs))
+
+# CAFs
+caf_immune_evasion_cpg_list <- unique(c(PDL1_cpgs, CTLA4_cpgs, cd58_cpgs, cd2_cpgs, stk11_cpgs, SOX17_cpgs, STC1_cpgs, PIK3CD_cpgs, TGFB1_cpgs, VEGFA_cpgs, FAP_cpgs, CXCL12_cpgs, IL6_cpgs, MMP2_cpgs, MMP9_cpgs))
+
+
+# Extract the coe component from results
+coe <- results$coe
+coe <- results_fib$coe
+
+# Filter for the desired cell type
+cell_type <- "Fib"
+data <- coe[[cell_type]]
+
+# Create a data frame with the necessary information
+plot_data <- data.frame(
+  CpG = rownames(data),
+  logFC = data$Estimate,
+  pval = data$p
+)
+
+# Filter the plot_data for immune evasion CpG sites
+filtered_plot_data <- plot_data[plot_data$CpG %in% caf_immune_evasion_cpg_list, ]
+
+# Identify significant CpG sites
+filtered_plot_data$significant <- filtered_plot_data$pval < 0.05
+
+# Create the Enhanced Volcano plot for the filtered CpG sites
+EnhancedVolcano(filtered_plot_data,
+                lab = filtered_plot_data$CpG,
+                x = 'logFC',
+                y = 'pval',
+                selectLab = filtered_plot_data$CpG[filtered_plot_data$significant],
+                xlab = 'Log Fold Change',
+                ylab = '-log10(p-value)',
+                pCutoff = 0.05,
+                FCcutoff = 5.0,
+                pointSize = 3.0,
+                labSize = 3.0,
+                title = paste("Volcano Plot for", cell_type, "in Immune Evasion CpG Sites"),
+                subtitle = "Significant CpG Sites",
+                caption = "Enhanced Volcano Plot",
+                legendLabels = c('Not Significant', 'Log Fold Change', 'p-value', 'p-value & Log Fold Change'),
+                legendPosition = 'right',
+                legendLabSize = 12,
+                legendIconSize = 3.0,
+                col = c('grey30', 'forestgreen', 'royalblue', 'red2'),
+                colAlpha = 1)
+
+
+# Create the Enhanced Volcano plot for the filtered CpG sites
+EnhancedVolcano(filtered_plot_data,
+                lab = NA,
+                x = 'logFC',
+                y = 'pval',
+                selectLab = filtered_plot_data$CpG[filtered_plot_data$significant],
+                xlab = 'Log Fold Change',
+                ylab = '-log10(p-value)',
+                pCutoff = 0.05,
+                FCcutoff = 1.0,
+                pointSize = 3.0,
+                labSize = 3.0,
+                title = paste("Volcano Plot for", cell_type, "in Immune Evasion CpG Sites"),
+                subtitle = "Significant CpG Sites",
+                caption = "Enhanced Volcano Plot",
+                legendLabels = c('Not Significant', 'Log Fold Change', 'p-value', 'p-value & Log Fold Change'),
+                legendPosition = 'right',
+                legendLabSize = 12,
+                legendIconSize = 3.0,
+                col = c('grey30', 'royalblue', 'forestgreen', 'red2'),
+                colAlpha = 1)
+
+```
+
+
+```{r}
+# Define custom thresholds
+lower_cutoff <- -5
+upper_cutoff <- 5
+
+# Create a new significance column based on custom thresholds
+filtered_plot_data$custom_significant <- with(filtered_plot_data,
+    (logFC <= lower_cutoff | logFC >= upper_cutoff) & pval < 0.05
+)
+
+# Add custom lines for -5 and 5 thresholds
+EnhancedVolcano(filtered_plot_data,
+                lab = NA,
+                x = 'logFC',
+                y = 'pval',
+                selectLab = filtered_plot_data$CpG[filtered_plot_data$custom_significant],
+                xlab = 'Log Fold Change',
+                ylab = '-log10(p-value)',
+                pCutoff = 0.05,
+                FCcutoff = 5.0,  
+                pointSize = 3.0,
+                labSize = 3.0,
+                title = paste("Volcano Plot for", cell_type, "in Immune Evasion CpG Sites"),
+                subtitle = "Significant CpG Sites",
+                caption = "Enhanced Volcano Plot",
+                legendLabels = c('Not Significant', 'Log Fold Change', 'p-value', 'p-value & Log Fold Change'),
+                legendPosition = 'right',
+                legendLabSize = 12,
+                legendIconSize = 3.0,
+                col = c('grey30', 'royalblue', 'forestgreen', 'red2'),
+                colAlpha = 1
+) +
+geom_vline(xintercept = c(lower_cutoff, upper_cutoff), col = "black", linetype = "dashed", size = .5) 
+
+
+```
+```{r}
+EnhancedVolcano(filtered_plot_data,
+                lab=rownames(filtered_plot_data),
+                 x = 'logFC',
+                 y = 'pval',
+     pCutoff = 10e-2,
+    FCcutoff = 1.5,
+    pointSize = 3.0,
+    labSize = 6.0,
+    col=c('black', 'black', 'black', 'red3'),
+    colAlpha = 1)
+```
+```{r}
+# Assuming filtered_plot_data contains your data and anno is your annotation dataframe
+
+# Step 1: Extract significant CpG sites
+significant_cpgs <- filtered_plot_data$CpG[filtered_plot_data$significant]
+
+# Step 2: Retrieve gene names for the significant CpG sites
+gene_names <- anno[significant_cpgs, "UCSC_RefGene_Name"]
+
+# Step 3: Create a data frame with CpG sites and their gene names
+# Handle cases with multiple gene names by splitting them and pairing them with CpG sites
+expanded_data <- data.frame(
+  CpG = rep(significant_cpgs, sapply(strsplit(gene_names, ";"), length)),
+  GeneNames = unlist(strsplit(gene_names, ";")),
+  stringsAsFactors = FALSE
+)
+
+# View the expanded data table with CpG sites next to gene names
+print(expanded_data)
+
+
+```
+
+
+```{r}
+library(ggplot2)
+library(EnhancedVolcano)
+library(pheatmap)
+
+# Assuming results is your CellDMC result object and anno is your annotation data frame with row names as CpG site names
+cd58_indices <- grep("CD58", anno$UCSC_RefGene_Name)
+cd2_indices <- grep("CD2", anno$UCSC_RefGene_Name)
+CTLA4_indices <- grep("CTLA4", anno$UCSC_RefGene_Name)
+PD1_indices <- grep("PDL1", anno$UCSC_RefGene_Name)
+stk11_indices <- grep("STK11", anno$UCSC_RefGene_Name)
+SOX17_indices <- grep("SOX17", anno$UCSC_RefGene_Name)
+STC1_indices <- grep("STC1", anno$UCSC_RefGene_Name)
+PIK3CD_indices <- grep("PIK3CD", anno$UCSC_RefGene_Name)
+
+# Extract CpG site names
+cd58_cpgs <- rownames(anno)[cd58_indices]
+cd2_cpgs <- rownames(anno)[cd2_indices]
+CTLA4_cpgs <- rownames(anno)[CTLA4_indices]
+PD1_cpgs <- rownames(anno)[PD1_indices]
+stk11_cpgs <- rownames(anno)[stk11_indices]
+SOX17_cpgs <- rownames(anno)[SOX17_indices]
+STC1_cpgs <- rownames(anno)[STC1_indices]
+PIK3CD_cpgs <- rownames(anno)[PIK3CD_indices]
+
+# Combine all CpG sites into a single list
+immune_evasion_cpg_list <- unique(c(cd58_cpgs, cd2_cpgs, CTLA4_cpgs, PD1_cpgs, stk11_cpgs, SOX17_cpgs, STC1_cpgs, PIK3CD_cpgs))
+
+# Filter the CpG list to include only valid CpGs present in m_values
+valid_cpg_list <- immune_evasion_cpg_list[immune_evasion_cpg_list %in% rownames(m_values)]
+
+# Print lengths to debug
+cat("Length of original CpG list:", length(immune_evasion_cpg_list), "\n")
+cat("Length of valid CpG list:", length(valid_cpg_list), "\n")
+
+# Prepare methylation data for the valid CpG sites
+methylation_matrix <- do.call(cbind, lapply(valid_cpg_list, function(cpg) {
+  as.numeric(m_values[cpg, ])
+}))
+
+# Convert to numeric matrix explicitly
+methylation_matrix <- as.matrix(methylation_matrix)
+
+# Print dimensions to debug
+cat("Dimensions of methylation_matrix:", dim(methylation_matrix), "\n")
+
+# Assign column names
+colnames(methylation_matrix) <- valid_cpg_list
+rownames(methylation_matrix) <- colnames(m_values)
+
+# Filter for the CD8mem cell type
+cd8mem_methylation <- methylation_matrix[rownames(cell_proportions_filtered), , drop = FALSE]
+
+# Ensure cd8mem_methylation is a numeric matrix
+cd8mem_methylation <- as.matrix(cd8mem_methylation)
+
+# Remove row names
+rownames(cd8mem_methylation) <- NULL
+
+# Print final dimensions to debug
+cat("Dimensions of CD8mem methylation matrix:", dim(cd8mem_methylation), "\n")
+
+# Check for non-finite values
+non_finite_rows <- rowSums(!is.finite(cd8mem_methylation)) > 0
+non_finite_cols <- colSums(!is.finite(cd8mem_methylation)) > 0
+
+cat("Rows with non-finite values:", sum(non_finite_rows), "\n")
+cat("Cols with non-finite values:", sum(non_finite_cols), "\n")
+
+# Ensure the phenotypic data matches the samples in cd8mem_methylation
+phenotypic_data_filtered <- phenotypic_data
+
+# Verify phenotypic data alignment
+if (length(phenotypic_data_filtered) != nrow(cd8mem_methylation)) {
+  stop("Mismatch in the length of phenotypic data and the number of samples in the methylation matrix.")
+}
+
+# Create the heatmap with annotation for rows
+pheatmap(cd8mem_methylation, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE,
+         main = "Heatmap of Methylation Levels for Immune Evasion-Related CpG Sites in CD8mem Cells",
+         show_rownames = FALSE, 
+         show_colnames = FALSE)
+         
+
+
+
+```
+
+EpiDISH work
+```{r}
+library(EpiDISH)
+# Extract the coe component from results
+coe <- results$coe
+
+# Filter for the desired cell type
+cell_type <- "Stromal"
+Stromal <- coe[[cell_type]]
+
+# Ensure Stromal is in a matrix format suitable for EpiDish
+stromal_matrix <- as.matrix(Stromal)
+
+# Check the dimensions and structure
+dim(stromal_matrix)
+head(stromal_matrix)
+
+# Extract the beta values (Estimates) from the stromal matrix
+stromal_beta_values <- stromal_matrix[, "Estimate"]
+
+# Ensure the stromal_beta_values is in matrix form as expected by EpiDish
+stromal_beta_matrix <- matrix(stromal_beta_values, ncol = 1)
+rownames(stromal_beta_matrix) <- rownames(stromal_matrix)
+
+# Check the dimensions and structure of the stromal_beta_matrix
+dim(stromal_beta_matrix)
+head(stromal_beta_matrix)
+
+# Transpose the matrix if needed
+stromal_beta_matrix <- t(stromal_beta_matrix)
+
+
+
+
+```
+
+
+
+```{r}
+library(EpiDISH)
+data(centEpiFibIC.m)
+cpg_sites_beta <- rownames(DH_CRC_Betas)
+cpg_sites_ref <- rownames(centEpiFibIC.m)
+
+common_cpg_sites <- intersect(cpg_sites_beta, cpg_sites_ref)
+
+# Run the EpiDISH function using the reference matrix
+results_epidish <- epidish(beta.m = DH_CRC_Betas_matrix, ref.m = centEpiFibIC.m, method = "RPC")
+
+# Extract the estimated cell type proportions
+cell_type_proportions <- results_epidish$estF
+cell_type_proportions_Fib = cell_type_proportions
+# Inspect the results
+head(cell_type_proportions)
+
+```
+```{r}
+# Run CellDMC
+results_fib <- EpiDISH::CellDMC(
+    beta.m = as.matrix(m_values),       # M-values matrix
+    pheno.v = phenotypic_data,          # Phenotypic data, e.g., metastasis status
+    frac.m = cell_type_proportions,          # Cell type proportions matrix
+    adjPMethod = "fdr",                 # Adjust p-values using FDR
+    adjPThresh = 0.05,                  # Threshold for calling DMCTs
+    cov.mod = design_matrix,            # Design matrix for covariates
+    sort = FALSE,                       # Do not sort the results
+    mc.cores = 1                        # Number of cores to use
+)
+```
+```{r}
+# Extract the coe component from results
+coe <- results_fib$coe
+
+# Function to create a volcano plot for a given cell type
+create_volcano_plot <- function(cell_type, coe) {
+  data <- coe[[cell_type]]
+  plot_data <- data.frame(
+    CpG = rownames(data),
+    logFC = data$Estimate,
+    pval = data$p,
+    adjP = data$adjP
+  )
+  plot_data$significant <- plot_data$p < 0.05
+  
+  ggplot(plot_data, aes(x = logFC, y = -log10(pval), color = significant)) +
+    geom_point() +
+    scale_color_manual(values = c("grey", "red")) +
+    theme_minimal() +
+    labs(title = paste("Volcano Plot for", cell_type), x = "Log Fold Change", y = "-log10(p-value)")
+}
+
+# Example for "Endothelial" cell type
+cell_type <- "Fib"
+create_volcano_plot(cell_type, coe)
+```
+
+
+
+MethylGSA
+```{r}
+# Extract the CpG sites and their associated p-values from CellDMC results
+cpg_sites <- rownames(coe$Fib)
+p_values <- coe$Fib$p
+
+# Create a named vector suitable for methylGSA
+cpg_pval <- setNames(p_values, cpg_sites)
+
+# Check the structure
+head(cpg_pval)
+
+
+```
+```{r}
+# Run methylGSA using the methylglm function
+results_methylGSA <- methylglm(
+    cpg.pval = cpg_pval,          # Named vector of p-values
+    array.type = "EPIC",          # Specify the array type, "EPIC" or "450K"
+    group = "all",                # Specify the group, e.g., "all", "body", "promoter1", or "promoter2"
+    GS.type = "GO",               # Specify the gene set category, e.g., "GO", "KEGG", or "Reactome"
+    minsize = 100,                # Minimum size of gene sets to test
+    maxsize = 500,                # Maximum size of gene sets to test
+    parallel = FALSE              # Whether to use parallel processing
+)
+
+# View the results
+head(results_methylGSA)
+
+
+```
+
+
+TCA
+Step 1: Prepare M-values and Cell Proportions
+```{r}
+# Assuming `M.val2` is your M-values matrix and `combined_df` contains cell proportions
+m_values <- M.val2
+
+# Make sure your cell-type proportions matrix matches the samples in `m_values`
+cell_proportions <- combined_df[, c("Fib", "Tumor", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "DC", "NK")]
+rownames(cell_proportions) <- combined_df$SampleID
+
+# Get the sample names from both datasets
+samples_m_values <- colnames(m_values)
+samples_cell_proportions <- rownames(cell_proportions_normalized)
+
+# Find the intersection of the sample names to ensure they match
+common_samples <- intersect(samples_m_values, samples_cell_proportions)
+
+# Subset both datasets to include only the common samples
+m_values_aligned <- m_values[, common_samples]
+cell_proportions_aligned <- cell_proportions_normalized[common_samples, ]
+
+# Verify if the dimensions are correct
+print(dim(m_values_aligned))
+print(dim(cell_proportions_aligned))
+
+# Select key cell types
+cell_types_selected <- c("Fib", "Tumor", "CD8mem", "CD4mem", "Treg")
+cell_proportions_reduced <- cell_proportions_aligned[, cell_types_selected]
+
+# Normalize the reduced cell proportions
+cell_proportions_reduced <- cell_proportions_reduced / rowSums(cell_proportions_reduced)
+
+
+# Ensure cell_proportions_reduced is a data frame
+cell_proportions_reduced <- as.data.frame(cell_proportions_reduced)
+
+# Convert all columns to numeric
+cell_proportions_reduced[] <- lapply(cell_proportions_reduced, as.numeric)
+
+# Convert to matrix
+cell_proportions_reduced <- as.matrix(cell_proportions_reduced)
+
+```
+
+
+```{r}
+# Design matrix from your existing analysis
+design_matrix <- model.matrix(~any_mets * MLH1 + age + sex + Tumor + Endothelial + Epithelial + Stromal + CD8mem + CD4mem + Treg + DC, data=analysis_data)
+
+# Convert design matrix to data frame and then to matrix
+design_matrix_simple <- as.data.frame(design_matrix_simple)
+design_matrix_simple[] <- lapply(design_matrix_simple, as.numeric)
+design_matrix_simple <- as.matrix(design_matrix_simple)
+
+# Remove intercept column if present
+if (any(colnames(design_matrix_simple) == "(Intercept)")) {
+    design_matrix_simple <- design_matrix_simple[, -which(colnames(design_matrix_simple) == "(Intercept)")]
+}
+
+```
+
+```{r}
+# Normalize the cell proportions again to ensure each row sums to 1
+cell_proportions_aligned <- cell_proportions_aligned / rowSums(cell_proportions_aligned)
+
+# Set row names to match the M-values column names
+rownames(cell_proportions_aligned) <- colnames(m_values_aligned)
+
+
+
+# If VIF values are high (>5 or >10), consider removing variables
+
+```
+```{r}
+library(car)
+
+# Fit a model to calculate VIFs
+vif_model <- lm(m_values_aligned[1, ] ~ ., data = as.data.frame(design_matrix_simple))
+vif_values <- vif(vif_model)
+
+print(vif_values)
+```
+
+
+```{r}
+library(TCA)
+
+tca_results <- tca(
+  X = m_values_aligned,
+  W = cell_proportions_reduced,
+  C1 = design_matrix_simple,
+  refit_W = FALSE,      # Start with refit_W = FALSE
+  vars.mle = FALSE,     # Use non-MLE estimation for variances
+  constrain_mu = TRUE   # Constrain mean estimates
+)
+
+
+
+
+```
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+
+# Specify the covariate and cell type of interest
+covariate <- "any_metsTRUE"
+cell_type <- "Tumor"
+
+# Build the column name to extract from gammas_hat
+column_name <- paste0(cell_type, ".", covariate)
+
+# Extract effect sizes for all CpG sites for the specified covariate and cell type
+effect_sizes <- tca_results$gammas_hat[, column_name]
+
+# Create a data frame
+effect_sizes_df <- data.frame(
+  CpG = rownames(tca_results$gammas_hat),
+  EffectSize = effect_sizes
+)
+
+# Select top CpG sites based on absolute effect size
+top_n <- 20  # Adjust the number as needed
+top_effects <- effect_sizes_df %>%
+  mutate(AbsEffectSize = abs(EffectSize)) %>%
+  arrange(desc(AbsEffectSize)) %>%
+  head(top_n)
+
+# Create a barplot of the top effect sizes
+ggplot(top_effects, aes(x = reorder(CpG, EffectSize), y = EffectSize)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  xlab("CpG Sites") +
+  ylab("Effect Size") +
+  ggtitle(paste("Top", top_n, "CpG Sites Effect Sizes in", cell_type)) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 6))
+
+```
+
+```{r}
+# Specify the covariate of interest
+covariate <- "any_metsTRUE"
+cell_types <- c("Fib", "Tumor", "CD8mem", "CD4mem", "Treg")
+
+# Initialize a data frame to store effect sizes
+effect_sizes <- data.frame(
+  CpG = rownames(tca_results$gammas_hat)
+)
+
+# Extract effect sizes for each cell type
+for (cell in cell_types) {
+  column_name <- paste0(cell, ".", covariate)
+  effect_sizes[[cell]] <- tca_results$gammas_hat[, column_name]
+}
+
+
+# Calculate the maximum absolute effect size across cell types for each CpG
+effect_sizes$MaxAbsEffectSize <- apply(effect_sizes[, cell_types], 1, function(x) max(abs(x)))
+
+# Select the top CpG sites based on MaxAbsEffectSize
+top_n <- 50  # Adjust as needed
+top_effects <- effect_sizes %>%
+  arrange(desc(MaxAbsEffectSize)) %>%
+  head(top_n)
+
+# Remove the MaxAbsEffectSize column for plotting
+top_effects <- top_effects[, c("CpG", cell_types)]
+
+# Reshape the data for plotting
+library(reshape2)
+effect_sizes_melted <- melt(top_effects, id.vars = "CpG", variable.name = "CellType", value.name = "EffectSize")
+
+
+# Create the heatmap
+ggplot(effect_sizes_melted, aes(x = CellType, y = CpG, fill = EffectSize)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "Effect Size") +
+  xlab("Cell Type") +
+  ylab("CpG Sites") +
+  ggtitle(paste("Heatmap of Effect Sizes for", covariate)) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 6))
+
+```
+
+
 

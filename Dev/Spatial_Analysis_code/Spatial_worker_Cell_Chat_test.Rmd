@@ -63,6 +63,8 @@ pbmc.rna <- FindVariableFeatures(pbmc.rna)
 pbmc.rna <- ScaleData(pbmc.rna)
 pbmc.rna <- RunPCA(pbmc.rna)
 pbmc.rna <- RunUMAP(pbmc.rna, dims = 1:30)
+
+holder = pbmc.rna
 ```
 
 ```{r}
@@ -71,8 +73,8 @@ options(future.globals.maxSize = 10 * 1024^3)  # 10 GB
 
 ```{r}
 # Read the .h5ad file
-sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/40_B10-18_G4_0_2_adata.h5ad")
-hires_image <- metadata(sce)$spatial$X28_A9.74_A3$images$hires
+sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/127_A8-6_0_adata.h5ad")
+hires_image <- metadata(sce)$spatial$X127_A8.6$images$hires
 
 # Assuming the image matrix is normalized, scale it to 0-255
 hires_image_scaled <- hires_image * 255
@@ -594,13 +596,36 @@ netVisual_aggregate(cellchat, signaling = pathways.show, layout = "chord")
 ```
 
 ```{r}
+# Define the exact custom colors for each cell type
+custom_colors <- c("B cells" = "#E41A1C",          # Red
+                   "Dendritic cells" = "#377EB8",  # Blue
+                   "Fibroblasts" = "#4DAF4A",      # Green
+                   "Monocytes" = "#984EA3",        # Purple
+                   "Tumor cells" = "#E377C2",      # Pink
+                   "NK cells" = "#17BECF",         # Teal
+                   "T-cells" = "#FF7F00")         # Orange
+
 # Convert factor to numeric
 cellchat@images$coordinates$x_cent <- as.numeric(as.character(cellchat@images$coordinates$x_cent))
 cellchat@images$coordinates$y_cent <- as.numeric(as.character(cellchat@images$coordinates$y_cent))
 
 
 par(mfrow=c(1,1))
-netVisual_aggregate(cellchat, signaling = pathways.show, layout = "spatial", edge.width.max = 2, vertex.size.max = 1, alpha.image = 0.2, vertex.label.cex = 3.5)
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "spatial", point.size = 2,edge.width.max = 2, vertex.size.max = 1, alpha.image = 0.2, vertex.label.cex = 3.5,color.use = custom_colors)
+
+# Use the custom colors in netVisual_aggregate with color.use
+par(mfrow=c(1,1))
+netVisual_aggregate(
+  cellchat,
+  signaling = pathways.show,
+  layout = "spatial",
+  edge.width.max = 1,
+  point.size = 2,
+  vertex.size.max = 2,
+  alpha.image = 0.21,
+  vertex.label.cex = 3.5,
+  color.use = custom_colors  # Apply custom colors here
+)
 ```
 ```{r}
 netVisual_heatmap(cellchat, measure = "count", color.heatmap = "Blues")
@@ -818,3 +843,4 @@ ggplot(plot_data, aes(x = x, y = y)) +
 ```{r}
 runCellChatApp(cellchat)
 ```
+

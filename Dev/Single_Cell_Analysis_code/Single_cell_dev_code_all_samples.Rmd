@@ -219,6 +219,72 @@ saveRDS(plot_list, file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/P
 ```
 
 
+```{r}
+consolidate_and_plot <- function(patient_seurat, patient_id) {
+    # Define the consolidated labels for each group
+    caf_labels <- c("cS27 (CXCL14+ CAF)", "cS28 (GREM1+ CAF)", "cS29 (MMP3+ CAF)", "cS30 (CAF CCL8 Fibro-like)", "cS31 (CAF stem niche Fibro-like)")
+    t_cell_labels <- c("cTNI01 (CD4+ IL7R+)", "cTNI02 (CD4+ IL7R+SELL+)", "cTNI10 (CD8+ IL7R+)")
+    tumor_labels <- c("cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)", "cE03 (Stem/TA-like prolif)", 
+                      "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)", "cE06 (Immature Goblet)", 
+                      "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)")
+
+    # Create a new column for consolidated labels if it doesn't exist
+    if (!"consolidated_labels" %in% colnames(patient_seurat@meta.data)) {
+        patient_seurat$consolidated_labels <- patient_seurat$predicted.id
+    }
+
+    # Consolidate labels
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% caf_labels] <- "CAF"
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% t_cell_labels] <- "T-Cell"
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% tumor_labels] <- "Tumor"
+
+    # Set labels to NA for cells not in the selected cell types
+    patient_seurat$consolidated_labels[!patient_seurat$consolidated_labels %in% c("Tumor", "CAF", "T-Cell")] <- NA
+
+    # Generate the UMAP plot with consolidated labels
+    if (sum(!is.na(patient_seurat$consolidated_labels)) == 0) {
+        warning(paste("No cells with valid 'consolidated_labels' in patient", patient_id))
+    }
+    umap_plot <- DimPlot(patient_seurat, reduction = "umap", group.by = "consolidated_labels", label = FALSE) + 
+                 ggplot2::ggtitle(paste("Immune Environment for Patient", patient_id))
+
+    # Subset CAF cells and check that subset is successful
+    caf_cells <- subset(patient_seurat, subset = consolidated_labels == "CAF")
+    if (nrow(caf_cells) == 0) {
+        warning(paste("No CAF cells found for patient", patient_id))
+    }
+
+    # Generate expression plots for SMA (ACTA2) and Fibronectin (FN1) within CAF cells
+    sma_plot <- FeaturePlot(caf_cells, features = "ACTA2", reduction = "umap") + 
+                ggplot2::ggtitle(paste("SMA (ACTA2) Expression in CAF Cells - Patient", patient_id))
+    fibronectin_plot <- FeaturePlot(caf_cells, features = "FN1", reduction = "umap") + 
+                        ggplot2::ggtitle(paste("Fibronectin (FN1) Expression in CAF Cells - Patient", patient_id))
+
+    # Return all three plots in a list
+    return(list(UMAP = umap_plot, SMA = sma_plot, Fibronectin = fibronectin_plot))
+}
+
+# Apply this function to each patient's Seurat object in `annotated_data` and save the results
+all_plots <- lapply(names(annotated_data), function(patient_id) {
+    result <- consolidate_and_plot(annotated_data[[patient_id]], patient_id)
+    if (is.null(result)) {
+        message(paste("Plot generation failed for patient", patient_id))
+    }
+    return(result)
+})
+
+# Check if any plots are missing
+if (any(sapply(all_plots, is.null))) {
+    message("Some plots may not have been generated successfully.")
+}
+
+# Access the UMAP, SMA, or Fibronectin plot for a specific patient (example for patient_3)
+print(all_plots[["patient_3"]][["UMAP"]])
+print(all_plots[["patient_3"]][["SMA"]])
+print(all_plots[["patient_3"]][["Fibronectin"]])
+
+
+```
 
 
 

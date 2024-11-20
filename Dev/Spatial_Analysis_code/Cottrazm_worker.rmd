@@ -1,0 +1,219 @@
+---
+title: "Cottrazm_worker"
+author: "Alos Diallo"
+date: "2024-10-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+# Copy and modify the STPreProcess function
+STPreProcess_mod <- function(InDir = InDir, Sample = Sample, OutDir = NULL) {
+  if (is.null(OutDir) == TRUE) {
+    OutDir <- paste(getwd(), "/", Sample, "/", sep = "")
+    dir.create(OutDir)
+  }
+
+  # read files------
+  aa_try <- try(
+    Xdata <- Seurat::Read10X(data.dir = paste(InDir, "filtered_feature_bc_matrix", sep = "")),
+    silent = T
+  )
+  if (is(aa_try, "try-error")) {
+    Xdata <- Seurat::Read10X_h5(filename = paste(InDir, "filtered_feature_bc_matrix.h5", sep = ""))
+  } else {
+    Xdata <- Xdata
+  }
+
+  # Modify the line below by removing 'min.spots = 0'
+  XF <- CreateSeuratObject(counts = Xdata, project = Sample, assay = "Spatial")
+
+  # ... rest of the function remains the same
+  # read image files
+  Ximage <- Read10X_Image(image.dir = paste(InDir, "spatial", sep = ""))
+  Seurat::DefaultAssay(Ximage) <- "Spatial"
+  Ximage <- Ximage[colnames(XF)]
+  XF[["image"]] <- Ximage
+  TumorST <- XF
+
+  # QC----
+  dir.create(paste(OutDir, "QC", sep = ""))
+  TumorST[["Mito.percent"]] <- PercentageFeatureSet(TumorST, pattern = "^MT-")
+
+  pdf(paste(OutDir, "QC/Vlnplot.pdf", sep = ""), width = 6, height = 4)
+  p <- VlnPlot(TumorST, features = c("nFeature_Spatial", "nCount_Spatial", "Mito.percent"), pt.size = 0, combine = F)
+  for (i in 1:length(p)) {
+    p[[i]] <- p[[i]] + NoLegend() + theme(axis.title.x = element_blank(), axis.text.x = element_text(angle = 0))
+  }
+  p <- cowplot::plot_grid(plotlist = p, ncol = 3)
+  print(p)
+  dev.off()
+
+  pdf(paste(OutDir, "QC/featurplot.pdf", sep = ""), width = 7, height = 7)
+  p <- SpatialFeaturePlot(TumorST, features = c("nFeature_Spatial", "nCount_Spatial", "Mito.percent"), combine = F)
+  for (i in 1:length(p)) {
+    p[[i]] <- p[[i]] + theme(axis.title.x = element_blank(), axis.text.x = element_text(angle = 0))
+  }
+  print(cowplot::plot_grid(plotlist = p, ncol = 3))
+  dev.off()
+
+  QCData <- TumorST@meta.data[, c("nCount_Spatial", "nFeature_Spatial", "Mito.percent")]
+  openxlsx::write.xlsx(QCData, paste(OutDir, "QC/QCData.xlsx", sep = ""), overwrite = T)
+
+  return(TumorST)
+}
+
+```
+
+```{r}
+STModiCluster_mod <- function(InDir = InDir,
+                              Sample = Sample,
+                              OutDir = NULL,
+                              TumorST = TumorST,
+                              res = .8) {
+  if (is.null(OutDir)) {
+    OutDir <- paste(getwd(), "/", Sample, "/", sep = "")
+    dir.create(OutDir, recursive = TRUE)
+  }
+
+  # Adjusted_expr_mtx
+  reticulate::use_condaenv("TumorBoundary", required = TRUE)
+  reticulate::source_python(system.file("python/Rusedtile.py", package = "Cottrazm"))
+  Adjusted_expr_mtx <- ME_normalize(inDir = InDir, outDir = OutDir, sample = Sample)
+
+  # Create Morph Seurat object
+  aa_try <- try(
+    rownames(Adjusted_expr_mtx) <- colnames(GetAssayData(TumorST, slot = "counts", assay = "Spatial")),
+    silent = TRUE
+  )
+
+  if (is(aa_try, "try-error")) {
+    library(Matrix)
+    Adjusted_expr_mtx <- Matrix::readMM(paste(OutDir, Sample, "_raw_SME_normalizeA.mtx", sep = ""))
+    rownames(Adjusted_expr_mtx) <- colnames(GetAssayData(TumorST, slot = "counts", assay = "Spatial"))
+    colnames(Adjusted_expr_mtx) <- rownames(TumorST)
+  } else {
+    rownames(Adjusted_expr_mtx) <- colnames(GetAssayData(TumorST, slot = "counts", assay = "Spatial"))
+    colnames(Adjusted_expr_mtx) <- rownames(TumorST)
+  }
+
+  Adjusted_expr_mtxF <- t(as.matrix(Adjusted_expr_mtx))
+  MorphMatirxSeurat <- CreateSeuratObject(counts = as(Adjusted_expr_mtxF, 'sparseMatrix'))
+
+  # Add morph feature as assay to TumorST
+  MorphMatirxSeurat <- subset(MorphMatirxSeurat, cells = colnames(TumorST))
+  TumorST[["Morph"]] <- MorphMatirxSeurat[["RNA"]]
+
+  # Use Morph assay for clustering
+  TumorST <- NormalizeData(TumorST, assay = "Morph")
+  TumorST <- FindVariableFeatures(object = TumorST, assay = "Morph")
+  TumorST <- ScaleData(object = TumorST, assay = "Morph")
+  TumorST <- RunPCA(object = TumorST, assay = "Morph", npcs = 50, verbose = FALSE)
+  TumorST <- FindNeighbors(TumorST, reduction = "pca", dims = 1:50, assay = "Morph")
+  TumorST <- RunUMAP(object = TumorST, dims = 1:50, assay = "Morph")
+  TumorST <- FindClusters(TumorST, resolution = res, algorithm = 1, graph.name = "Morph_snn")
+
+  TumorST@meta.data$seurat_clusters <- TumorST@meta.data[, paste("Morph_snn_res.", res, sep = "")]
+
+  # Predefine 40 colors to avoid the insufficient colors issue
+  cluster_colors <- c(
+    "#DC050C", "#FB8072", "#1965B0", "#7BAFDE", "#882E72",
+    "#B17BA6", "#FF7F00", "#FDB462", "#E7298A", "#E78AC3",
+    "#33A02C", "#B2DF8A", "#55B1B1", "#8DD3C7", "#A6761D",
+    "#E6AB02", "#7570B3", "#BEAED4", "#666666", "#999999",
+    "#aa8282", "#d4b7b7", "#8600bf", "#ba5ce3", "#808000",
+    "#aeae5c", "#1e90ff", "#00bfff", "#56ff0d", "#ffff00",
+    "#8B4513", "#A52A2A", "#FF6347", "#4682B4", "#6A5ACD",
+    "#FF4500", "#DAA520", "#008B8B", "#FFD700", "#4B0082"
+  )
+
+  pdf(paste(OutDir, Sample, "_Spatial_SeuratCluster.pdf", sep = ""), width = 7, height = 7)
+  p <- SpatialDimPlot(TumorST, group.by = "seurat_clusters", cols = cluster_colors, pt.size.factor = 1, alpha = 0.8) +
+    scale_fill_manual(values = cluster_colors) +
+    labs(title = paste("Resolution = ", res, sep = ""))
+  print(p)
+  dev.off()
+
+  pdf(paste(OutDir, Sample, "_UMAP_SeuratCluster.pdf", sep = ""), width = 7, height = 7)
+  p <- DimPlot(TumorST, group.by = "seurat_clusters", cols = cluster_colors) +
+    scale_fill_manual(values = cluster_colors) +
+    labs(title = paste("Resolution = ", res, sep = ""))
+  print(p)
+  dev.off()
+
+  # Add ImmuneScore
+  Normalfeatures <- c("PTPRC", "CD2", "CD3D", "CD3E", "CD3G", "CD5", "CD7", "CD79A", 'MS4A1', "CD19")
+  TumorST@meta.data$NormalScore <- apply(GetAssayData(TumorST, slot = "data", assay = "Morph")[rownames(GetAssayData(TumorST, slot = "data", assay = "Morph")) %in% Normalfeatures, ], 2, mean)
+
+  pdf(paste(OutDir, Sample, "_NormalScore.pdf", sep = ""), width = 6, height = 4)
+  p <- VlnPlot(TumorST, features = "NormalScore", pt.size = 0, group.by = "seurat_clusters", cols = cluster_colors) +
+    geom_boxplot() +
+    geom_hline(yintercept = max(unlist(lapply(
+      split(TumorST@meta.data[, c("seurat_clusters", "NormalScore")], TumorST@meta.data[, c("seurat_clusters", "NormalScore")]$seurat_clusters),
+      function(test) median(test$NormalScore)
+    ))), linetype = "dashed") +
+    ggpubr::stat_compare_means() + NoLegend()
+  print(p)
+  dev.off()
+
+  NormalCluster <- levels(TumorST$seurat_clusters)[order(unlist(lapply(
+    split(TumorST@meta.data[, c("seurat_clusters", "NormalScore")], TumorST@meta.data[, c("seurat_clusters", "NormalScore")]$seurat_clusters),
+    function(test) mean(test$NormalScore)
+  )), decreasing = TRUE)[1]]
+  print(paste("NormalCluster = ", NormalCluster, sep = ""))
+
+  # Save CNV annotation file
+  cellAnnotation <- data.frame(CellID = rownames(TumorST@meta.data), DefineTypes = TumorST@meta.data[, "seurat_clusters"])
+  dir.create(paste(OutDir, "InferCNV", sep = ""), recursive = TRUE)
+  write.table(cellAnnotation, paste(OutDir, "InferCNV/CellAnnotation.txt", sep = ""), sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+  return(TumorST)
+}
+```
+
+```{r}
+image_dir = InDir <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/data/106_A4_60_B3/outs/spatial"
+Read10X_Image(
+   image_dir,
+   image.name = "tissue_lowres_image.png",
+   assay = "Spatial",
+   slice = "slice1",
+   filter.matrix = TRUE
+ )
+```
+
+```{r}
+library(Cottrazm)
+library(Seurat)
+library(ggplot2)
+InDir <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/data/106_A4_60_B3/outs/"
+Sample <- "106_A4_60_B3"
+OutDir <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/data/106_A4_60_B3/"
+TumorST <- STPreProcess_mod(InDir = InDir, OutDir = OutDir, Sample = Sample)
+```
+
+```{r}
+print("STModiCluster")
+res = .8
+TumorST = STModiCluster_mod(InDir = InDir,Sample = Sample, OutDir = OutDir,TumorST = TumorST)
+```
+
+```{r}
+# On the new machine
+TumorST <- readRDS(file = "/Users/adiallo/Downloads/TumorSTClustered.rds")
+```
+
+
+```{r}
+library(dplyr)
+library(infercnv)
+print("STCNV")
+STInferCNV <- STCNV(TumorST = TumorST,OutDir = OutDir, assay = "Spatial")
+```
+
+
+

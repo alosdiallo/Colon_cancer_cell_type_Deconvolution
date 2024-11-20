@@ -42,6 +42,8 @@ library(viridis)
 library(textshaping)
 library(EnhancedVolcano)
 library(DataExplorer)
+library(HDF5Array)
+library(DropletUtils)
 ```
 
 Functions Used in NoteBook 
@@ -120,33 +122,69 @@ consolidate_and_plot_ridge <- function(patient_seurat, patient_id, features) {
 
 ```
 
+Old Version 
 ```{r}
-consolidate_and_plot_new <- function(patient_seurat, patient_id) {
-    # Define the consolidated labels for each group
+# consolidate_and_plot_new <- function(patient_seurat, patient_id) {
+#     # Define the consolidated labels for each group
+#     caf_labels <- c("cS27 (CXCL14+ CAF)", "cS28 (GREM1+ CAF)", "cS29 (MMP3+ CAF)", "cS30 (CAF CCL8 Fibro-like)", "cS31 (CAF stem niche Fibro-like)")
+#     t_cell_labels <- c("cTNI01 (CD4+ IL7R+)", "cTNI02 (CD4+ IL7R+SELL+)", "cTNI10 (CD8+ IL7R+)")
+#     tumor_labels <- c("cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)", "cE03 (Stem/TA-like prolif)", "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)", "cE06 (Immature Goblet)", "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)")
+# 
+#     # Check and consolidate labels
+#     if (!"consolidated_labels" %in% colnames(patient_seurat@meta.data)) {
+#         patient_seurat$consolidated_labels <- patient_seurat$predicted.id
+#         
+#         patient_seurat$consolidated_labels <- ifelse(patient_seurat$predicted.id %in% caf_labels, "CAF",
+#                                                      ifelse(patient_seurat$predicted.id %in% t_cell_labels, "T-Cell",
+#                                                             ifelse(patient_seurat$predicted.id %in% tumor_labels, "Tumor", NA)))
+#     }
+#     # Ensure dataset_origin is a factor with the correct levels
+#     patient_seurat$dataset_origin <- as.factor(patient_seurat$dataset_origin)
+# 
+#     # Generate and return the Plot with the patient info in the title
+#     # Generate UMAP plot
+#     plot <- DimPlot(patient_seurat, reduction = "umap", group.by = "consolidated_labels", label = TRUE) +
+#             scale_shape_manual(values = c("metastasis" = 25, "non_metastasis" = 5)) +
+#             ggplot2::ggtitle(paste("Immune Environment for Patients", patient_id)) +
+#             theme(legend.position = "bottom")
+# 
+#     return(plot)
+# }
+
+```
+
+
+```{r}
+consolidate_and_plot_new_version <- function(patient_seurat, patient_id) {
+    # Define the consolidated labels for each group within the function scope
     caf_labels <- c("cS27 (CXCL14+ CAF)", "cS28 (GREM1+ CAF)", "cS29 (MMP3+ CAF)", "cS30 (CAF CCL8 Fibro-like)", "cS31 (CAF stem niche Fibro-like)")
-    t_cell_labels <- c("cTNI01 (CD4+ IL7R+)", "cTNI02 (CD4+ IL7R+SELL+)", "cTNI10 (CD8+ IL7R+)")
+    CD4_cell_labels <- c("cTNI01 (CD4+ IL7R+)", "cTNI02 (CD4+ IL7R+SELL+)", "cTNI03 (CD4+ IL7R+HSP+)", "cTNI04 (CD4+ IL7R+CCL5+)", "cTNI05 (CD4+ IL17+)", "cTNI06 (CD4+ TFH)", "cTNI07 (CD4+ CXCL13+)")
     tumor_labels <- c("cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)", "cE03 (Stem/TA-like prolif)", "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)", "cE06 (Immature Goblet)", "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)")
-
-    # Check and consolidate labels
-    if (!"consolidated_labels" %in% colnames(patient_seurat@meta.data)) {
-        patient_seurat$consolidated_labels <- patient_seurat$predicted.id
-        
-        patient_seurat$consolidated_labels <- ifelse(patient_seurat$predicted.id %in% caf_labels, "CAF",
-                                                     ifelse(patient_seurat$predicted.id %in% t_cell_labels, "T-Cell",
-                                                            ifelse(patient_seurat$predicted.id %in% tumor_labels, "Tumor", NA)))
-    }
-    # Ensure dataset_origin is a factor with the correct levels
-    patient_seurat$dataset_origin <- as.factor(patient_seurat$dataset_origin)
-
-    # Generate and return the Plot with the patient info in the title
-    # Generate UMAP plot
-    plot <- DimPlot(patient_seurat, reduction = "umap", group.by = "consolidated_labels", label = TRUE) +
-            scale_shape_manual(values = c("metastasis" = 25, "non_metastasis" = 5)) +
-            ggplot2::ggtitle(paste("Immune Environment for Patients", patient_id)) +
-            theme(legend.position = "bottom")
-
-    return(plot)
+    B_Cells_labels <- c("cB1 (B IGD+IgM+)", "cB2 (B GC-like)", "cB3 (B CD40+ GC-like)")
+    NK_Cells_labels <- c("cTNI23 (NK CD16A+)", "cTNI24 (NK GZMK+)")
+    Monocytes_labels <- c("cM01 (Monocyte)")
+    CD8_cell_labels <- c("cTNI10 (CD8+ IL7R+)", "cTNI11 (CD8+GZMK+)", "cTNI12 (CD8+ IL7R+)", "cTNI13 (CD8+ T IL17+)", "cTNI14 (CD8+ CXCL13+)", "cTNI15 (CD8+ CXCL13+ HSP+)", "cTNI16 (CD8+ CXCL13+ prolif)")
+    Endothelial_cell_labels <- c("cS01 (Endo arterial)", "cS02 (Endo capillary)", "cS03 (Endo capillary)", "cS04 (Endo)", "cS05 (Endo venous)", "cS06 (Endo lymphatic)", "cS07 (Endo capillary-like)", "cS08 (Endo arterial-like)", "cS09 (Endo)", "cS10 (Endo tip cells)", "cS11 (Endo proif)", "cS12 (Endo)", "cS13 (Endo venous-like)", "cS14 (Endo)")
+    TREG <- c("cTNI08 (CD4+ Treg)", "cTNI09 (CD4+ Treg prolif)")
+    
+    # Consolidate labels
+    patient_seurat$consolidated_labels <- sapply(patient_seurat$predicted.id, function(x) {
+        if (x %in% caf_labels) return("CAF")
+        else if (x %in% CD4_cell_labels) return("CD4 T-cells")
+        else if (x %in% tumor_labels) return("Tumor")
+        else if (x %in% B_Cells_labels) return("B-Cells")
+        else if (x %in% NK_Cells_labels) return("NK Cells")
+        else if (x %in% Monocytes_labels) return("Monocytes")
+        else if (x %in% CD8_cell_labels) return("CD8 T-cells")
+        else if (x %in% Endothelial_cell_labels) return("Endothelial")
+        else if (x %in% TREG) return("TREG")
+        else return("Other")
+    })
 }
+# Define a consistent color palette for cell types
+cell_type_colors <- c("CAF" = "#1f77b4", "CD4 T-cells" = "#ff7f0e", "Tumor" = "#2ca02c", "B-Cells" = "#d62728",
+                      "NK Cells" = "#9467bd", "Monocytes" = "#8c564b", "CD8 T-cells" = "#e377c2",
+                      "Endothelial" = "#7f7f7f", "TREG" = "#bcbd22", "Other" = "#17becf")
 
 ```
 
@@ -264,6 +302,118 @@ ggsave("nonmets_umap_plot.png", plot = nonmets_plot, width = 20, height = 10, dp
 
 
 
+```{r}
+consolidate_and_plot_s_f <- function(patient_seurat, group_name) {
+    # Define the consolidated labels for each group
+    caf_labels <- c("cS27 (CXCL14+ CAF)", "cS28 (GREM1+ CAF)", "cS29 (MMP3+ CAF)", "cS30 (CAF CCL8 Fibro-like)", "cS31 (CAF stem niche Fibro-like)")
+    t_cell_labels <- c("cTNI01 (CD4+ IL7R+)", "cTNI02 (CD4+ IL7R+SELL+)", "cTNI10 (CD8+ IL7R+)")
+    tumor_labels <- c("cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)", "cE03 (Stem/TA-like prolif)", 
+                      "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)", "cE06 (Immature Goblet)", 
+                      "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)")
+
+    # Create a new column for consolidated labels
+    patient_seurat$consolidated_labels <- patient_seurat$predicted.id
+
+    # Consolidate labels
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% caf_labels] <- "CAF"
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% t_cell_labels] <- "T-Cell"
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% tumor_labels] <- "Tumor"
+
+    # Set labels to NA for cells not in the selected cell types
+    patient_seurat$consolidated_labels[!patient_seurat$consolidated_labels %in% c("Tumor", "CAF", "T-Cell")] <- NA
+
+    # Generate the UMAP plot with consolidated labels
+    umap_plot <- DimPlot(patient_seurat, reduction = "umap", group.by = "consolidated_labels", label = FALSE) + 
+                 ggplot2::ggtitle(paste("Immune Environment for", group_name))
+
+    # Subset CAF cells
+    caf_cells <- subset(patient_seurat, subset = consolidated_labels == "CAF")
+
+    # Generate expression plots for SMA (ACTA2) and Fibronectin (FN1) within CAF cells
+    sma_plot <- FeaturePlot(caf_cells, features = "ACTA2", reduction = "umap") + 
+                ggplot2::ggtitle(paste("SMA (ACTA2) Expression in CAF Cells -", group_name))
+    fibronectin_plot <- FeaturePlot(caf_cells, features = "FN1", reduction = "umap") + 
+                        ggplot2::ggtitle(paste("Fibronectin (FN1) Expression in CAF Cells -", group_name))
+
+    # Return all three plots in a list
+    return(list(UMAP = umap_plot, SMA = sma_plot, Fibronectin = fibronectin_plot))
+}
+
+# Generate plots for metastasis and non-metastasis groups
+metastasis_plot <- consolidate_and_plot_s_f(metastasis, "Metastasis")
+non_metastasis_plot <- consolidate_and_plot_s_f(non_metastasis, "Non-Metastasis")
+
+# Display the plots for metastasis and non-metastasis
+print(metastasis_plot[["UMAP"]])
+print(metastasis_plot[["SMA"]])
+print(metastasis_plot[["Fibronectin"]])
+
+print(non_metastasis_plot[["UMAP"]])
+print(non_metastasis_plot[["SMA"]])
+print(non_metastasis_plot[["Fibronectin"]])
+
+```
+```{r}
+consolidate_and_plot_both <- function(patient_seurat, group_name) {
+ # Define the consolidated labels for each group
+    caf_labels <- c("cS27 (CXCL14+ CAF)", "cS28 (GREM1+ CAF)", "cS29 (MMP3+ CAF)", "cS30 (CAF CCL8 Fibro-like)", "cS31 (CAF stem niche Fibro-like)")
+    t_cell_labels <- c("cTNI01 (CD4+ IL7R+)", "cTNI02 (CD4+ IL7R+SELL+)", "cTNI10 (CD8+ IL7R+)")
+    tumor_labels <- c("cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)", "cE03 (Stem/TA-like prolif)", 
+                      "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)", "cE06 (Immature Goblet)", 
+                      "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)")
+
+    # Create a new column for consolidated labels
+    patient_seurat$consolidated_labels <- patient_seurat$predicted.id
+
+    # Consolidate labels
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% caf_labels] <- "CAF"
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% t_cell_labels] <- "T-Cell"
+    patient_seurat$consolidated_labels[patient_seurat$predicted.id %in% tumor_labels] <- "Tumor"
+
+    # Set labels to NA for cells not in the selected cell types
+    patient_seurat$consolidated_labels[!patient_seurat$consolidated_labels %in% c("Tumor", "CAF", "T-Cell")] <- NA
+
+    # Generate the UMAP plot with consolidated labels
+    umap_plot <- DimPlot(patient_seurat, reduction = "umap", group.by = "consolidated_labels", label = FALSE) + 
+                 ggplot2::ggtitle(paste("Immune Environment for", group_name))
+
+    # Subset CAF cells
+    caf_cells <- subset(patient_seurat, subset = consolidated_labels == "CAF")
+
+    # Extract UMAP coordinates and expression data for ACTA2 (SMA) and FN1 (Fibronectin)
+    umap_data <- Embeddings(caf_cells, "umap")
+    expr_data <- FetchData(caf_cells, vars = c("ACTA2", "FN1"))
+    
+    # Combine UMAP coordinates with expression data
+    plot_data <- data.frame(umap_data, expr_data)
+    colnames(plot_data) <- c("UMAP_1", "UMAP_2", "ACTA2", "FN1")
+
+    # Create the combined plot using ggplot2 with different colors for each gene
+    combined_plot <- ggplot(plot_data, aes(x = UMAP_1, y = UMAP_2)) +
+        geom_point(aes(color = ACTA2), size = 1, alpha = 0.7) +
+        scale_color_gradient(low = "lightblue", high = "darkblue", name = "SMA (ACTA2)") +
+        geom_point(aes(color = FN1), size = 1, alpha = 0.7) +
+        scale_color_gradient(low = "lightgreen", high = "darkgreen", name = "Fibronectin (FN1)") +
+        ggtitle(paste("SMA (ACTA2) and Fibronectin (FN1) Expression in CAF Cells -", group_name)) +
+        theme_minimal()
+
+    # Return UMAP and combined expression plot
+    return(list(UMAP = umap_plot, Combined_Expression = combined_plot))
+}
+
+# Generate plots for metastasis and non-metastasis groups
+metastasis_plot <- consolidate_and_plot_both(metastasis, "Metastasis")
+non_metastasis_plot <- consolidate_and_plot_both(non_metastasis, "Non-Metastasis")
+
+# Display the plots for metastasis and non-metastasis
+print(metastasis_plot[["UMAP"]])
+print(metastasis_plot[["Combined_Expression"]])
+
+print(non_metastasis_plot[["UMAP"]])
+print(non_metastasis_plot[["Combined_Expression"]])
+
+
+```
 
 
 
@@ -366,6 +516,8 @@ ridge_plot_non_mets <- consolidate_and_plot_ridge(non_metastasis, "Non-Metastasi
 
 ggsave("non_metastasis_ridge_plot.png", plot = ridge_plot_non_mets, width = 15, height = 20, dpi = 600)
 ```
+
+
 ```{r}
 # Add orig.ident metadata to each dataset if not already present
 metastasis$dataset_origin <- 'metastasis'
@@ -456,6 +608,8 @@ non_metastatic_data_combined_data_plot
 # non_metastatic_plot
 
 ```
+
+
 ```{r}
 # Subset the data for specific clusters
 selected_clusters <- c(1,3,4,9)  # Example cluster IDs
@@ -484,6 +638,12 @@ DimPlot(subset_data, reduction = "umap", group.by = "original_cell_type", label 
 combined_data <- consolidate_cell_types(combined_data)
 saveRDS(combined_data, file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/combined_data.rds")
 ```
+
+```{r}
+combined_data <- readRDS(file = "F:/GS/PhD/Christensen_Lab/Colon_Project/single_cell/combined_data.rds")
+```
+
+
 
 ```{r}
 combined_data <- consolidate_cell_types(combined_data)
@@ -516,5 +676,81 @@ print(stacked_barplot)
 
 
 ```
+
+```{r}
+# Path to the .h5 file
+file_path <- "F:/GS/PhD/Christensen_Lab/Colon_Project/MAIT_Cells/GSM5830281_blood1_filtered_feature_bc_matrix.h5"
+
+# Load the data
+single_cell_data <- Read10X_h5(file_path)
+
+# Create a Seurat object
+seurat_object <- CreateSeuratObject(counts = single_cell_data)
+
+```
+
+```{r}
+seurat_object[["percent.mt"]] <- PercentageFeatureSet(seurat_object, pattern = "^MT-")
+# Basic filtering
+seurat_object <- subset(seurat_object, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+
+# Normalize the data
+seurat_object <- NormalizeData(seurat_object)
+
+# Find variable features
+seurat_object <- FindVariableFeatures(seurat_object)
+
+```
+```{r}
+    seurat_object <- ScaleData(seurat_object)
+    
+    # Perform PCA
+    seurat_object <- RunPCA(seurat_object, features = VariableFeatures(object = seurat_object))
+    
+    # Find neighbors and clusters
+    seurat_object <- FindNeighbors(seurat_object, dims = 1:20)
+    seurat_object <- FindClusters(seurat_object, resolution = 0.5)
+    
+    # Run UMAP
+    seurat_object <- RunUMAP(seurat_object, dims = 1:20)
+    DimPlot(seurat_object, reduction = "umap", group.by = "orig.ident")
+```
+```{r}
+library(ggplot2)
+library(Seurat)
+library(patchwork)
+
+# Define a consistent color palette for cell types
+cell_type_colors <- c("CAF" = "#1f77b4", "CD4 T-cells" = "#ff7f0e", "Tumor" = "#2ca02c", "B-Cells" = "#d62728",
+                      "NK Cells" = "#9467bd", "Monocytes" = "#8c564b", "CD8 T-cells" = "#e377c2",
+                      "Endothelial" = "#7f7f7f", "TREG" = "#bcbd22", "Other" = "#17becf")
+
+# Update this function to match the consolidation logic in consolidate_cell_types
+
+
+# Assuming 'combined_data' has been processed with consolidate_cell_types
+cell_counts_df <- cell_counts_df %>%
+  mutate(consolidated_labels = factor(consolidated_labels, levels = names(cell_type_colors)))
+
+# Generate the bar plot with the consistent color palette
+stacked_barplot <- ggplot(cell_counts_df, aes(x = dataset_origin, y = Proportion, fill = consolidated_labels)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = cell_type_colors) +
+  labs(x = "Sample Type", y = "Proportion", fill = "Cell Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Cell Type Composition")
+
+# Print and/or combine plots
+metastatic_plot <- consolidate_and_plot_new_version(metastatic_data, "Metastatic")
+non_metastatic_plot <- consolidate_and_plot_new_version(non_metastatic_data, "Non-Metastatic")
+
+# Combine plots using patchwork
+combined_figure <- (metastatic_plot / non_metastatic_plot) / stacked_barplot
+print(combined_figure)
+
+```
+
+
 
 
