@@ -1,0 +1,87 @@
+---
+title: "ref_maps"
+author: "Alos Diallo"
+date: "2024-04-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+gr <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+
+```{r}
+target <- read.csv("F:/GS/PhD/Christensen_Lab/Colon_Project/dnm_data/dm_57_samples.csv")
+target $patient <- paste(target$Sentrix_ID,target$Sentrix_Position,sep="_")
+rownames(target) <- target$patient
+target$SampleID <- rownames(target)
+target_ordered <- target[match(colnames(gset), target$SampleID),]
+phenoData <- new("AnnotatedDataFrame", data = target_ordered)
+pData(gset) <- phenoData
+
+
+
+```
+
+
+
+```{r}
+
+MSet<-preprocessRaw(RGset_eV1)
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+gset <- mapToGenome(ratioSet)
+beta <- getBeta(gset)
+m <- getM(gset)
+cn <- getCN(gset)
+sampleNames <- sampleNames(gset)
+probeNames <- featureNames(gset)
+pheno <- pData(gset)
+gr <- granges(gset)
+annotation <- getAnnotation(gset)
+islands <- getIslandStatus(gset)
+probeType <- getProbeType(gset)
+rowData(gset)$Probe_ID <- rownames(gset)
+```
+
+
+QC
+```{r}
+qc<-getQC(MSet)
+plotQC(qc)
+densityPlot(MSet)
+densityBeanPlot(MSet)
+```
+```{r}
+snps<-getSnpInfo(gset)
+snps
+```
+```{r}
+GTEx_eV1
+
+
+MSet_G <-preprocessRaw(GTEx_eV1)
+ratioSetG <- ratioConvert(MSet_G, what = "both", keepCN = TRUE)
+gsetG <- mapToGenome(ratioSetG)
+betaG <- getBeta(gsetG)
+mG <- getM(gsetG)
+cnG <- getCN(gsetG)
+sampleNamesG <- sampleNames(gsetG)
+probeNamesG <- featureNames(gsetG)
+phenoG <- pData(gsetG)
+grG <- granges(gsetG)
+annotationG <- getAnnotation(gsetG)
+islandsG <- getIslandStatus(gsetG)
+probeTypeG <- getProbeType(gsetG)
+
+
+rowData(gsetG)$Probe_ID <- rownames(gsetG)
+```
+
+```{r}
+compareReference(gsetG, gset)
+```
+

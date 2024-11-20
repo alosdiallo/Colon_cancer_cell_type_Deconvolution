@@ -1,0 +1,67 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+library(glmnet)
+
+# Assuming `M.val2` is your complete methylation matrix (samples x CpGs)
+# Subset `M.val2` to include only the top CpGs
+top_cpgs <- rownames(top_cpgs)
+M.val2_top <- M.val2[top_cpgs, ]
+
+# Transpose `M.val2_top` to match the sample rows with columns
+M.val2_top <- t(M.val2_top)
+
+# Standardize the methylation data
+M.val2_top <- scale(M.val2_top)
+```
+```{r}
+library(umap)
+
+# UMAP settings
+umap_settings <- umap.defaults
+umap_settings$n_neighbors <- 15
+umap_settings$min_dist <- 0.1
+
+# Apply UMAP
+umap_result <- umap(M.val2_top, config = umap_settings)
+embedding <- umap_result$layout
+```
+```{r}
+library(mclust)
+
+# Perform Gaussian Mixture Model-based clustering
+gmm <- Mclust(embedding)
+
+# Extract cluster assignments
+clusters <- gmm$classification
+
+```
+```{r}
+library(ggplot2)
+library(ggforce)  # For geom_mark_ellipse
+
+# Combine UMAP results with metastasis status
+embedding_df <- as.data.frame(embedding)
+embedding_df$cluster <- as.factor(clusters)
+embedding_df$metastasis_status <- as.factor(combined_data$MLH1)
+
+# Add contours for density
+ggplot(embedding_df, aes(x = V1, y = V2)) +
+  geom_point(aes(color = metastasis_status), size = 2) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon", alpha = 0.3) +
+  labs(title = "UMAP Projection of CpG Sites Clustering with Contours",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2") +
+  theme_minimal() +
+  scale_color_manual(values = c("red", "blue")) + # Customize colors as needed
+  scale_fill_viridis_c()
+
+
+```
+
+

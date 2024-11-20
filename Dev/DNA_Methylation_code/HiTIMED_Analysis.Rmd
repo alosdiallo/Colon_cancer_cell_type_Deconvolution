@@ -48,10 +48,11 @@ load("25_files_data_converted.RData")
 
 putting the two datasets together
 ```{r}
+#merged_Betas = DH_CRC_Betas #comment out later
 merged_Betas <- merge(Betas, v2_Betas, by = "row.names")
 rownames(merged_Betas) <- merged_Betas$Row.names
 merged_Betas <- merged_Betas[,-1] 
-#save(merged_Betas, file = "all_samples.RData")
+save(merged_Betas, file = "all_samples.RData")
 
 ```
 
@@ -61,8 +62,8 @@ GTEx_eV1 = read.metharray.exp("F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/",re
 MSet <-preprocessNoob(GTEx_eV1)
 Betas_GTEx <-getBeta(MSet)
 Betas_GTEx <- sesame::betasCollapseToPfx(Betas_GTEx)
-
 saveRDS(Betas_GTEx,file = "F:/GS/PhD/Christensen_Lab/Colon_Project/GTEx/GTEx_samples.rds")
+Betas_GTEx = GTEx_samples
 ```
 
 Get TCGA data
@@ -78,8 +79,8 @@ tcga.cell$COAD_Deconv2#MASS
 
 tcga_T = t(tcga.dnam)
 
-MSet_noob_T <- preprocessNoob(tcga.dnam)
-beta_matrix_TCGA<-getBeta(MSet_noob_T)
+# MSet_noob_T <- preprocessNoob(tcga.dnam)
+# beta_matrix_TCGA<-getBeta(MSet_noob_T)
 
 ```
 
@@ -94,6 +95,12 @@ HiTIMED_result_4<-HiTIMED_deconvolution(merged_Betas,"COAD",4,"tumor")
 HiTIMED_result_5<-HiTIMED_deconvolution(merged_Betas,"COAD",5,"tumor")
 HiTIMED_result_6<-HiTIMED_deconvolution(merged_Betas,"COAD",6,"tumor")
 
+GTEx_result_1<-HiTIMED_deconvolution(Betas_GTEx,"COAD",1,"tumor")
+GTEx_result_2<-HiTIMED_deconvolution(Betas_GTEx,"COAD",2,"tumor")
+GTEx_result_3<-HiTIMED_deconvolution(Betas_GTEx,"COAD",3,"tumor")
+GTEx_result_4<-HiTIMED_deconvolution(Betas_GTEx,"COAD",4,"tumor")
+GTEx_result_5<-HiTIMED_deconvolution(Betas_GTEx,"COAD",5,"tumor")
+GTEx_result_6<-HiTIMED_deconvolution(Betas_GTEx,"COAD",6,"tumor")
 
 tcga_result_1<-HiTIMED_deconvolution(tcga_T,"COAD",1,"tumor")
 tcga_result_2<-HiTIMED_deconvolution(tcga_T,"COAD",2,"tumor")
@@ -102,6 +109,8 @@ tcga_result_4<-HiTIMED_deconvolution(tcga_T,"COAD",4,"tumor")
 tcga_result_5<-HiTIMED_deconvolution(tcga_T,"COAD",5,"tumor")
 tcga_result_6<-HiTIMED_deconvolution(tcga_T,"COAD",6,"tumor")
 ```
+
+
 ```{r}
 library(tidyverse)
 
@@ -120,13 +129,21 @@ tcga_result_4$Source <- "TCGA"
 tcga_result_5$Source <- "TCGA"
 tcga_result_6$Source <- "TCGA"
 
+GTEx_result_1$Source<-"GTEx"
+GTEx_result_2$Source<-"GTEx"
+GTEx_result_3$Source<-"GTEx"
+GTEx_result_4$Source<-"GTEx"
+GTEx_result_5$Source<-"GTEx"
+GTEx_result_6$Source<-"GTEx"
+
+
 # Combine DH and TCGA data frames for each level
-data_level_1 <- bind_rows(HiTIMED_result_1, tcga_result_1)
-data_level_2 <- bind_rows(HiTIMED_result_2, tcga_result_2,HiTIMED_result_gtex2)
-data_level_3 <- bind_rows(HiTIMED_result_3, tcga_result_3)
-data_level_4 <- bind_rows(HiTIMED_result_4, tcga_result_4)
-data_level_5 <- bind_rows(HiTIMED_result_5, tcga_result_5)
-data_level_6 <- bind_rows(HiTIMED_result_6, tcga_result_6)
+data_level_1 <- bind_rows(HiTIMED_result_1, tcga_result_1,GTEx_result_1)
+data_level_2 <- bind_rows(HiTIMED_result_2, tcga_result_2,GTEx_result_2)
+data_level_3 <- bind_rows(HiTIMED_result_3, tcga_result_3,GTEx_result_3)
+data_level_4 <- bind_rows(HiTIMED_result_4, tcga_result_4,GTEx_result_4)
+data_level_5 <- bind_rows(HiTIMED_result_5, tcga_result_5,GTEx_result_5)
+data_level_6 <- bind_rows(HiTIMED_result_6, tcga_result_6,GTEx_result_6)
 
 # Set a unique ID for each level and source combination
 data_level_1$ID <- "Level_1"
@@ -203,22 +220,7 @@ for (level in names(levels_data)) {
     values_to = "Proportion"
   )
 
-#   # Generate boxplot using ggplot2
-#   plot <- ggplot(long_data, aes(x = CellType, y = Proportion, fill = Source)) +
-#     geom_boxplot() +
-#     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-#     labs(title = paste("Distribution of Cell Types at", level, "across DH and TCGA Results"),
-#          x = "Cell Type", y = "Proportion") +
-#     scale_fill_brewer(palette = "Set1")  # Clear color distinction
-# 
-#   # Save each plot with a unique filename
-#   plot_file_name <- paste0("Plot_", level, ".png")
-#   ggsave(plot_file_name, plot, width = 12, height = 8)
-# }
 
-
-#For figures Background and lines removed.
- # Generate boxplot using ggplot2
   plot <- ggplot(long_data, aes(x = CellType, y = Proportion, fill = Source)) +
     geom_boxplot() +
     theme_minimal() +  # Cleaner theme
@@ -231,7 +233,7 @@ for (level in names(levels_data)) {
     labs(title = paste("Distribution of Cell Types at", level, "across DH and TCGA Results"),
          x = "Cell Type", y = "Proportion") +
     scale_fill_brewer(palette = "Set1")  # Clear color distinction
-
+print(plot)
   # Save each plot with a unique filename
   plot_file_name <- paste0("Plot_", level, ".png")
   ggsave(plot_file_name, plot, width = 12, height = 8)
@@ -414,14 +416,6 @@ print(plot_subset)
 ```
 
 
-HiTIMED_result_1$Source <- "DH"
-HiTIMED_result_2$Source <- "DH"
-HiTIMED_result_3$Source <- "DH"
-HiTIMED_result_4$Source <- "DH"
-HiTIMED_result_5$Source <- "DH"
-HiTIMED_result_6$Source <- "DH"
-
-Mono,DC,NK,Eos,Neu
 ```{r}
 
 Holder_main = HiTIMED_result_1
@@ -552,6 +546,19 @@ distant_mets_plot_all
 
 
 ```
+
+
+```{r}
+data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+
+
+
+
+
+
 
 
 

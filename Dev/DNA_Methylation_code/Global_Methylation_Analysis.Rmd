@@ -1,0 +1,54 @@
+---
+title: "Global_Analysis"
+author: "Alos Diallo"
+date: "2024-08-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+library(ENmix)
+library(DataExplorer)
+library(missMethyl)
+```
+
+
+```{r}
+data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+```{r}
+# Subset for LINE-1 and Alu elements
+line1_sites <- anno[grep("LINE1", anno$UCSC_RefGene_Name), ]
+alu_sites <- anno[grep("Alu", anno$UCSC_RefGene_Name), ]
+```
+
+```{r}
+# Extract beta values for these sites
+line1_beta <- getBeta(mSet)[line1_sites$Name, ]
+alu_beta <- getBeta(mSet)[alu_sites$Name, ]
+
+# Calculate average methylation levels
+avg_line1_methylation <- rowMeans(line1_beta, na.rm = TRUE)
+avg_alu_methylation <- rowMeans(alu_beta, na.rm = TRUE)
+```
+
