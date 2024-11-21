@@ -1,0 +1,348 @@
+---
+title: "Q_C_For_Colon_DM_Data"
+author: "Alos Diallo"
+date: "2024-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In this document I am running a number of QC related analyses 
+Loading packages
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+library(sva)
+library(ENmix)
+library(DataExplorer)
+library(ExperimentHub)
+sesameDataCache("idatSignature")
+```
+
+Loading the MetaData file
+```{r}
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+```
+
+Loading the IDAT's 
+32 samples are Epic V2 and 25 samples are Epic V1 so I have kept them in seperate directories. If they are in the same directory loading the data will fail because all samples in a directory must be from the same platform.
+```{r}
+idat = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/"
+RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
+```
+
+Looking for batch effects in the data
+Performing a surrogate variable analysis (SVA)
+Surrogate variables are used to account for unmeasured sources of variation (e.g., batch effects) in high-dimensional data like methylation data.
+	•	The displayed output is a matrix of principal components (PCs), which represent surrogate variables derived from the input data.
+	•	Each row corresponds to a sample (e.g., 206184840145_R01C01), and each column corresponds to a principal component (e.g., PC1, PC2, etc.).
+	•	The values in the table represent the contribution of each PC to the respective sample.
+
+```{r}
+sva_32 <-ctrlsva(RGset_32)
+sva_25 <-ctrlsva(RGset_25)
+surrogateVariables_32 <- sva_32
+surrogateVariables_25 <- sva_25
+```
+Note for myself:
+If Your Goal is Batch Effect Removal:
+	•	Include PCs as Covariates: Use the surrogate variables as covariates in your downstream statistical models (e.g., regression) to account for batch effects or confounding variation, rather than directly filtering the data to these PCs.
+	•	Why? This approach corrects for unwanted variation while keeping all original data dimensions.
+Something to think about for analysis plan.
+
+
+Running QC info to look for bad CpG's
+Common Criteria for Identifying Bad CpGs:
+
+	1.	Low Detection P-value:
+	•	CpGs with a detection p-value above a certain threshold (typically p > 0.01 or p > 0.05) are considered unreliable.
+	•	These p-values indicate the confidence that the methylation value for a CpG is distinguishable from background noise.
+	2.	Cross-Reactive Probes:
+	•	Some probes bind non-specifically to multiple genomic locations, leading to unreliable or misleading results.
+	•	Lists of cross-reactive probes are often published in studies, such as by Chen et al. (2013) or Pidsley et al. (2016).
+	3.	Probes with SNPs:
+	•	CpGs located near or overlapping Single Nucleotide Polymorphisms (SNPs) in the target population can lead to variability unrelated to methylation.
+	•	SNPs can affect probe hybridization and alter the measured signal.
+	4.	Probes on Sex Chromosomes:
+	•	Probes located on the X and Y chromosomes are often removed if working with mixed-sex datasets to avoid sex-biased effects unless explicitly relevant to the study (e.g., sex-specific analysis).
+	5.	Non-CpG Probes:
+	•	Some probes are designed to target non-CpG methylation (e.g., CHH or CHG contexts). These are often removed if the analysis focuses on CpG methylation.
+	6.	Probes Mapping to Repeats:
+	•	Probes mapping to repetitive regions of the genome can produce unreliable data due to multi-mapping.
+	7.	High Missingness:
+	•	CpGs with a high percentage of missing values (e.g., ≥5% samples failing QC) are typically removed.
+	8.	Technical Artifacts:
+	•	Probes affected by batch effects, dye-bias issues, or poorly calibrated fluorescence can be flagged and excluded.
+	9.	Extreme Beta Values:
+	•	CpGs with extreme beta values (close to 0 or 1 across nearly all samples) may indicate poor variability and might be excluded depending on the analysis goal.
+	10.	Probes Not Mapping to the Reference Genome:
+	•	Some probes, particularly from earlier array versions, may not map to the latest reference genome assemblies, leading to inaccurate annotations.
+
+
+I have to convert the beta value matrix array to extended format for this to work.
+```{r}
+# Convert RGChannelSet to RGChannelSetExtended
+RGset_32_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE,extended = TRUE)
+RGset_25_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE,extended = TRUE) 
+
+# Run QCinfo function
+qc_info32 <- QCinfo(RGset_32_extended)
+qc_info25 <- QCinfo(RGset_25_extended)
+
+# Display QC information
+print(qc_info32)
+print(qc_info25)
+badCpG = c(qc_info32$badCpG,qc_info25$badCpG)
+# Remove any suffix after an underscore
+cleaned_badCpG <- sub("_.*", "", badCpG)
+```
+
+Calculating a series of quality metrics for the methylation data, such as probe signal strength, bisulfite conversion efficiency, and detection p-values.
+```{r}
+idat_dir_25_samples = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+idat_dir_32_samples = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/" 
+qcs_25 = openSesame(idat_dir_25_samples, prep="", func=sesameQC_calcStats)
+qcs_32 = openSesame(idat_dir_32_samples, prep="", func=sesameQC_calcStats)
+
+qcs_25[[1]]
+qcs_32[[1]]
+
+```
+Calculating fraction of dye bias corrected total intensity. 
+
+This metric represents the proportion of signal intensity that remains after dye bias correction has been applied. Dye bias occurs due to differences in the fluorescence efficiency of the two dye channels (Cy3 and Cy5) used in Illumina methylation arrays. Correcting for dye bias ensures the data is normalized and comparable across samples. A value close to 1 indicates that most of the signal is retained after dye bias correction, which suggests high-quality data with minimal dye-related issues.Lower values (e.g., < 0.8) may indicate poor-quality samples or significant dye bias issues.
+
+	•	High frac_dt Values (> 0.9):
+	•	Suggests the sample is of high quality and suitable for downstream analysis.
+	•	Low frac_dt Values (< 0.8):
+	•	May indicate poor-quality samples or problematic intensity measurements, and these samples may need to be flagged or removed from the analysis.
+```{r}
+
+sesameQC_getStats(qcs_25[[1]], "frac_dt")
+sesameQC_getStats(qcs_32[[1]], "frac_dt")
+```
+
+The pOOBAH function is applied to each sample (or SigDF) in your datasets sdfs_25 and sdfs_32, identifying and masking unreliable probes.
+```{r}
+sdfs_25 = lapply(searchIDATprefixes("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"), readIDATpair)
+sdfs_32 = lapply(searchIDATprefixes("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"), readIDATpair)
+
+sdf_withNA_25 = lapply(sdfs_25, pOOBAH)
+sdf_withNA_32 = lapply(sdfs_32, pOOBAH)
+
+sum(sdf_withNA_25$mask) 
+sum(sdf_withNA_32$mask) 
+```
+The result indicates that no probes were masked by the pOOBAH QC step in either sdfs_25 or sdfs_32. This suggests that the quality of my data is exceptionally good in this context, as all probes passed the detection p-value threshold.
+
+Plots of samples before and after normalization to study the effects of normalizing using noob
+```{r}
+# Function to plot before and after for a list of SigDF objects
+plotQC <- function(sdf_list) {
+  for (i in seq_along(sdf_list)) {
+    par(mfrow=c(2,1), mar=c(3,3,2,1))
+    sesameQC_plotBetaByDesign(sdf_list[[i]], main=paste("Before (Sample", i, ")"), xlab="β")
+    sesameQC_plotBetaByDesign(noob(sdf_list[[i]]), main=paste("After (Sample", i, ")"), xlab="β")
+  }
+}
+
+# Plotting for both 25 and 32 sample sets
+plotQC(sdf_withNA_25)
+plotQC(sdf_withNA_32)
+
+```
+This identifies probes specifically designed for normalization control (e.g., probes used to evaluate technical consistency, dye bias, and background correction).
+Check for control probes in the first SigDF object
+```{r}
+# Check for control probes in the first SigDF object
+control_probes_25 <- grepl("normControl", sdfs_25[[1]]$Probe_ID)
+control_probes_32 <- grepl("normControl", sdfs_32[[1]]$Probe_ID)
+
+# Summarize the findings
+summary(control_probes_25)
+summary(control_probes_32)
+```
+
+
+```{r}
+str(sdfs_25[[1]])
+str(sdfs_32[[1]])
+```
+
+Examining non-linear correction
+```{r}
+# Function to plot QC metrics
+plotQC <- function(corrected_list) {
+  for (i in seq_along(corrected_list)) {
+    par(mfrow=c(1,2), mar=c(3,3,2,1))
+    
+    # Plot Red/Green QQ plot before correction
+    sesameQC_plotRedGrnQQ(corrected_list[[i]], main=paste("Non-Linear Correction (Sample", i, ")"))
+  }
+}
+
+
+plotQC(sdf_withNA_25)
+plotQC(sdf_withNA_32)
+```
+
+
+The bisulfite conversion plots generated by controlStripPlot are designed to evaluate the efficiency of bisulfite conversion, a critical step in methylation array processing. 
+
+What the Plots Represent
+
+	1.	X-Axis (Log2 Intensity):
+	•	The log2-transformed fluorescence intensities for the control probes.
+	•	Probes in the Green and Red channels correspond to different dyes used during hybridization.
+	2.	Y-Axis (Samples):
+	•	Each row represents a sample, with intensities plotted for the control probes of the specified category ("BISULFITE CONVERSION I").
+	3.	Two Panels (Green and Red):
+	•	The Green and Red panels represent dye-specific control probes. Both panels should show a similar trend if bisulfite conversion was successful and the data quality is consistent.
+	
+	Good Quality Bisulfite Conversion
+
+	•	Clustering of Points:
+	•	The control probe intensities (dots) should cluster in a tight, consistent range across all samples.
+	•	This indicates that the bisulfite conversion process was efficient and consistent across samples.
+	•	Symmetry Across Channels:
+	•	The Red and Green panels should show comparable intensity distributions.
+	•	Any significant asymmetry may suggest dye bias or a technical issue.
+
+Possible Issues
+
+	•	Wide Spread of Intensities:
+	•	If the dots are widely scattered or show inconsistent patterns across samples, it could indicate:
+	•	Poor bisulfite conversion for certain samples.
+	•	Technical variation during processing.
+	•	Significant Differences Between Channels:
+	•	If the Green and Red panels show very different patterns, it could suggest dye bias or inconsistencies in hybridization.
+	•	Very Low Intensities:
+	•	Consistently low intensities across all samples could suggest incomplete or failed bisulfite conversion.
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+```
+
+```{r}
+snps25 <- getSnpInfo(Noob_25_m)
+snps32 <- getSnpInfo(Noob_32_m)
+```
+
+Looking at Bisulfite Conversion for each sample
+```{r}
+controlStripPlot(RGset_25, controls="BISULFITE CONVERSION I")
+controlStripPlot(RGset_32, controls="BISULFITE CONVERSION I")
+```
+1st Plot (RGset_25):
+
+	•	The dots cluster tightly in both the Green and Red channels.
+	•	There is minimal scatter or asymmetry, indicating good bisulfite conversion quality for these samples.
+
+2nd Plot (RGset_32):
+
+	•	Similar to the first plot, the dots cluster tightly, suggesting that bisulfite conversion quality is consistent across these samples as well.
+
+
+```{r}
+plotCtrl(RGset_32)
+plotCtrl(RGset_25)
+getwd()
+```
+
+Here I am making Density and Box plots of the M values
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+
+Betas_25<-getBeta(Noob_25_m)
+Betas_32<-getBeta(Noob_32_m)
+
+Betas_25<- sesame::betasCollapseToPfx(Betas_25)
+colnames(Betas_25) = colnames(Noob_25_m)
+
+DH_CRC_Betas <- merge(Betas_25, Betas_32, by = "row.names")
+
+DH_CRC_Betas_matrix <- as.matrix(DH_CRC_Betas[, -1])  # Exclude the first column (Row.names) if it's not numeric
+rownames(DH_CRC_Betas_matrix) <- DH_CRC_Betas$Row.names  # Set row names
+
+DH_CRC_M_value = BetaValueToMValue(DH_CRC_Betas_matrix)
+```
+
+```{r}
+# Convert the M-values matrix (DH_CRC_M_value) to a data frame for easier plotting
+library(reshape2)
+m_values_df <- melt(DH_CRC_M_value)
+
+# Plot the boxplot
+library(ggplot2)
+ggplot(m_values_df, aes(x=Var2, y=value)) +
+  geom_boxplot(fill="blue") +
+  labs(title="Box Plot of M-values", x="Samples", y="M-values") +
+  theme(axis.text.x = element_text(angle=90, hjust=1))  # Rotate sample names if needed
+```
+```{r}
+# Flatten the M-values matrix into a single vector
+m_values_vector <- as.vector(DH_CRC_M_value)
+
+# Plot the density plot
+ggplot(data.frame(M_values = m_values_vector), aes(x = M_values)) +
+  geom_density(fill="blue", alpha=0.5) +
+  labs(title="Density Plot of M-values", x="M-value", y="Density") +
+  theme_minimal()
+```
+Here I'm plotting the beta and M values together. 
+```{r}
+# Flatten the Beta values and M-values into separate vectors
+beta_values_vector <- as.vector(DH_CRC_Betas_matrix)
+m_values_vector <- as.vector(DH_CRC_M_value)
+
+# Create a combined data frame for plotting
+combined_df <- data.frame(
+  Value = c(beta_values_vector, m_values_vector),
+  Type = rep(c("Beta Values", "M Values"), 
+             c(length(beta_values_vector), length(m_values_vector)))
+)
+
+# Plot the density plot with different colors for Beta and M-values
+library(ggplot2)
+ggplot(combined_df, aes(x = Value, fill = Type)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("Beta Values" = "red", "M Values" = "blue")) +
+  labs(title = "Density Plot of Beta Values and M-values",
+       x = "Value",
+       y = "Density",
+       fill = "Data Type") +
+  theme_minimal()
+```
+
+QC Stats Bar plot
+```{r}
+sesameQC_plotBar(lapply(sdfs_25, sesameQC_calcStats, "detection"))
+sesameQC_plotBar(lapply(sdfs_32, sesameQC_calcStats, "detection"))
+```
+
+```{r}
+sesameQC_plotBar(lapply(sdfs_25, sesameQC_calcStats, "intensity"))
+sesameQC_plotBar(lapply(sdfs_32, sesameQC_calcStats, "intensity"))
+```
+
+
