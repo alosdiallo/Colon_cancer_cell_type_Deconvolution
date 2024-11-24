@@ -1,0 +1,480 @@
+---
+title: "Cell_Type_Deconvolution_Analysis_DNA_Methylation"
+author: "Alos Diallo"
+date: "2024-11-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# =========================================================================
+# DNA methylation Cell Type Deconvolution using HiTIMED - COAD DH Dataset
+# Code by: Alos Diallo
+# 2023,2024
+# =========================================================================
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+library(sva)
+library(ENmix)
+library(DataExplorer)
+library(tidyr)
+library(EpiDISH)
+library(tibble)
+```
+
+Loading Data
+```{r}
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+
+
+# Convert relevant columns in `targets` to factors
+targets <- targets %>%
+  mutate(
+    MLH1 = factor(MLH1, levels = c(0, 1), labels = c("MLH1 Negative", "MLH1 Positive")),
+    MSH2 = factor(MSH2),
+    sex = factor(sex, levels = c("M", "F")),
+    Distant_Mets = factor(Distant_Mets, levels = c(FALSE, TRUE), labels = c("No Distant Mets", "Distant Mets")),
+    any_mets = factor(any_mets, levels = c(FALSE, TRUE), labels = c("No Mets", "Mets")),
+    ln_only = factor(ln_only, levels = c(FALSE, TRUE), labels = c("No LN Mets", "LN Mets"))
+  )
+```
+
+```{r}
+idat = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/"
+RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
+```
+
+
+Normalize my Data
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+```
+
+Getting the beta values
+```{r}
+Betas_25<-getBeta(Noob_25_m)
+Betas_32<-getBeta(Noob_32_m)
+```
+
+```{r}
+Betas_25<- sesame::betasCollapseToPfx(Betas_25)
+#Betas_32<- sesame::betasCollapseToPfx(Betas_32)
+colnames(Betas_25) = colnames(Noob_25_m)
+```
+
+```{r}
+DH_CRC_Betas <- merge(Betas_25, Betas_32, by = "row.names")
+rownames(DH_CRC_Betas) <- DH_CRC_Betas$Row.names
+DH_CRC_Betas <- DH_CRC_Betas[,-1] 
+```
+
+
+Loading the TCGA Data:
+```{r warning=FALSE, include=FALSE}
+tcga.data <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/TCGA_data.rds")
+tcga.dnam <- tcga.data[["dnam"]]
+tcga.pheno <- tcga.data[["pheno"]]
+tcga.cell <- tcga.data[["cell_types"]]
+msi_dat<-readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/msi_tcga.rds")
+tcga.cell$COAD_Deconv1#$MSS
+tcga.cell$COAD_Deconv2#MASS
+
+tcga_T = t(tcga.dnam)
+
+```
+
+Running EpiDish to obtain Fibroblast information
+```{r}
+# Define sources
+sources <- list(
+  DH = DH_CRC_Betas,
+  TCGA = tcga_T
+  # GTEx = GTEx_T
+)
+
+# Define the reference matrix (e.g., centEpiFibIC.m from EpiDISH)
+ref_matrix <- centEpiFibIC.m
+
+# Function to run EpiDISH on a source
+run_epidish <- function(beta_matrix, source_name) {
+  # Run EpiDISH
+  results <- epidish(beta.m = beta_matrix, ref.m = ref_matrix, method = "RPC")
+  
+  # Extract estimated cell type proportions
+  cell_type_proportions <- results$estF
+  
+  # Convert matrix to a data frame and scale proportions to percentages
+  cell_type_proportions_df <- as.data.frame(cell_type_proportions) * 100
+  
+  # Add metadata columns
+  cell_type_proportions_df$Source <- source_name
+  cell_type_proportions_df$SampleID <- rownames(cell_type_proportions)
+  
+  return(cell_type_proportions_df)
+}
+
+# Apply EpiDISH to all sources
+epidish_results <- lapply(names(sources), function(source_name) {
+  run_epidish(sources[[source_name]], source_name)
+})
+
+# Combine results from all sources into a single data frame
+epidish_combined_results <- do.call(rbind, epidish_results)
+
+# Inspect the combined results
+head(epidish_combined_results)
+```
+
+
+Running HiTIMED
+```{r include=FALSE}
+sources <- list(
+  DH = DH_CRC_Betas,
+  TCGA = tcga_T
+  #GTEx = GTEx_T
+)
+
+all_results <- lapply(names(sources), function(source_name) {
+  lapply(1:6, function(i) {
+    result <- HiTIMED_deconvolution(sources[[source_name]], "COAD", i, "tumor")
+    result$Source <- source_name
+    result
+  })
+})
+
+names(all_results) <- names(sources)  # Label results by source
+```
+
+```{r}
+data_levels <- lapply(1:6, function(level) {
+  bind_rows(
+    all_results$DH[[level]],
+    all_results$TCGA[[level]],
+    all_results$GTEx[[level]]
+  )
+})
+names(data_levels) <- paste0("Level_", 1:6)
+
+data_levels <- lapply(1:6, function(level) {
+  data <- data_levels[[level]]
+  data$ID <- paste0("Level_", level)
+  data
+})
+
+# Combine all levels into one dataset
+deconvolution_results <- bind_rows(data_levels)
+deconvolution_results$SampleID <- rownames(deconvolution_results)
+
+```
+
+Rearranging the data so that I can plot it properly.
+```{r}
+# Reshape data to long format
+long_data <- deconvolution_results %>%
+  pivot_longer(
+    -c(SampleID, ID, Source),  # Exclude SampleID, ID, and Source from reshaping
+    names_to = "CellType",
+    values_to = "Proportion"
+  )
+
+
+# Define HiTIMED levels and their corresponding cell types
+hitimed_levels <- list(
+  Level_1 = c("Tumor", "Other"),
+  Level_2 = c("Tumor", "Immune", "Angiogenic"),
+  Level_3 = c("Tumor", "Lymphocyte", "Myeloid", "Endothelial", "Epithelial", "Stromal"),
+  Level_4 = c("Tumor", "Granulocyte", "Mononuclear", "Tcell", "Bcell", "NK", 
+              "Endothelial", "Epithelial", "Stromal"),
+  Level_5 = c("Tumor", "Bas", "Eos", "Neu", "Mono", "DC", "Bnv", "Bmem", 
+              "CD4T", "CD8T", "NK", "Endothelial", "Epithelial", "Stromal"),
+  Level_6 = c("Tumor", "Endothelial", "Epithelial", "Stromal", "Bnv", "Bmem", 
+              "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "Mono", "DC", "NK", 
+              "Bas", "Eos", "Neu")
+)
+
+```
+
+Printing out the box plot for the DH data and TCGA data
+```{r}
+# Function to plot cell types for a specific HiTIMED level and source
+plot_hitimed_level <- function(data, level, source = NULL) {
+  # Get the cell types for the specified level
+  selected_cell_types <- hitimed_levels[[level]]
+  
+  if (is.null(selected_cell_types)) {
+    warning(paste("Level", level, "is not defined in hitimed_levels. Skipping this level."))
+    return(NULL)
+  }
+  
+  # Filter the data for the specific level and cell types
+  filtered_data <- data %>%
+    filter(CellType %in% selected_cell_types)
+  
+  # Further filter by Source if specified
+  if (!is.null(source)) {
+    filtered_data <- filtered_data %>%
+      filter(Source == source)
+  }
+  
+  if (nrow(filtered_data) == 0) {
+    warning(paste("No data available for Level", level, "after filtering."))
+    return(NULL)
+  }
+  
+  # Plot the data without grouping by any variable
+  plot <- ggplot(filtered_data, aes(x = CellType, y = Proportion)) +
+    geom_boxplot(fill = "skyblue") +  # Use a fixed fill color
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none"  # Remove legend
+    ) +
+    labs(
+      x = "Cell Type",
+      y = "Cell Type Proportion",
+      title = paste("Distribution of Cell Types for HiTIMED", level, "(", source, ")")
+    )
+  
+  return(plot)
+}
+
+# Example usage with all levels, for DH or TCGA data only
+all_levels <- names(hitimed_levels)
+
+# Generate plots for DH data
+for (level in all_levels) {
+  plot <- plot_hitimed_level(data = long_data, level = level, source = "DH")
+  
+  # Save only if the plot is successfully created
+  if (!is.null(plot)) {
+    ggsave(paste0("HiTIMED_", level, "_Boxplot_DH.png"), plot, width = 10, height = 8)
+    print(plot)  # Display the plot in R
+  }
+}
+
+# Generate plots for TCGA data
+for (level in all_levels) {
+  plot <- plot_hitimed_level(data = long_data, level = level, source = "TCGA")
+  
+  # Save only if the plot is successfully created
+  if (!is.null(plot)) {
+    ggsave(paste0("HiTIMED_", level, "_Boxplot_TCGA.png"), plot, width = 10, height = 8)
+    print(plot)  # Display the plot in R
+  }
+}
+```
+
+
+```{r}
+# Extract SampleID (everything before the ellipsis)
+deconvolution_results$SampleID <- gsub("\\.\\.\\..*", "", rownames(deconvolution_results))
+
+# Extract HiTIMED_Level (everything after the last underscore and before the ellipsis)
+deconvolution_results$HiTIMED_Level <- gsub(".*\\.\\.\\.(.*)", "\\1", rownames(deconvolution_results))
+
+# Verify the results
+head(deconvolution_results[, c("SampleID", "HiTIMED_Level")])
+
+# Ensure targets has a SampleID column
+targets$SampleID <- rownames(targets)
+
+# Merge deconvolution_results and targets based on the new SampleID column
+combined_results <- deconvolution_results %>%
+  inner_join(targets, by = "SampleID")
+
+# Check the structure of the combined dataframe
+str(combined_results)
+
+# Filter for DH data
+dh_results <- combined_results %>%
+  filter(Source == "DH")
+
+# Reshape DH data into long format
+reshaped_dh_data <- dh_results %>%
+  pivot_longer(
+    cols = where(is.numeric),  # Only numeric columns
+    names_to = "CellType",
+    values_to = "Proportion"
+  )
+
+# Define HiTIMED levels and their corresponding cell types
+hitimed_levels <- list(
+  Level_1 = c("Tumor", "Other"),
+  Level_2 = c("Tumor", "Immune", "Angiogenic"),
+  Level_3 = c("Tumor", "Lymphocyte", "Myeloid", "Endothelial", "Epithelial", "Stromal"),
+  Level_4 = c("Tumor", "Granulocyte", "Mononuclear", "Tcell", "Bcell", "NK", 
+              "Endothelial", "Epithelial", "Stromal"),
+  Level_5 = c("Tumor", "Bas", "Eos", "Neu", "Mono", "DC", "Bnv", "Bmem", 
+              "CD4T", "CD8T", "NK", "Endothelial", "Epithelial", "Stromal"),
+  Level_6 = c("Tumor", "Endothelial", "Epithelial", "Stromal", "Bnv", "Bmem", 
+              "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "Mono", "DC", "NK", 
+              "Bas", "Eos", "Neu")
+)
+```
+
+
+
+```{r}
+# Function to plot HiTIMED levels with stratification
+plot_stratified_hitimed <- function(data, level, stratify_by = NULL) {
+  # Get cell types for the specified HiTIMED level
+  selected_cell_types <- hitimed_levels[[level]]
+  
+  # Filter data for specified cell types
+  level_data <- data %>%
+    filter(CellType %in% selected_cell_types)
+  
+  if (nrow(level_data) == 0) {
+    warning(paste("No data available for Level", level, "after filtering."))
+    return(NULL)
+  }
+  
+  # Generate plot
+  plot <- ggplot(level_data, aes(x = CellType, y = Proportion)) +
+    geom_boxplot(aes(fill = .data[[stratify_by]])) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "bottom"
+    ) +
+    labs(
+      fill = stratify_by,
+      x = "Cell Type",
+      y = "Cell Type Proportion",
+      title = paste("HiTIMED Level", level, "-", stratify_by, "Stratification")
+    )
+  
+  return(plot)
+}
+
+# Example usage: Plot for Level_1, stratified by 'any_mets'
+plot <- plot_stratified_hitimed(data = reshaped_dh_data, level = "Level_1", stratify_by = "any_mets")
+if (!is.null(plot)) {
+  ggsave("HiTIMED_Level_1_Stratified_by_any_mets.png", plot, width = 10, height = 8)
+  print(plot)
+}
+```
+Here I am combining what I have from HiTIMED and EpiDISH to plot cell type proportions 
+```{r}
+# Step 1: Extract fibroblast information from EpiDISH results
+fibroblast_data <- epidish_combined_results %>%
+  select(SampleID, Source, Fibroblasts = Fib)  # Rename 'Fib' to 'Fibroblasts' for clarity
+
+# Step 2: Extract HiTIMED Level 6 results
+hitimed_level_6 <- lapply(all_results, function(source_results) {
+  source_result <- source_results[[6]]  # Extract Level 6
+  
+  # Convert row names into a SampleID column
+  source_result <- source_result %>%
+    rownames_to_column(var = "SampleID")  # Move row names into "SampleID"
+  
+  # Remove 'Stromal' column if it exists and keep all other columns
+  source_result %>%
+    select(-Stromal, everything())  # Exclude Stromal cells, keep all others
+})
+
+# Combine HiTIMED Level 6 results into a single data frame
+hitimed_level_6 <- bind_rows(hitimed_level_6)
+
+# Step 3: Merge HiTIMED Level 6 with EpiDISH fibroblast data
+combined_data <- hitimed_level_6 %>%
+  left_join(fibroblast_data, by = c("SampleID", "Source"))  # Match by SampleID and Source
+
+# Step 4: Merge with DH metadata (from `targets`) for stratification
+combined_data <- combined_data %>%
+  inner_join(targets, by = "SampleID")  # Add metadata like 'any_mets'
+
+# Step 5: Filter for DH data only
+dh_combined_data <- combined_data %>%
+  filter(Source == "DH")  # Keep only DH samples
+
+# Step 6: Reshape data for visualization (include only specific cell types)
+cell_types_to_include <- c("Tumor", "Endothelial", "Epithelial", "Fibroblasts", "Bnv", "Bmem", 
+                           "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "Mono", "DC", "NK", 
+                           "Bas", "Eos", "Neu")
+
+long_dh_data <- dh_combined_data %>%
+  pivot_longer(
+    cols = where(is.numeric),  # Include only numeric columns for reshaping
+    names_to = "CellType",
+    values_to = "Proportion"
+  ) %>%
+  filter(CellType %in% cell_types_to_include)  # Include only selected cell types
+
+# Ensure CellType is a factor with a meaningful order
+long_dh_data <- long_dh_data %>%
+  mutate(CellType = factor(CellType, levels = cell_types_to_include))  # Set order of CellType
+
+# Generate boxplots for selected cell types stratified by 'any_mets'
+all_celltypes_boxplot <- ggplot(long_dh_data, aes(x = CellType, y = Proportion, fill = any_mets)) +
+  geom_boxplot(outlier.shape = NA) +  # Remove outliers for clarity
+  theme_minimal() +
+  labs(
+    title = "Selected Cell Type Proportions Stratified by Any Metastasis",
+    x = "Cell Type",
+    y = "Proportion",
+    fill = "Metastasis Status"
+  ) +
+  scale_fill_brewer(palette = "Set2") +  # Use a color palette
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+# Display the plot
+print(all_celltypes_boxplot)
+
+# Save the plot
+ggsave("Selected_CellTypes_Boxplot_DH_AnyMets.png", all_celltypes_boxplot, width = 12, height = 8)
+
+# OPTIONAL: Faceted version
+facet_celltypes_boxplot <- ggplot(long_dh_data, aes(x = any_mets, y = Proportion, fill = any_mets)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~ CellType, scales = "free_y") +  # Create separate panels for each cell type
+  theme_minimal() +
+  labs(
+    title = "Selected Cell Type Proportions by Any Metastasis (Faceted)",
+    x = "Metastasis Status",
+    y = "Proportion",
+    fill = "Metastasis Status"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    strip.text = element_text(size = 8, face = "bold")  # Format facet labels
+  )
+
+# Display the faceted plot
+print(facet_celltypes_boxplot)
+
+# Save the faceted plot
+ggsave("Facet_Selected_CellTypes_Boxplot_DH_AnyMets.png", facet_celltypes_boxplot, width = 16, height = 10)
+
+```
+
+
+

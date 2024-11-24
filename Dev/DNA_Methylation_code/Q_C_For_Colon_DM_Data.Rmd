@@ -9,6 +9,12 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+# =========================================================================
+# QC and Data explortation - COAD DH Dataset
+# Code by: Alos Diallo
+# 2023,2024
+# =========================================================================
+
 In this document I am running a number of QC related analyses 
 Loading packages
 ```{r message=FALSE, warning=FALSE, include=FALSE}
