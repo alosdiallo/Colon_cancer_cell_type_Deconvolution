@@ -143,6 +143,47 @@ DH_CRC_Betas <- cbind(Betas_25_filtered, Betas_32_filtered)
 
 ```
 
+Examining Variance
+```{r}
+# Assuming beta_matrix is a dataframe or matrix where rows are CpG sites and columns are samples
+
+# Calculate variances for each CpG site
+variances <- apply(DH_CRC_Betas, 1, var)
+
+# Check summary statistics for variances
+summary(variances)
+
+# Create histogram of variances
+hist(variances, breaks = 1000, main = "Variance Distribution of CpG Sites",
+     xlab = "Variance", ylab = "Frequency", col = "skyblue")
+
+# Add a vertical line for a tentative cutoff
+abline(v = 0.01, col = "red", lwd = 2, lty = 2)
+
+# Define the threshold for variance
+threshold <- 0.01
+
+# Count the number of CpG sites with variance greater than the threshold
+num_above_threshold <- sum(variances > threshold)
+
+# Print the result
+cat("Number of CpG sites with variance > ", threshold, ": ", num_above_threshold, "\n")
+
+# Proportion of CpGs retained
+prop_retained <- num_above_threshold / length(variances)
+cat("Proportion of CpG sites retained: ", round(prop_retained * 100, 2), "%\n")
+
+# Count the number of CpG sites with variance <= threshold (to the left of the line)
+num_below_threshold <- sum(variances <= threshold)
+
+# Print the result
+cat("Number of CpG sites with variance <= ", threshold, ": ", num_below_threshold, "\n")
+
+```
+
+
+
+
 Running HiTIMED to generate cell type proportions
 ```{r}
 HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",6,"tumor")
