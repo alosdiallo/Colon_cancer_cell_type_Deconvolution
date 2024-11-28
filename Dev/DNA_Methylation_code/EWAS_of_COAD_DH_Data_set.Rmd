@@ -16,7 +16,7 @@ knitr::opts_chunk$set(echo = TRUE)
 # =========================================================================
 
 Loading libraries:
-```{r message=FALSE, warning=FALSE}
+```{r message=FALSE, warning=FALSE, include=FALSE}
 library(minfi)
 library(sesame)
 library(pheatmap)
@@ -57,6 +57,11 @@ targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.
 targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
 rownames(targets) <- targets$patient
 targets$SampleID<- targets$patient
+
+targets_expanded <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv")
+targets_expanded$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets_expanded) <- targets_expanded$patient
+targets_expanded$SampleID<- targets_expanded$patient
 ```
 
 ```{r}
@@ -158,10 +163,10 @@ hist(variances, breaks = 1000, main = "Variance Distribution of CpG Sites",
      xlab = "Variance", ylab = "Frequency", col = "skyblue")
 
 # Add a vertical line for a tentative cutoff
-abline(v = 0.01, col = "red", lwd = 2, lty = 2)
+abline(v = 0.005, col = "red", lwd = 2, lty = 2)
 
 # Define the threshold for variance
-threshold <- 0.01
+threshold <- 0.006
 
 # Count the number of CpG sites with variance greater than the threshold
 num_above_threshold <- sum(variances > threshold)
@@ -227,6 +232,118 @@ filtered_DH_CRC_M_value <- DH_CRC_M_value[good_cpgs, ]
 DH_CRC_M_value = filtered_DH_CRC_M_value
 ```
 
+I am looking at the relationship between MLH1 status and metastasis to determine if it should be included in my linear models.  Here I am making a table and then running a fisher's exact test. 
+```{r}
+# Assuming your targets data is already loaded in R
+
+# Create a contingency table for MLH1 and any_mets
+contingency_table <- table(targets$MLH1, targets$any_mets)
+
+# Add labels for clarity
+dimnames(contingency_table) <- list(
+  MLH1 = c("Wildtype", "Mutated"),
+  Metastasis = c("No Mets", "Mets")
+)
+
+# View the contingency table
+print(contingency_table)
+
+# Perform Fisher's Exact Test
+fisher_test <- fisher.test(contingency_table)
+
+# View the results of the test
+print(fisher_test)
+
+
+# Step 1: Create a new column 'MMR'
+targets_expanded$MMR <- ifelse(rowSums(targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")] == 1) > 0, 1, 0)
+
+targets_expanded$MMR = as.factor(targets_expanded$MMR)
+targets_expanded$any_mets = as.factor(targets_expanded$any_mets)
+# Step 2: Verify the new column
+table(targets_expanded$MMR)
+
+# Step 1: Generate a contingency table for MMR and any_mets
+contingency_table <- table(targets_expanded$MMR, targets_expanded$any_mets)
+contingency_table
+
+# Create a summary table for mutations in individual MMR genes
+gene_summary <- colSums(targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")] == 1)
+
+# Print the table
+print(gene_summary)
+
+# Fisher's test for a specific gene (e.g., MLH1 vs. any_mets)
+contingency_table <- table(targets_expanded$MLH1, targets_expanded$any_mets)
+fisher_test <- fisher.test(contingency_table)
+print(fisher_test)
+```
+No noticable difference was found.  
+
+Here I am running the same analysis on all of the categorical data:
+	•	Higher values indicate smaller (more significant) p-values.
+	•	Lower values indicate larger (less significant) p-values.
+	
+	•	\(-\log_{10}(\text{p-value}) = 1: Corresponds to a p-value of \(0.1\).
+	•	\(-\log_{10}(\text{p-value}) = 2: Corresponds to a p-value of \(0.01\).
+	•	\(-\log_{10}(\text{p-value}) = 3: Corresponds to a p-value of \(0.001\).	
+```{r}
+# Step 1: Convert appropriate columns to factors
+categorical_vars <- c("MLH1", "MSH2", "diagnosis", "node_stage", "sex", "site", "Distant_Mets", "any_mets", "ln_only")
+targets[categorical_vars] <- lapply(targets[categorical_vars], factor)
+
+# Debug: Check if all columns are converted
+str(targets[categorical_vars])
+
+# Step 2: Initialize the p-value matrix
+pval_matrix <- matrix(NA, nrow = length(categorical_vars), ncol = length(categorical_vars),
+                      dimnames = list(categorical_vars, categorical_vars))
+
+# Step 3: Compute Fisher's Exact Test for all pairs
+for (i in seq_along(categorical_vars)) {
+  for (j in seq_along(categorical_vars)) {
+    if (i != j) {
+      # Create contingency table
+      contingency_table <- table(targets[[categorical_vars[i]]], targets[[categorical_vars[j]]])
+      
+      # Check dimensions of the contingency table
+      if (nrow(contingency_table) > 1 && ncol(contingency_table) > 1) {
+        # Perform Fisher's Exact Test
+        fisher_test <- fisher.test(contingency_table,simulate.p.value = TRUE, B = 1e6)
+        
+        # Store the p-value
+        pval_matrix[i, j] <- fisher_test$p.value
+      }
+    }
+  }
+}
+
+# Debug: Check the p-value matrix
+print(pval_matrix)
+
+# Replace NA values to avoid errors in log transformation
+pval_matrix[is.na(pval_matrix)] <- 1
+
+# Step 4: Visualize as a heatmap
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+library(pheatmap)
+
+# Plot the heatmap
+pheatmap(-log10(pval_matrix), 
+         display_numbers = TRUE, 
+         number_format = "%.2f",
+         main = "Heatmap of Fisher's Exact Test (-log10 p-values)",
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE)
+
+
+```
+
+
+
+
+
+
 Setting up the model matrix
 ```{r}
 # Step 1: Prepare Combined Data
@@ -248,14 +365,14 @@ DH_CRC_M_value_filtered <- DH_CRC_M_value[, combined_data_filtered$SampleID]
 combined_data_filtered <- combined_data_filtered %>%
   mutate(
     site = tolower(gsub(" ", "", site)),
-    across(c("sex", "any_mets", "MLH1", "Distant_Mets", "ln_only"), as.factor),  # Convert to factors
+    across(c("sex", "any_mets", "MLH1", "Distant_Mets", "ln_only", "node_stage"), as.factor),  # Convert to factors
     age = as.numeric(as.character(age))  # Ensure 'age' is numeric
   )
 
 # Step 4: Define Relevant Columns for Analysis
 relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Fib", 
                       "CD8mem", "Bmem", "DC", "Treg", "CD4mem", "age", "sex", 
-                      "any_mets", "Distant_Mets", "ln_only")
+                      "any_mets", "Distant_Mets", "ln_only","node_stage")
 
 analysis_data <- combined_data_filtered %>%
   select(all_of(relevant_columns)) %>%
@@ -268,7 +385,7 @@ if (sum(is.na(analysis_data)) > 0) {
 
 # Step 5: Create Design Matrix
 design <- model.matrix(
-  ~ any_mets * MLH1 + age + sex + Tumor + Endothelial + Epithelial + Fib + Treg + CD4mem + CD8mem + Bmem + DC, 
+  ~ any_mets * MLH1 + age + sex + Tumor + Endothelial + Epithelial + node_stage + Fib + Treg + CD4mem + CD8mem + Bmem + DC, 
   data = analysis_data
 )
 
@@ -358,7 +475,7 @@ results_anno$logPval <- -log10(results_anno$pval)
 
 # Create the volcano plot
 volcano_plot <- ggplot(results_anno, aes(x = logFC, y = logPval)) +
-  geom_point(aes(color = logPval > -log10(0.001)), alpha = 0.5) +
+  geom_point(aes(color = logPval > -log10(0.01)), alpha = 0.5) +
   scale_color_manual(values = c("black", "red")) +
   theme_minimal() +
   labs(title = "Volcano Plot", x = "Log Fold Change", y = "-log10(p-value)")
@@ -448,8 +565,8 @@ if (length(missing_sites) > 0) {
 # Extract the top CpGs using topTable
 top_cpgs <- topTable(fit2, coef=2, adjust="BH",n=Inf,sort.by="p")
 
-# Filtering CpGs based on effect size and select top 1000
-selected_cpgs <- top_cpgs[abs(top_cpgs$logFC) > 0.05, ][1:1000, ]
+# Filtering CpGs based on effect size and select top 10000
+selected_cpgs <- top_cpgs[abs(top_cpgs$logFC) > 0.05, ][1:10000, ]
 
 # Subset betas
 selected_beta <- M.val2[rownames(M.val2) %in% rownames(selected_cpgs), ]
@@ -461,7 +578,7 @@ selected_beta_no_na_matrix <- as.matrix(selected_beta_no_na)
 # Calculate variance of each CpG across all samples
 CpG_Var <- rowVars(selected_beta_no_na_matrix)
 rankVar <- data.frame('order' = rank(-CpG_Var), 'var' = CpG_Var)
-rankVar$top1000 <- ifelse(rankVar$order <= 1000, 'Yes', 'No')
+rankVar$top1000 <- ifelse(rankVar$order <= 10000, 'Yes', 'No')
 
 # Get top 1000 variable CpGs
 data.topvar <- selected_beta_no_na_matrix[rankVar$top1000 == 'Yes',]
