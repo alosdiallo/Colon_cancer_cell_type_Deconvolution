@@ -114,6 +114,11 @@ RGset_25_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Docu
 qc_info32 <- QCinfo(RGset_32_extended)
 qc_info25 <- QCinfo(RGset_25_extended)
 
+
+#plot more QC
+ENmix::plotCtrl(RGset_32_extended)
+ENmix::plotCtrl(RGset_25_extended)
+
 # Display QC information
 print(qc_info32)
 print(qc_info25)

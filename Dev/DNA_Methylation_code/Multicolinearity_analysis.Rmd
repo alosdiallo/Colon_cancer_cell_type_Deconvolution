@@ -1,16 +1,10 @@
 ---
-title: "EWAS_of_COAD_DH_Data_set"
-author: "Alos Diallo"
-date: "2024-11-24"
-output: html_document
+title: "R Notebook"
+output: html_notebook
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
 # =========================================================================
-# EWAS - COAD DH Dataset
+# Multi-Colinearity analysis
 # Code by: Alos Diallo
 # 2023,2024
 # =========================================================================
@@ -42,10 +36,15 @@ library(tibble)
 library(tidyr)
 ```
 
+
+
 Loading the annotation file:
 ```{r}
 data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
 anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# Extract probes located on the Y chromosome
+cpg_y_probes <- rownames(anno[anno$chr == "chrY", ])  # Filter probes on Y chromosome
 ```
 
 Loading the data and metadata information
@@ -67,7 +66,6 @@ RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_
 #RGset_25 = openSesame(idat , func = getBetas) 
 RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
 ```
-
 
 Looking for bad CpG's using QCinfo
 ```{r}
@@ -110,9 +108,6 @@ colnames(Betas_25) = colnames(Noob_25_m)
 
 Filter out sex linked probes
 ```{r}
-# Extract probes located on the Y chromosome
-cpg_y_probes <- rownames(anno[anno$chr == "chrY", ])  # Filter probes on Y chromosome
-
 # Filter Y chromosome probes from Betas_25
 cpg_y_probes_in_betas_25 <- cpg_y_probes[cpg_y_probes %in% rownames(Betas_25)]
 Betas_25_filtered <- Betas_25[!rownames(Betas_25) %in% cpg_y_probes_in_betas_25, ]
@@ -238,114 +233,6 @@ filtered_DH_CRC_M_value <- DH_CRC_M_value[good_cpgs, ]
 DH_CRC_M_value = filtered_DH_CRC_M_value
 ```
 
-I am looking at the relationship between MLH1 status and metastasis to determine if it should be included in my linear models.  Here I am making a table and then running a fisher's exact test. 
-```{r}
-# Assuming your targets data is already loaded in R
-
-# Create a contingency table for MLH1 and any_mets
-contingency_table <- table(targets$MLH1, targets$any_mets)
-
-# Add labels for clarity
-dimnames(contingency_table) <- list(
-  MLH1 = c("Wildtype", "Mutated"),
-  Metastasis = c("No Mets", "Mets")
-)
-
-# View the contingency table
-print(contingency_table)
-
-# Perform Fisher's Exact Test
-fisher_test <- fisher.test(contingency_table)
-
-# View the results of the test
-print(fisher_test)
-
-
-# Step 1: Create a new column 'MMR'
-targets_expanded$MMR <- ifelse(rowSums(targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")] == 1) > 0, 1, 0)
-
-targets_expanded$MMR = as.factor(targets_expanded$MMR)
-targets_expanded$any_mets = as.factor(targets_expanded$any_mets)
-# Step 2: Verify the new column
-table(targets_expanded$MMR)
-
-# Step 1: Generate a contingency table for MMR and any_mets
-contingency_table <- table(targets_expanded$MMR, targets_expanded$any_mets)
-contingency_table
-
-# Create a summary table for mutations in individual MMR genes
-gene_summary <- colSums(targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")] == 1)
-
-# Print the table
-print(gene_summary)
-
-# Fisher's test for a specific gene (e.g., MLH1 vs. any_mets)
-contingency_table <- table(targets_expanded$MLH1, targets_expanded$any_mets)
-fisher_test <- fisher.test(contingency_table)
-print(fisher_test)
-```
-No noticable difference was found.  
-
-Here I am running the same analysis on all of the categorical data:
-	•	Higher values indicate smaller (more significant) p-values.
-	•	Lower values indicate larger (less significant) p-values.
-	
-	•	\(-\log_{10}(\text{p-value}) = 1: Corresponds to a p-value of \(0.1\).
-	•	\(-\log_{10}(\text{p-value}) = 2: Corresponds to a p-value of \(0.01\).
-	•	\(-\log_{10}(\text{p-value}) = 3: Corresponds to a p-value of \(0.001\).	
-
-
-```{r}
-# Step 1: Convert appropriate columns to factors
-categorical_vars <- c("MLH1", "MSH2", "diagnosis", "node_stage", "sex", "site", "Distant_Mets", "any_mets", "ln_only")
-targets[categorical_vars] <- lapply(targets[categorical_vars], factor)
-
-# Debug: Check if all columns are converted
-str(targets[categorical_vars])
-
-# Step 2: Initialize the p-value matrix
-pval_matrix <- matrix(NA, nrow = length(categorical_vars), ncol = length(categorical_vars),
-                      dimnames = list(categorical_vars, categorical_vars))
-
-# Step 3: Compute Fisher's Exact Test for all pairs
-for (i in seq_along(categorical_vars)) {
-  for (j in seq_along(categorical_vars)) {
-    if (i != j) {
-      # Create contingency table
-      contingency_table <- table(targets[[categorical_vars[i]]], targets[[categorical_vars[j]]])
-      
-      # Check dimensions of the contingency table
-      if (nrow(contingency_table) > 1 && ncol(contingency_table) > 1) {
-        # Perform Fisher's Exact Test
-        fisher_test <- fisher.test(contingency_table,simulate.p.value = TRUE, B = 1e6)
-        
-        # Store the p-value
-        pval_matrix[i, j] <- fisher_test$p.value
-      }
-    }
-  }
-}
-
-# Debug: Check the p-value matrix
-print(pval_matrix)
-
-# Replace NA values to avoid errors in log transformation
-pval_matrix[is.na(pval_matrix)] <- 1
-
-# Step 4: Visualize as a heatmap
-if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
-library(pheatmap)
-
-# Plot the heatmap
-pheatmap(-log10(pval_matrix), 
-         display_numbers = TRUE, 
-         number_format = "%.2f",
-         main = "Heatmap of Fisher's Exact Test (-log10 p-values)",
-         cluster_rows = FALSE, 
-         cluster_cols = FALSE)
-
-
-```
 
 Setting up the model matrix
 ```{r}
@@ -389,7 +276,7 @@ if (sum(is.na(analysis_data)) > 0) {
 
 # Step 5: Create Design Matrix
 design <- model.matrix(
-  ~ any_mets * MLH1 + age + sex + Tumor + Endothelial + node_stage + Epithelial + Fib + Treg + CD4mem + CD8mem + Bmem + DC, 
+  ~ any_mets * MLH1 + age + sex + Tumor + Endothelial + Epithelial + Fib + Treg + CD4mem + CD8mem + Bmem + DC, 
   data = analysis_data
 )
 
@@ -457,172 +344,170 @@ print(head(results_table))  # View top results
 print(summary(q_values))    # View summary of q-values
 ```
 
-
-Generating a volcano plot:
-Volcano plot
 ```{r}
-# Combine the results with the annotation data
-results_df <- data.frame(
-  probe = rownames(fit2),
-  logFC = logFC,
-  pval = p_values,
-  stringsAsFactors = FALSE
-)
-results_anno <- merge(results_df, anno, by.x = "probe", by.y = "Name")
+# Calculate correlation matrix for the design matrix
+cor_matrix <- cor(design[, -which(colnames(design) == "X.Intercept.")])
+
+# Visualize correlation matrix as a heatmap
+library(ggcorrplot)
+ggcorrplot(cor_matrix, hc.order = TRUE, type = "lower", lab = TRUE)
+```
+```{r}
+# Convert design matrix to data frame
+design_df <- as.data.frame(design[, -which(colnames(design) == "X.Intercept.")])
+
+# Fit the model using lm()
+lm_model <- lm(M.val2[1, ] ~ ., data = design_df)
+
+# Run VIF analysis
+library(car)
+vif_result <- vif(lm_model)
+print(vif_result)
+```
+Trying to address multicolinearity 
+```{r}
+design_df$Endothelial <- scale(design_df$Endothelial, center = TRUE, scale = FALSE)
+design_df$Fib <- scale(design_df$Fib, center = TRUE, scale = FALSE)
+design_df$Tumor <- scale(design_df$Tumor, center = TRUE, scale = FALSE)
+
+# Fit the model using lm()
+lm_model <- lm(M.val2[1, ] ~ ., data = design_df)
+
+# Run VIF analysis
+library(car)
+vif_result <- vif(lm_model)
+print(vif_result)
+```
+SVA analysis
+```{r}
+# Full model
+mod <- model.matrix(~ any_metsTRUE + MLH11 + age + sexM + Tumor + Endothelial + Fib + CD8mem + DC, data = design_df)
+
+# Null model
+mod0 <- model.matrix(~ age + sexM, data = design_df)
+
+library(sva)
+sva_results = sva(dat = M.val2, mod = mod, mod0 = mod0)
+
+surrogate_vars <- sva_results$sv
+
+# Transpose M.val2 to align dimensions with surrogate_vars
+M.val2_t <- t(M.val2)  # Now samples are rows, and probes are columns
+
+# Perform matrix multiplication
+fitted_values <- surrogate_vars %*% solve(t(surrogate_vars) %*% surrogate_vars) %*% t(surrogate_vars) %*% M.val2_t
+# Fit a linear model for each probe using the surrogate variables
+
+# Transpose fitted_values back to match the original M.val2 dimensions
+fitted_values <- t(fitted_values)  # Dimensions are now 412622 × 57
+
+# Residuals
+residuals <- M.val2 - fitted_values
+
+# Total variance in the data
+total_variance <- sum(apply(M.val2, 1, var))
+
+# Variance explained by surrogate variables
+explained_variance <- sum(apply(fitted_values, 1, var))
+
+# Percentage of variance explained
+percentage_variance_explained <- (explained_variance / total_variance) * 100
+
+print(paste("Percentage of variance explained by surrogate variables:", percentage_variance_explained, "%"))
+```
+
+Looking at the model with the surrogates attached
+```{r}
+# Add surrogate variables to the design matrix
+design_with_sv <- cbind(design_df, surrogate_vars)
+
+
+colnames(design_with_sv)[(ncol(design_df) + 1):ncol(design_with_sv)] <- paste0("SV", 1:ncol(surrogate_vars))
+
+mod_with_sv <- model.matrix(~ any_metsTRUE + MLH11 + age + sexM + Tumor + Endothelial + Fib + CD8mem + DC + SV1 + SV2 + SV3 + SV4 + SV5 + SV6 + SV7 + SV8, data = design_with_sv)
+```
+
+```{r}
+# Fit the model using limma
+library(limma)
+fit <- lmFit(M.val2, mod_with_sv)
+fit <- eBayes(fit)
+
+# Extract results for your primary variable of interest (e.g., any_metsTRUE)
+results <- topTable(fit, coef = "any_metsTRUE", adjust = "fdr")
 ```
 
 
 ```{r}
-# Adjust p-values for plotting
-results_anno$logPval <- -log10(results_anno$pval)
-
-
-# Create the volcano plot
-volcano_plot <- ggplot(results_anno, aes(x = logFC, y = logPval)) +
-  geom_point(aes(color = logPval > -log10(0.05)), alpha = 0.5) +
-  scale_color_manual(values = c("black", "red")) +
-  theme_minimal() +
-  labs(title = "Volcano Plot", x = "Log Fold Change", y = "-log10(p-value)")
-
-# Highlight significant points with p-value < 0.001
-volcano_plot <- volcano_plot + 
-  geom_text_repel(data = subset(results_anno, pval < 0.001 & abs(logFC) > 1), 
-                  aes(label = probe),
-                  size = 3, 
-                  max.overlaps = 10)
-
-print(volcano_plot)
-
-# Save the plot
-ggsave(filename = "volcano_plot.png", plot = volcano_plot, width = 12, height = 10, dpi = 600)
-```
-Saving information on significant CpG's
-```{r}
-# Identify significant CpGs
-significant_cpgs <- subset(results_anno, pval < 0.05 & abs(logFC) > 1)
-
-# Select relevant columns (customize as needed to include other annotation columns)
-significant_cpgs_info <- significant_cpgs[, c("probe", "logFC", "pval", "chr", "Islands_Name", "Relation_to_Island","GencodeBasicV12_NAME")]
-
-# Print the list
-print(significant_cpgs_info)
-
-# Optionally, save the list to a file
-write.csv(significant_cpgs_info, file = "significant_cpgs_annotations.csv", row.names = FALSE)
-```
-
-Seting up my data for a heatmap
-```{r}
-combined_data$sex = factor(combined_data$sex)
-combined_data$any_mets = factor(combined_data$any_mets)
-combined_data$Tumor = as.numeric(combined_data$Tumor)
-combined_data$site = factor(combined_data$site)
-combined_data$CD8mem = as.numeric(combined_data$CD8mem)
-combined_data$node_stage = factor(combined_data$node_stage)
-
-# Make the annotation dataframe for the heatmap with 'SampleID' column
-heat_annot <- data.frame(
-  row.names = combined_data$SampleID,
-  Gender = combined_data$sex,
-  Metastasis = combined_data$any_mets, # Changed Treatment to any_mets
-  Site = combined_data$site,
-  NodeStage = combined_data$node_stage
-)
-
-# Standardize the `Site` column in `heat_annot`
-heat_annot$Site <- tolower(gsub(" ", "", heat_annot$Site))  # Lowercase and remove spaces
-
-
-# Ensure `ann_colors` is a named list of named vectors -- Debuging this 
-ann_colors <- list(
-  Gender = c('F' = "#F21F66", 'M' = "#176EBD"), 
-  Metastasis = c('TRUE' = "black", 'FALSE' = "grey"),
-  Site = c(
-    cecum = "#FFB6C1",
-    rectum = "#ADD8E6",
-    rightcolon = "#90EE90",
-    leftcolon = "#FFA07A",
-    sigmoid = "#DDA0DD",
-    hepaticflexure = "#FFD700",
-    splenicflexure = "#98FB98",
-    transversecolon = "#8A2BE2"
-  )
-)
-
-# Ensure `ann_colors` matches all levels in `heat_annot`
-for (colname in names(heat_annot)) {
-  if (!is.null(ann_colors[[colname]])) {
-    missing_levels <- setdiff(levels(heat_annot[[colname]]), names(ann_colors[[colname]]))
-    if (length(missing_levels) > 0) {
-      stop(paste("Missing colors for levels in", colname, ":", paste(missing_levels, collapse = ", ")))
-    }
-  }
-}
-
-# Verify that all levels in `heat_annot$Site` have corresponding colors
-missing_sites <- setdiff(levels(heat_annot$Site), names(ann_colors$Site))
-if (length(missing_sites) > 0) {
-  stop("Some levels in heat_annot$Site are missing in ann_colors$Site. Please add colors for: ", 
-       paste(missing_sites, collapse = ", "))
-}
+fitted_values <- fitted(fit)
+residuals <- M.val2 - fitted_values
+residual_variance <- sum(apply(residuals, 1, var))
+print(paste("Residual variance after including SVs:", residual_variance))
 ```
 
 ```{r}
-# Extract the top CpGs using topTable
-top_cpgs <- topTable(fit2, coef=2, adjust="BH",n=Inf,sort.by="p")
-
-# Filtering CpGs based on effect size and select top 10000
-selected_cpgs <- top_cpgs[abs(top_cpgs$logFC) > 0.05, ][1:50000, ]
-
-# Subset betas
-selected_beta <- M.val2[rownames(M.val2) %in% rownames(selected_cpgs), ]
-selected_beta_no_na <- selected_beta[complete.cases(selected_beta), ]
-
-# Convert selected_beta_no_na to a matrix
-selected_beta_no_na_matrix <- as.matrix(selected_beta_no_na)
-
-# Calculate variance of each CpG across all samples
-CpG_Var <- rowVars(selected_beta_no_na_matrix)
-rankVar <- data.frame('order' = rank(-CpG_Var), 'var' = CpG_Var)
-rankVar$top1000 <- ifelse(rankVar$order <= 50000, 'Yes', 'No')
-
-# Get top 1000 variable CpGs
-data.topvar <- selected_beta_no_na_matrix[rankVar$top1000 == 'Yes',]
+total_variance <- sum(apply(M.val2, 1, var))
+proportion_explained <- 1 - (residual_variance / total_variance)
+print(paste("Proportion of variance explained by the model:", proportion_explained * 100, "%"))
 ```
 
-
+Now lets look at the amount of variance when we don't include SV's
 ```{r}
-library(pheatmap)
+# Step 1: Fit a model without SVs
+mod_without_sv <- model.matrix(~ any_metsTRUE + MLH11 + age + sexM + Tumor + Endothelial + Fib + CD8mem + DC, data = design_df)
 
-# Reorder the columns of data.topvar to match the order of heat_annot
-data.topvar <- data.topvar[, rownames(heat_annot)]
+# Step 2: Fit the model using limma
+library(limma)
+fit_without_sv <- lmFit(M.val2, mod_without_sv)
 
+# Step 3: Extract fitted values from the model
+fitted_values_without_sv <- fitted(fit_without_sv)
 
-# Ensure no NA values in heat_annot
-heat_annot <- na.omit(heat_annot)
+# Step 4: Calculate residuals and residual variance without SVs
+residuals_without_sv <- M.val2 - fitted_values_without_sv
+residual_variance_without_sv <- sum(apply(residuals_without_sv, 1, var))
 
-# Reorder `heat_annot` by `Metastasis` if necessary
-heat_annot <- heat_annot[order(heat_annot$Metastasis), ]
+# Step 5: Calculate total variance in the dataset
+total_variance <- sum(apply(M.val2, 1, var))
 
-# Reorder `data.topvar` columns to match `heat_annot`
-data.topvar <- data.topvar[, rownames(heat_annot)]
+# Step 6: Calculate the proportion of variance explained without SVs
+proportion_explained_without_sv <- 1 - (residual_variance_without_sv / total_variance)
+print(paste("Proportion of variance explained without SVs:", proportion_explained_without_sv * 100, "%"))
 
-# Generate the heatmap
-heatm <- pheatmap(
-  data.topvar,
-  annotation_col = heat_annot,  # Ensure column annotations are properly structured
-  annotation_colors = ann_colors,  # Ensure colors are correctly assigned
-  show_rownames = FALSE,  # Hide CpG names
-  show_colnames = FALSE,  # Hide sample names
-  cluster_cols = FALSE,  # Do not cluster columns
-  color = colorRampPalette(c("yellow", "blue"))(1024),  # Define color palette
-  clustering_distance_rows = "manhattan",  # Use Manhattan distance for rows
-  clustering_method = "average",  # Use average linkage clustering
-  border_color = NA,  # No border color
-  fontsize = 13  # Set font size
-)
+# Step 7: Compare with the proportion of variance explained with SVs
+# Assuming you already have residual_variance_with_sv from the earlier analysis:
+proportion_explained_with_sv <- 1 - (residual_variance / total_variance)
+print(paste("Proportion of variance explained with SVs:", proportion_explained_with_sv * 100, "%"))
 
-print(heatm)
-ggsave(filename = "Heatmap.png", plot = heatm, width = 12, height = 10, dpi = 600)
+# Optional: Difference in variance explained
+difference <- proportion_explained_with_sv - proportion_explained_without_sv
+print(paste("Difference in variance explained (impact of SVs):", difference * 100, "%"))
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
