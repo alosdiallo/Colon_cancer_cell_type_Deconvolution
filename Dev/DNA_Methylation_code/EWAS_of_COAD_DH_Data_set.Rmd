@@ -294,6 +294,73 @@ Here I am running the same analysis on all of the categorical data:
 	•	\(-\log_{10}(\text{p-value}) = 2: Corresponds to a p-value of \(0.01\).
 	•	\(-\log_{10}(\text{p-value}) = 3: Corresponds to a p-value of \(0.001\).	
 
+Generating a Venn Diagram showing overplap of MMR gene mutations with Metastasis status
+```{r}
+# Load necessary library
+library(VennDiagram)
+
+# Step 1: Create logical vectors for each MMR gene mutation
+mlh1_mutated <- targets_expanded$MLH1 == 1
+msh2_mutated <- targets_expanded$MSH2 == 1
+pms2_mutated <- targets_expanded$PMS2 == 1
+msh6_mutated <- targets_expanded$MSH6 == 1
+
+# Step 2: Generate a Venn diagram to visualize the overlap
+venn_plot <- venn.diagram(
+  x = list(
+    MLH1 = which(mlh1_mutated),
+    MSH2 = which(msh2_mutated),
+    PMS2 = which(pms2_mutated),
+    MSH6 = which(msh6_mutated)
+  ),
+  filename = NULL,  # Set to NULL to return the plot as an object
+  category.names = c("MLH1", "MSH2", "PMS2", "MSH6"),
+  fill = c("red", "blue", "green", "yellow"),
+  alpha = 0.5,
+  cat.cex = 0.8,
+  cex = 0.9,
+  margin = 0.1
+)
+
+grid.draw(venn_plot)
+# Step 3: Save the plot or display it
+pdf("MMR_gene_mutation_venn.pdf")
+grid.draw(venn_plot)
+dev.off()
+```
+Generating a heatmap that shows which mutations are positive for a given sample. 
+```{r}
+# Install and load pheatmap if not already installed
+if (!requireNamespace("pheatmap", quietly = TRUE)) {
+  install.packages("pheatmap")
+}
+library(pheatmap)
+
+# Step 1: Create a mutation matrix for MMR genes
+# Extract relevant columns for MMR genes (MLH1, MSH2, PMS2, MSH6)
+mmr_genes <- targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")]
+
+# Transpose the matrix so rows are genes and columns are samples
+mutation_matrix <- t(as.matrix(mmr_genes))
+
+# Step 2: Set colors for the heatmap
+# Blue for mutation (1), white for no mutation (0)
+annotation_colors <- list(
+  Mutation = c("0" = "white", "1" = "blue")
+)
+
+# Step 3: Generate the heatmap
+pheatmap(
+  mutation_matrix,
+  color = c("white", "blue"), # White for 0, blue for 1
+  cluster_rows = FALSE,       # Do not cluster rows (genes)
+  cluster_cols = FALSE,       # Do not cluster columns (samples)
+  main = "MMR Gene Mutation Heatmap",
+  fontsize = 10,
+  legend_labels = c("No Mutation", "Mutation")
+)
+```
+
 
 ```{r}
 # Step 1: Convert appropriate columns to factors
