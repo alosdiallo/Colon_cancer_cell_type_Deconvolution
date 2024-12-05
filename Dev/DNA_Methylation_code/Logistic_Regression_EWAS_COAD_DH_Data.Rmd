@@ -36,13 +36,14 @@ library(qvalue)
 library(sva)
 library(ENmix)
 library(DataExplorer)
-library(ggplot2)
 library(ggrepel)
 library(matrixStats)
 library(EpiDISH)
 library(tibble)
 library(tidyr)
 library(pROC)
+library(glmnet)
+library(sva)
 ```
 
 Loading the annotation file:
@@ -52,6 +53,9 @@ anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 
 # Extract probes located on the Y chromosome
 cpg_y_probes <- rownames(anno[anno$chr == "chrY", ])  # Filter probes on Y chromosome
+
+# Extract probes located on the X chromosome
+cpg_x_probes <- rownames(anno[anno$chr == "chrX", ])
 ```
 
 Loading the data and metadata information
@@ -123,9 +127,6 @@ Betas_25_filtered <- Betas_25[!rownames(Betas_25) %in% cpg_y_probes_in_betas_25,
 # Filter Y chromosome probes from Betas_32
 cpg_y_probes_in_betas_32 <- cpg_y_probes[cpg_y_probes %in% rownames(Betas_32)]
 Betas_32_filtered <- Betas_32[!rownames(Betas_32) %in% cpg_y_probes_in_betas_32, ]
-
-# Extract probes located on the X chromosome
-cpg_x_probes <- rownames(anno[anno$chr == "chrX", ])
 
 # Filter X chromosome probes from Betas_25
 cpg_x_probes_in_betas_25 <- cpg_x_probes[cpg_x_probes %in% rownames(Betas_25_filtered)]
@@ -301,6 +302,47 @@ pheatmap(-log10(pval_matrix),
 
 
 ```
+```{r}
+# Step 1: Prepare Combined Data
+HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+
+# Merge HiTIMED results, targets, and EpiDISH fibroblast data
+combined_data <- HiTIMED_result %>%
+  left_join(targets, by = "SampleID") %>%
+  left_join(cell_type_proportions_df %>% select(SampleID, Fib), by = "SampleID")  # Add 'Fib' column
+
+# Step 2: Filter out Rectal Samples
+combined_data_filtered <- combined_data %>%
+  filter(site != "rectum")
+
+# Subset M-value matrix to exclude rectal samples
+DH_CRC_M_value_filtered <- DH_CRC_M_value[, combined_data_filtered$SampleID]
+
+# Step 3: Normalize Metadata Columns
+combined_data_filtered <- combined_data_filtered %>%
+  mutate(
+    site = tolower(gsub(" ", "", site)),
+    across(c("sex", "any_mets", "MLH1", "Distant_Mets", "ln_only", "node_stage"), as.factor),  # Convert to factors
+    age = as.numeric(as.character(age))  # Ensure 'age' is numeric
+  )
+
+# Step 4: Define Relevant Columns for Analysis
+relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Fib", 
+                      "CD8mem", "Bmem", "DC", "Treg", "CD4mem", "age", "sex", 
+                      "any_mets", "Distant_Mets", "ln_only","node_stage")
+
+analysis_data <- combined_data_filtered %>%
+  select(all_of(relevant_columns)) %>%
+  column_to_rownames(var = "SampleID")  # Set row names for alignment with M-value matrix
+
+# Check for NA values and ensure data consistency
+if (sum(is.na(analysis_data)) > 0) {
+  stop("NA values detected in analysis_data. Please investigate.")
+}
+
+```
+
+
 
 Prepare the Predictors (CpGs + Covariates)
 Modify your existing script to prepare the input matrix (x_matrix) for Lasso regression, combining CpGs (from DH_CRC_M_value_filtered) and covariates (from analysis_data).
@@ -325,89 +367,112 @@ if (!all(rownames(x_matrix) == rownames(analysis_data))) {
 }
 ```
 
+Perform SVA
+```{r}
+# Full model (includes the response)
+mod_full <- model.matrix(~ any_mets + MLH1 + Tumor + Endothelial + Epithelial + Fib +
+                           CD8mem + Bmem + DC + Treg + CD4mem + age + sex, data = analysis_data)
+
+# Null model (excludes the response)
+mod_null <- model.matrix(~ MLH1 + Tumor + Endothelial + Epithelial + Fib +
+                           CD8mem + Bmem + DC + Treg + CD4mem + age + sex, data = analysis_data)
+
+# Estimate surrogate variables
+sva_obj <- sva(as.matrix(DH_CRC_M_value_filtered), mod_full, mod_null)
+
+# Extract surrogate variables
+sva_variables <- sva_obj$sv
+colnames(sva_variables) <- paste0("SV", 1:ncol(sva_variables))
+```
+
+Calculate Explained Variance
+```{r}
+# Variance explained by surrogate variables
+explained_variance <- apply(as.matrix(DH_CRC_M_value_filtered), 1, function(cpg) {
+  lm_fit <- lm(cpg ~ sva_variables)
+  summary(lm_fit)$r.squared  # R² for each CpG
+})
+
+# Mean and distribution of variance explained
+mean_variance_explained <- mean(explained_variance)
+summary(explained_variance)
+
+# Visualize the distribution of variance explained
+hist(explained_variance, main = "Distribution of Variance Explained by SVs",
+     xlab = "Proportion of Variance (R²)", breaks = 30)
+abline(v = mean_variance_explained, col = "red", lwd = 2)
+print(paste("Mean variance explained by SVs:", mean_variance_explained))
+```
+
+
+Add SVA to Predictors
+```{r}
+ # Combine CpGs, covariates, and surrogate variables
+x_matrix <- cbind(t(DH_CRC_M_value_filtered), covariates, sva_variables)
+
+# Ensure alignment between predictors and response
+if (!all(rownames(x_matrix) == rownames(analysis_data))) {
+    stop("Predictor matrix and response variable are misaligned.")
+}
+```
 
 2.	Fit the Lasso Logistic Regression Model
 Use the glmnet package to fit a Lasso logistic regression model, selecting the optimal lambda using cross-validation.
 ```{r}
-# Fit Lasso logistic regression with cross-validation
-# Use cross-validation AUC to assess generalization
-lasso_model <- cv.glmnet(
-  x = x_matrix,
-  y = response,
+set.seed(88324509)  # For reproducibility
+
+# Split into training and test sets
+train_indices <- sample(1:nrow(x_matrix), size = 0.7 * nrow(x_matrix))
+x_train <- x_matrix[train_indices, ]
+y_train <- response[train_indices]
+x_test <- x_matrix[-train_indices, ]
+y_test <- response[-train_indices]
+
+# Fit Lasso with cross-validation on training data
+lasso_model_train <- cv.glmnet(
+  x = x_train,
+  y = y_train,
   family = "binomial",
   alpha = 1,
-  nfolds = 5,  # 10-fold cross-validation
-  type.measure = "auc"  # Measure AUC during CV
+  nfolds = 5,  # Use 5-fold cross-validation
+  type.measure = "auc"
 )
 
-# Best cross-validated AUC
-print(paste("Cross-validated AUC:", max(lasso_model$cvm)))
-
 # Extract the best lambda (penalty parameter)
-best_lambda <- lasso_model$lambda.min
+best_lambda <- lasso_model_train$lambda.min
 
-
-plot(lasso_model)
-
-# Convert log(lambda) = -6 to lambda
-
-# Fit the model with the manually chosen lambda
-best_fit_lasso_model <- glmnet(
-  x = x_matrix, 
-  y = response, 
-  family = "binomial", 
-  alpha = 1, 
+# Fit final Lasso model with best lambda
+final_model <- glmnet(
+  x = x_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 1,
   lambda = best_lambda
 )
 
-# Extract non-zero coefficients
-selected_features_best_fit_lasso_model <- coef(best_fit_lasso_model)
-selected_features_best_fit_lasso_model_df <- as.data.frame(as.matrix(selected_features_best_fit_lasso_model))
-selected_features_best_fit_lasso_model_df$Feature <- rownames(selected_features_best_fit_lasso_model_df)
-selected_features_best_fit_lasso_model_df <- selected_features_neg6_df[selected_features_best_fit_lasso_model_df[, 1] != 0, ]
-print(selected_features_best_fit_lasso_model_df)
-```
+# Predict probabilities on the test set
+predicted_probs_test <- predict(final_model, newx = x_test, type = "response")
 
-3.	Extract Selected Features
-After fitting the Lasso model, extract the CpGs and covariates with non-zero coefficients.
-```{r}
-# Extract coefficients for the final model
-selected_features <- coef(best_fit_lasso_model)
+# Generate ROC curve for the test set
+roc_curve_test <- roc(y_test, as.numeric(predicted_probs_test))
+plot(roc_curve_test, main = "ROC Curve for Test Set")
 
-# Convert to a data frame for easier interpretation
+# Calculate AUC for the test set
+auc_test <- auc(roc_curve_test)
+print(paste("AUC on Test Set with SVA:", auc_test))
+
+# Extract non-zero coefficients from the final model
+selected_features <- coef(final_model)
 selected_features_df <- as.data.frame(as.matrix(selected_features))
 selected_features_df$Feature <- rownames(selected_features_df)
+selected_features_df <- selected_features_df[selected_features_df[, 1] != 0, ]  # Non-zero coefficients
 
-# Filter for non-zero coefficients
-selected_features_df <- selected_features_df[selected_features_df[, 1] != 0, ]
-
-# View selected CpGs and covariates
+# Inspect selected features
 print(selected_features_df)
+
 ```
 
-4.	Evaluate the Model’s Performance
-Assess the model’s performance by calculating the Area Under the Curve (AUC) and plotting the ROC curve.
-```{r}
 
-# Predict probabilities for the response variable
-predicted_probs <- predict(best_fit_lasso_model, newx = x_matrix, type = "response")
-
-# Ensure predicted_probs is numeric
-predicted_probs <- as.numeric(predicted_probs)
-
-# Ensure response is binary numeric (0/1)
-response <- ifelse(analysis_data$any_mets == "TRUE", 1, 0)
-
-# Generate ROC curve
-roc_curve <- roc(response, predicted_probs)
-
-# Plot ROC curve
-plot(roc_curve, main = "ROC Curve for Lasso Model")
-
-# Print AUC
-auc_value <- auc(roc_curve)
-print(paste("AUC:", auc_value))
-```
 
 
 
