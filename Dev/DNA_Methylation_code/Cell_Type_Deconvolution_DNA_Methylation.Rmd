@@ -37,6 +37,8 @@ library(DataExplorer)
 library(tidyr)
 library(EpiDISH)
 library(tibble)
+library(vegan)
+library(rstatix)
 ```
 
 Loading Data
@@ -371,7 +373,7 @@ plot_stratified_hitimed <- function(data, level, stratify_by = NULL) {
 }
 
 # Example usage: Plot for Level_1, stratified by 'any_mets'
-plot <- plot_stratified_hitimed(data = reshaped_dh_data, level = "Level_1", stratify_by = "any_mets")
+plot <- plot_stratified_hitimed(data = reshaped_dh_data, level = "Level_5", stratify_by = "any_mets")
 if (!is.null(plot)) {
   ggsave("HiTIMED_Level_1_Stratified_by_any_mets.png", plot, width = 10, height = 8)
   print(plot)
@@ -474,6 +476,668 @@ print(facet_celltypes_boxplot)
 # Save the faceted plot
 ggsave("Facet_Selected_CellTypes_Boxplot_DH_AnyMets.png", facet_celltypes_boxplot, width = 16, height = 10)
 
+```
+Here we are looking at Cell Type distrobutions but my mets status, but not stratified by MLH1.
+```{r}
+# Step 1: Filter and categorize data for "No Mets," "LN Mets," and "Distant Mets"
+stratified_data <- dh_combined_data %>%
+  mutate(
+    Metastasis_Group = case_when(
+      ln_only == "LN Mets" & Distant_Mets == "No Distant Mets" ~ "LN Mets",
+      Distant_Mets == "Distant Mets" ~ "Distant Mets",
+      any_mets == "No Mets" ~ "No Mets"
+    )
+  ) %>%
+  filter(!is.na(Metastasis_Group))  # Ensure no missing values in grouping
+
+# Step 2: Reshape data for visualization (HiTIMED Level 6 results, including specific cell types)
+long_stratified_data <- stratified_data %>%
+  pivot_longer(
+    cols = where(is.numeric),  # Include only numeric columns
+    names_to = "CellType",
+    values_to = "Proportion"
+  ) %>%
+  filter(CellType %in% cell_types_to_include) %>%  # Keep only selected cell types
+  mutate(
+    CellType = factor(CellType, levels = cell_types_to_include),  # Order CellType
+    Metastasis_Group = factor(Metastasis_Group, levels = c("No Mets", "LN Mets", "Distant Mets"))  # Order groups
+  )
+
+# Step 3: Generate boxplots for each cell type with three metastasis groups
+stratified_boxplot <- ggplot(long_stratified_data, aes(x = Metastasis_Group, y = Proportion, fill = Metastasis_Group)) +
+  geom_boxplot(outlier.shape = NA) +  # Remove outliers for clarity
+  facet_wrap(~ CellType, scales = "free_y", ncol = 3) +  # Create facets for each cell type
+  theme_minimal() +
+  labs(
+    title = "Cell Type Proportions Stratified by Metastasis Status",
+    x = "Metastasis Group",
+    y = "Proportion",
+    fill = "Metastasis Group"
+  ) +
+  scale_fill_brewer(palette = "Set2") +  # Use a color palette
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    strip.text = element_text(size = 8, face = "bold")  # Format facet labels
+  )
+
+# Step 4: Display and save the plot
+print(stratified_boxplot)
+ggsave("Stratified_CellType_Boxplot.png", stratified_boxplot, width = 16, height = 12)
+```
+
+Plots for each cell type individually saved.  I did this because it was hard to see the plots when they were all together.  This works, but there are no stats and or jiggers.
+```{r}
+# Step 1: Filter and categorize data for MLH1 status and metastasis groups
+stratified_ml_data <- dh_combined_data %>%
+  mutate(
+    Metastasis_Group = case_when(
+      ln_only == "LN Mets" & Distant_Mets == "No Distant Mets" ~ "LN Mets",
+      Distant_Mets == "Distant Mets" ~ "Distant Mets",
+      any_mets == "No Mets" ~ "No Mets"
+    )
+  ) %>%
+  filter(!is.na(Metastasis_Group), !is.na(MLH1))  # Ensure no missing values
+
+# Step 2: Reshape data for visualization
+long_ml_data <- stratified_ml_data %>%
+  pivot_longer(
+    cols = where(is.numeric),  # Include only numeric columns
+    names_to = "CellType",
+    values_to = "Proportion"
+  ) %>%
+  filter(CellType %in% cell_types_to_include) %>%  # Include specific cell types
+  mutate(
+    CellType = factor(CellType, levels = cell_types_to_include),  # Order cell types
+    Metastasis_Group = factor(Metastasis_Group, levels = c("No Mets", "LN Mets", "Distant Mets")),  # Order groups
+    MLH1 = factor(MLH1, levels = c("MLH1 Negative", "MLH1 Positive"))  # Order MLH1
+  )
+
+# Create a directory to save the plots (optional)
+output_dir <- "MLH1_CellType_Plots"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# Loop through each cell type and create a separate plot
+unique_cell_types <- unique(long_ml_data$CellType)
+
+for (cell_type in unique_cell_types) {
+  # Filter data for the current cell type
+  cell_type_data <- long_ml_data %>% filter(CellType == cell_type)
+  
+  # Create the plot
+  cell_type_plot <- ggplot(cell_type_data, aes(x = Metastasis_Group, y = Proportion, fill = Metastasis_Group)) +
+    geom_boxplot(outlier.shape = NA) +  # Remove outliers for clarity
+    facet_wrap(~ MLH1, scales = "free_y") +  # Separate facets by MLH1 status
+    theme_minimal(base_size = 14) +  # Increase base font size for readability
+    labs(
+      title = paste("Proportions of", cell_type, "Stratified by Metastasis and MLH1 Status"),
+      x = "Metastasis Group",
+      y = "Proportion",
+      fill = "Metastasis Group"
+    ) +
+    scale_fill_brewer(palette = "Set2") +  # Use a color palette
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 12),  # Larger x-axis text
+      legend.position = "bottom",
+      legend.title = element_text(size = 14),  # Larger legend title
+      legend.text = element_text(size = 12),  # Larger legend text
+      strip.text = element_text(size = 14, face = "bold")  # Larger facet labels
+    )
+  
+  # Save each plot with a unique file name
+  file_name <- paste0(output_dir, "/", cell_type, "_MLH1_Boxplot.png")
+  ggsave(file_name, cell_type_plot, width = 12, height = 8, dpi = 300)
+}
+```
+
+
+
+Setting up date for Permanova analysis
+```{r}
+# Define the cell types to include based on my analysis plan
+cell_types_to_include <- c(
+  "Tumor", "Endothelial", "Epithelial", "Fibroblasts",
+  "Bnv", "Bmem", "CD4nv", "CD4mem", "Treg",
+  "CD8nv", "CD8mem", "Mono", "DC", "NK",
+  "Bas", "Eos", "Neu"
+)
+
+# Verify that all specified cell types are present in the data
+missing_cols <- setdiff(cell_types_to_include, colnames(dh_combined_data))
+if(length(missing_cols) > 0){
+  stop(paste("Missing cell type columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# Extract the cell type proportion data
+cell_type_matrix <- dh_combined_data %>%
+  select(all_of(cell_types_to_include)) %>%
+  as.matrix()
+
+# Ensure all cell type columns are numeric
+if(!all(sapply(cell_type_matrix, is.numeric))){
+  stop("Not all cell type proportion columns are numeric.")
+}
+
+# Set row names to SampleID for reference (optional)
+rownames(cell_type_matrix) <- dh_combined_data$SampleID
+
+# Ensure 'any_mets' is a factor with appropriate levels
+dh_combined_data$any_mets <- factor(dh_combined_data$any_mets, levels = c("No Mets", "Mets"))
+```
+
+Perform PCoA
+```{r}
+# Compute Bray-Curtis distance matrix
+bray_dist <- vegdist(cell_type_matrix, method = "bray")
+
+# Perform PCoA
+pcoa_results <- cmdscale(bray_dist, eig = TRUE, k = 2)
+
+# Create a dataframe for plotting
+pcoa_df <- data.frame(
+  SampleID = rownames(cell_type_matrix),
+  PC1 = pcoa_results$points[,1],
+  PC2 = pcoa_results$points[,2],
+  any_mets = dh_combined_data$any_mets
+)
+
+# Plot PCoA
+ggplot(pcoa_df, aes(x = PC1, y = PC2, color = any_mets)) +
+  geom_point(alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "PCoA of Cell Type Proportions",
+    x = "PC1",
+    y = "PC2",
+    color = "Metastasis Status"
+  ) +
+  scale_color_brewer(palette = "Set1")
+```
+
+```{r}
+# Assuming 'bray_dist' is your distance matrix and 'cell_type_matrix' is your data
+# Perform PCoA using vegan's cmdscale or ape's pcoa
+pcoa_results <- cmdscale(bray_dist, eig = TRUE, k = 2)
+
+# Extract eigenvectors (coordinates)
+pc1 <- pcoa_results$points[,1]
+pc2 <- pcoa_results$points[,2]
+
+# Calculate correlations between cell types and principal coordinates
+correlations <- cor(cell_type_matrix, cbind(pc1, pc2))
+print(correlations)
+```
+```{r}
+# Calculate species scores (variable loadings)
+species_scores <- envfit(pcoa_results, cell_type_matrix, permutations = 999)
+species_vectors <- as.data.frame(scores(species_scores, display = "vectors"))
+species_vectors$CellType <- rownames(species_vectors)
+# Using dplyr
+library(dplyr)
+
+species_vectors <- species_vectors %>%
+  rename(
+    PC1 = Dim1,
+    PC2 = Dim2
+  )
+
+
+# Create PCoA dataframe
+pcoa_df <- data.frame(
+  SampleID = rownames(cell_type_matrix),
+  PC1 = pcoa_results$points[,1],
+  PC2 = pcoa_results$points[,2],
+  any_mets = dh_combined_data$any_mets
+)
+
+ggplot(pcoa_df, aes(x = PC1, y = PC2, color = any_mets)) +
+  geom_point(alpha = 0.7) +
+  
+  # geom_segment with inherit.aes = FALSE
+  geom_segment(
+    data = species_vectors,
+    aes(x = 0, y = 0, xend = PC1 * max(pcoa_df$PC1), yend = PC2 * max(pcoa_df$PC2)),
+    arrow = arrow(length = unit(0.2, "cm")),
+    color = "black",
+    inherit.aes = FALSE  # Prevent inheritance of main aes
+  ) +
+  
+  # geom_text with inherit.aes = FALSE
+  geom_text(
+    data = species_vectors,
+    aes(x = PC1 * max(pcoa_df$PC1) * 1.1, y = PC2 * max(pcoa_df$PC2) * 1.1, label = CellType),
+    size = 3,
+    inherit.aes = FALSE  # Prevent inheritance of main aes
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "PCoA of Cell Type Proportions with Biplot Vectors",
+    x = "PCoA1",
+    y = "PCoA2",
+    color = "Metastasis Status"
+  )
+```
+Here I am generating a PCoA plot but for MLH1+ and MLH1- seperately. 
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(vegan)
+library(ggpubr)  # Optional, for advanced annotations
+
+# Step 1: Compute Bray-Curtis distance matrix
+bray_dist <- vegdist(cell_type_matrix, method = "bray")
+
+# Step 2: Perform PCoA
+pcoa_results <- cmdscale(bray_dist, eig = TRUE, k = 2)
+
+# Step 3: Create a dataframe for plotting
+pcoa_df <- data.frame(
+  SampleID = rownames(cell_type_matrix),
+  PC1 = pcoa_results$points[,1],
+  PC2 = pcoa_results$points[,2],
+  any_mets = dh_combined_data$any_mets,
+  MLH1_status = dh_combined_data$MLH1  # Include MLH1 status
+)
+
+# Correct Factor Recoding for MLH1_status
+pcoa_df <- pcoa_df %>%
+  mutate(
+    MLH1_status = factor(
+      MLH1_status, 
+      levels = c("MLH1 Positive", "MLH1 Negative"),  # Match actual levels
+      labels = c("MLH1+", "MLH1-")  # Desired labels
+    )
+  )
+
+# Split the PCoA dataframe into MLH1+ and MLH1- subsets
+pcoa_df_MLH1_positive <- pcoa_df %>%
+  filter(MLH1_status == "MLH1+")
+
+pcoa_df_MLH1_negative <- pcoa_df %>%
+  filter(MLH1_status == "MLH1-")
+
+# Step 4: Calculate Species Vectors
+species_scores <- envfit(pcoa_results, cell_type_matrix, permutations = 999)
+species_vectors <- as.data.frame(scores(species_scores, display = "vectors"))
+species_vectors$CellType <- rownames(species_vectors)
+colnames(species_vectors)[1:2] <- c("PC1", "PC2")  # Rename columns
+
+# Scale vectors based on PCoA axes
+scale_factor_pc1 <- max(pcoa_df$PC1) * 0.8
+scale_factor_pc2 <- max(pcoa_df$PC2) * 0.8
+
+species_vectors <- species_vectors %>%
+  mutate(
+    PC1_end = PC1 * scale_factor_pc1,
+    PC2_end = PC2 * scale_factor_pc2
+  )
+
+# Step 5: Generate PCoA Plot for MLH1+ Patients
+pcoa_plot_MLH1_positive <- ggplot(pcoa_df_MLH1_positive, aes(x = PC1, y = PC2, color = any_mets)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_segment(data = species_vectors,
+               aes(x = 0, y = 0, xend = PC1_end, yend = PC2_end),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "black") +
+  geom_text_repel(data = species_vectors,
+                  aes(x = PC1_end * 1.05, y = PC2_end * 1.05, label = CellType),
+                  size = 3,
+                  inherit.aes = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCoA of Cell Type Proportions - MLH1+ Patients",
+    x = "PCoA1",
+    y = "PCoA2",
+    color = "Metastasis Status"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+# Display and save MLH1+ PCoA plot
+print(pcoa_plot_MLH1_positive)
+ggsave("PCoA_MLH1_Positive_Biplot.png", pcoa_plot_MLH1_positive, width = 10, height = 8, dpi = 300)
+
+# Step 6: Generate PCoA Plot for MLH1- Patients
+pcoa_plot_MLH1_negative <- ggplot(pcoa_df_MLH1_negative, aes(x = PC1, y = PC2, color = any_mets)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_segment(data = species_vectors,
+               aes(x = 0, y = 0, xend = PC1_end, yend = PC2_end),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "black") +
+  geom_text_repel(data = species_vectors,
+                  aes(x = PC1_end * 1.05, y = PC2_end * 1.05, label = CellType),
+                  size = 3,
+                  inherit.aes = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "PCoA of Cell Type Proportions - MLH1- Patients",
+    x = "PCoA1",
+    y = "PCoA2",
+    color = "Metastasis Status"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+# Display and save MLH1- PCoA plot
+print(pcoa_plot_MLH1_negative)
+ggsave("PCoA_MLH1_Negative_Biplot.png", pcoa_plot_MLH1_negative, width = 10, height = 8, dpi = 300)
+
+# Step 7: (Optional) Create Combined Faceted PCoA Plot with Specific Vectors
+
+# Function to compute species vectors for a given subset
+compute_species_vectors <- function(cell_type_matrix_subset, pcoa_results_subset) {
+  species_fit <- envfit(pcoa_results_subset, cell_type_matrix_subset, permutations = 999)
+  species_vec <- as.data.frame(scores(species_fit, display = "vectors"))
+  species_vec$CellType <- rownames(species_vec)
+  colnames(species_vec)[1:2] <- c("PC1", "PC2")
+  
+  # Scale vectors
+  scale_factor_pc1 <- max(pcoa_results_subset$points[,1]) * 0.8
+  scale_factor_pc2 <- max(pcoa_results_subset$points[,2]) * 0.8
+  
+  species_vec <- species_vec %>%
+    mutate(
+      PC1_end = PC1 * scale_factor_pc1,
+      PC2_end = PC2 * scale_factor_pc2
+    )
+  
+  return(species_vec)
+}
+
+# Compute species vectors for MLH1+ patients
+species_vectors_MLH1_positive <- compute_species_vectors(
+  cell_type_matrix_subset = cell_type_matrix[rownames(pcoa_df_MLH1_positive), ],
+  pcoa_results_subset = cmdscale(vegdist(cell_type_matrix[rownames(pcoa_df_MLH1_positive), ], method = "bray"), eig = TRUE, k = 2)
+)
+
+# Compute species vectors for MLH1- patients
+species_vectors_MLH1_negative <- compute_species_vectors(
+  cell_type_matrix_subset = cell_type_matrix[rownames(pcoa_df_MLH1_negative), ],
+  pcoa_results_subset = cmdscale(vegdist(cell_type_matrix[rownames(pcoa_df_MLH1_negative), ], method = "bray"), eig = TRUE, k = 2)
+)
+
+# Combine species vectors with MLH1 status
+species_vectors_combined <- bind_rows(
+  species_vectors_MLH1_positive %>% mutate(MLH1_status = "MLH1+"),
+  species_vectors_MLH1_negative %>% mutate(MLH1_status = "MLH1-")
+)
+
+# Combined PCoA dataframe
+pcoa_df_combined <- pcoa_df
+
+# Combined PCoA plot with faceting by MLH1_status and specific species vectors
+pcoa_plot_combined_specific <- ggplot(pcoa_df_combined, aes(x = PC1, y = PC2, color = any_mets)) +
+  geom_point(alpha = 0.7, size = 3) +
+  
+  # Add biplot vectors specific to each facet
+  geom_segment(data = species_vectors_combined,
+               aes(x = 0, y = 0, xend = PC1_end, yend = PC2_end),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "black") +
+  
+  # Add labels for cell types using ggrepel
+  geom_text_repel(data = species_vectors_combined,
+                  aes(x = PC1_end * 1.05, y = PC2_end * 1.05, label = CellType),
+                  size = 3,
+                  inherit.aes = FALSE) +
+  
+  facet_wrap(~ MLH1_status) +  # Facet by MLH1_status
+  theme_minimal() +
+  labs(
+    title = "PCoA of Cell Type Proportions by MLH1 Status",
+    x = "PCoA1",
+    y = "PCoA2",
+    color = "Metastasis Status"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+    axis.title = element_text(size = 14),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    strip.text = element_text(size = 16, face = "bold")  # Enhance facet labels
+  )
+
+# Display the combined faceted PCoA plot with specific vectors
+print(pcoa_plot_combined_specific)
+
+# Save the combined faceted plot
+ggsave("PCoA_Combined_Faceted_MLH1_Status_SpecificVectors.png", 
+       plot = pcoa_plot_combined_specific, 
+       width = 14, height = 8, dpi = 300)
+```
+
+
+
+Perform PERMANOVA
+```{r}
+# Perform PERMANOVA using adonis2
+permanova_results <- adonis2(
+  cell_type_matrix ~ any_mets,
+  data = dh_combined_data,
+  method = "bray",
+  permutations = 999
+)
+
+# View the results
+print(permanova_results)
+```
+
+```{r}
+# Assess homogeneity of dispersion
+dispersion <- betadisper(bray_dist, dh_combined_data$any_mets)
+
+# View dispersion results
+print(dispersion)
+
+# Perform permutation test for homogeneity
+dispersion_test <- permutest(dispersion, permutations = 999)
+
+# View dispersion test results
+print(dispersion_test)
+```
+Performing the Wilcoxon rank-sum test (also known as the Mann-Whitney U test) to compare the proportions of CD8+ T-cells and Fibroblasts between metastatic (Mets) and non-metastatic (No Mets) colorectal cancer samples.
+
+```{r}
+# Define the cell types of interest
+cell_types_of_interest <- c("CD8mem", "Fibroblasts")
+```
+
+```{r}
+# Perform Wilcoxon rank-sum tests for the specified cell types
+wilcox_results <- long_dh_data %>%
+  filter(CellType %in% cell_types_of_interest) %>%  # Select relevant cell types
+  group_by(CellType) %>%                             # Group by cell type
+  wilcox_test(Proportion ~ any_mets) %>%            # Perform the test
+  adjust_pvalue(method = "BH") %>%                  # Adjust p-values for multiple testing
+  add_significance()                                 # Add significance labels
+
+# View the results
+print(wilcox_results)
+```
+```{r}
+# Filter data for the cell types of interest
+plot_data <- long_dh_data %>%
+  filter(CellType %in% cell_types_of_interest)
+
+# Create boxplots
+ggplot(plot_data, aes(x = any_mets, y = Proportion, fill = any_mets)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  facet_wrap(~ CellType, scales = "free_y") +  # Create separate panels for each cell type
+  theme_minimal() +
+  labs(
+    title = "Cell Type Proportions by Metastasis Status",
+    x = "Metastasis Status",
+    y = "Proportion",
+    fill = "Metastasis Status"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    strip.text = element_text(size = 12, face = "bold")
+  )
+```
+```{r}
+# Calculate effect size
+wilcox_results <- wilcox_results %>%
+  mutate(effect_size = statistic / (n1 * n2))
+
+# View the updated results
+print(wilcox_results)
+```
+
+
+```{r}
+# Load necessary packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(vegan)
+
+# Step 1: Extract fibroblast information from EpiDISH results
+fibroblast_data <- epidish_combined_results %>%
+  select(SampleID, Source, Fibroblasts = Fib)  # Rename 'Fib' to 'Fibroblasts' for clarity
+
+# Step 2: Extract HiTIMED Levels 1-6 with conditional 'Stromal' removal
+hitimed_all_levels <- lapply(all_results, function(source_results) {
+  # Assuming levels 1 to 6 are stored as elements 1 to 6
+  levels_data <- lapply(1:6, function(level) {
+    level_result <- source_results[[level]]  # Extract specific level
+    
+    level_result <- level_result %>%
+      rownames_to_column(var = "SampleID") %>%  # Move row names into "SampleID"
+      select(-any_of("Stromal"), everything()) %>%  # Conditionally remove 'Stromal' if it exists
+      mutate(Level = paste0("Level", level))    # Add 'Level' column
+    
+    return(level_result)
+  })
+  
+  bind_rows(levels_data)  # Combine all levels for the current source
+})
+
+
+# Combine all sources and levels into a single dataframe
+hitimed_all_levels <- bind_rows(hitimed_all_levels)
+
+# Step 3: Merge HiTIMED Levels with EpiDISH Fibroblast Data
+combined_data <- hitimed_all_levels %>%
+  left_join(fibroblast_data, by = c("SampleID", "Source"))
+
+# Step 4: Merge with Metadata
+combined_data <- combined_data %>%
+  inner_join(targets, by = "SampleID")  # Add metadata like 'any_mets'
+
+# Step 5: Filter for DH Data Only
+dh_combined_data <- combined_data %>%
+  filter(Source == "DH")  # Keep only DH samples
+
+# Step 6: Reshape Data for Visualization (include only specific cell types)
+cell_types_to_include <- c("Tumor", "Endothelial", "Epithelial", "Fibroblasts", 
+                           "Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", 
+                           "CD8nv", "CD8mem", "Mono", "DC", "NK", 
+                           "Bas", "Eos", "Neu")
+
+long_dh_data <- dh_combined_data %>%
+  pivot_longer(
+    cols = all_of(cell_types_to_include),  # Include only specified cell types
+    names_to = "CellType",
+    values_to = "Proportion"
+  ) %>%
+  mutate(
+    CellType = factor(CellType, levels = cell_types_to_include),  # Set factor levels
+    Level = factor(Level, levels = paste0("Level", 1:6))         # Ensure 'Level' is a factor
+  )
+
+# Step 7: Generate Boxplots with Faceting and Data Points
+
+# Generate faceted boxplots with individual data points
+facet_celltypes_boxplot <- ggplot(long_dh_data, aes(x = any_mets, y = Proportion, fill = any_mets)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +  # Boxplots without outliers
+  geom_jitter(aes(color = any_mets), width = 0.2, alpha = 0.5, size = 1.5) +  # Overlay points
+  facet_grid(Level ~ CellType, scales = "free_y") +  # Facet by 'Level' and 'CellType'
+  theme_minimal() +
+  labs(
+    title = "Cell Type Proportions by Metastasis Status Across HiTIMED Levels",
+    x = "Metastasis Status",
+    y = "Proportion",
+    fill = "Metastasis Status",
+    color = "Metastasis Status"
+  ) +
+  scale_fill_brewer(palette = "Set2") +  # Aesthetic color palette
+  scale_color_brewer(palette = "Set2") +  # Match point colors to fill
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    strip.text = element_text(size = 8, face = "bold")  # Enhance facet labels
+  )
+
+# Display the faceted plot
+print(facet_celltypes_boxplot)
+
+# Save the faceted plot
+ggsave("Facet_Selected_CellTypes_Boxplot_DH_AnyMets.png", 
+       plot = facet_celltypes_boxplot, 
+       width = 16, height = 10, dpi = 300)
+
+# OPTIONAL: Generate Separate Plots for Each HiTIMED Level
+
+# List of levels
+levels_list <- levels(long_dh_data$Level)
+
+# Create a directory to save individual plots
+dir.create("HiTIMED_Level_Plots", showWarnings = FALSE)
+
+# Loop through each level and generate plots
+for (lvl in levels_list) {
+  # Filter data for the current level
+  level_data <- long_dh_data %>%
+    filter(Level == lvl)
+  
+  # Generate boxplot with points
+  level_plot <- ggplot(level_data, aes(x = any_mets, y = Proportion, fill = any_mets)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(aes(color = any_mets), width = 0.2, alpha = 0.5, size = 1.5) +  # Add points
+    facet_wrap(~ CellType, scales = "free_y") +  # Facet by cell type within the level
+    theme_minimal() +
+    labs(
+      title = paste("HiTIMED", lvl, "- Cell Type Proportions by Metastasis Status"),
+      x = "Metastasis Status",
+      y = "Proportion",
+      fill = "Metastasis Status",
+      color = "Metastasis Status"
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_brewer(palette = "Set2") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "bottom",
+      strip.text = element_text(size = 8, face = "bold")  # Format facet labels
+    )
+  
+  # Display the plot
+  print(level_plot)
+  
+  # Save the plot
+  ggsave(filename = paste0("HiTIMED_Level_Plots/Boxplot_", lvl, ".png"), 
+         plot = level_plot, 
+         width = 12, height = 8, dpi = 300)
+}
 ```
 
 

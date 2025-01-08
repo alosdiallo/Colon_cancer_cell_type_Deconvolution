@@ -1,0 +1,462 @@
+---
+title: "Cell_Type_Deconvolution_Analysis_DNA_Methylation"
+author: "Alos Diallo"
+date: "2024-11-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# =========================================================================
+# DNA methylation Cell Type Deconvolution using HiTIMED - COAD DH Dataset
+# Code by: Alos Diallo
+# 2023,2024
+# =========================================================================
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+library(sva)
+library(ENmix)
+library(DataExplorer)
+library(tidyr)
+library(EpiDISH)
+library(tibble)
+library(vegan)
+library(rstatix)
+```
+
+Loading Data
+```{r}
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+
+
+# Convert relevant columns in `targets` to factors
+targets <- targets %>%
+  mutate(
+    MLH1 = factor(MLH1, levels = c(0, 1), labels = c("MLH1 Negative", "MLH1 Positive")),
+    MSH2 = factor(MSH2),
+    sex = factor(sex, levels = c("M", "F")),
+    Distant_Mets = factor(Distant_Mets, levels = c(FALSE, TRUE), labels = c("No Distant Mets", "Distant Mets")),
+    any_mets = factor(any_mets, levels = c(FALSE, TRUE), labels = c("No Mets", "Mets")),
+    ln_only = factor(ln_only, levels = c(FALSE, TRUE), labels = c("No LN Mets", "LN Mets"))
+  )
+```
+
+```{r}
+idat = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/"
+RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
+```
+
+
+Normalize my Data
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+```
+
+Getting the beta values
+```{r}
+Betas_25<-getBeta(Noob_25_m)
+Betas_32<-getBeta(Noob_32_m)
+```
+
+```{r}
+Betas_25<- sesame::betasCollapseToPfx(Betas_25)
+#Betas_32<- sesame::betasCollapseToPfx(Betas_32)
+colnames(Betas_25) = colnames(Noob_25_m)
+```
+
+```{r}
+DH_CRC_Betas <- merge(Betas_25, Betas_32, by = "row.names")
+rownames(DH_CRC_Betas) <- DH_CRC_Betas$Row.names
+DH_CRC_Betas <- DH_CRC_Betas[,-1] 
+```
+
+
+Running EpiDish to obtain Fibroblast information
+```{r}
+# Define the beta matrix and reference matrix
+beta_matrix <- DH_CRC_Betas  # Your dataset
+ref_matrix <- centEpiFibIC.m  # Reference matrix for EpiDISH (e.g., centEpiFibIC.m)
+
+# Run EpiDISH
+epidish_results <- epidish(beta.m = beta_matrix, ref.m = ref_matrix, method = "RPC")
+
+# Extract the estimated cell type proportions
+cell_type_proportions <- epidish_results$estF
+
+# Convert the matrix to a data frame and scale proportions to percentages
+cell_type_proportions_df <- as.data.frame(cell_type_proportions) * 100
+
+# Add SampleID as a column from the row names
+cell_type_proportions_df$SampleID <- rownames(cell_type_proportions)
+
+# Inspect the results
+head(cell_type_proportions_df)
+```
+
+
+
+Running HiTIMED to generate cell type proportions
+```{r}
+HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",6,"tumor")
+
+HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+```
+
+
+```{r}
+# Merge HiTIMED results, targets, and EpiDISH fibroblast data
+combined_data <- HiTIMED_result %>%
+  left_join(targets, by = "SampleID") %>%
+  left_join(cell_type_proportions_df %>% select(SampleID, Fib), by = "SampleID")  # Add 'Fib' column
+
+combined_data$SampleID = combined_data$patient
+```
+
+	•	No Metastasis (if any_mets == "No Mets"),
+	•	Lymph Node Metastasis (if ln_only == "LN Mets" and Distant_Mets == "No Distant Mets"),
+	•	Distant Metastasis (if Distant_Mets == "Distant Mets").
+	
+```{r}
+# ----- 1. Create a metastasis category factor -----
+combined_data <- combined_data %>%
+  mutate(
+    mets_cat = case_when(
+      any_mets == "No Mets" ~ "No Metastasis",
+      # Ensure that LN-only does not include Distant Mets
+      ln_only == "LN Mets" & Distant_Mets == "No Distant Mets" ~ "LN Metastasis",
+      Distant_Mets == "Distant Mets" ~ "Distant Metastasis",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(
+    mets_cat = factor(
+      mets_cat,
+      levels = c("No Metastasis", "LN Metastasis", "Distant Metastasis")
+    )
+  )
+```
+
+
+```{r}
+# ----- 2. Reshape your data for plotting -----
+# Define my relevant cell-type columns based on the HiTIMED paper:
+cell_types <- c(
+  "Tumor","Endothelial","Epithelial","Stromal","Bnv","Bmem","CD4nv","CD4mem",
+  "Treg","CD8nv","CD8mem","Mono","DC","NK","Bas","Eos","Neu","Fib"
+)
+
+long_data <- combined_data %>%
+  pivot_longer(
+    cols = all_of(cell_types),
+    names_to = "cell_type",
+    values_to = "proportion"
+  )
+```
+	
+	
+```{r}
+# ----- 3. Plot using ggplot2 -----
+# A single faceted figure for all cell types:
+ggplot(long_data, aes(x = mets_cat, y = proportion, fill = MLH1)) +
+  geom_boxplot() +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  labs(
+    title = "Cell Type Proportions by Metastasis Category and MLH1 Status",
+    x = "Metastasis Category",
+    y = "Proportion",
+    fill = "MLH1 Status"
+  ) +
+  theme_bw()
+```
+
+Here I am looking at Distant Mets colored by MLH1
+```{r}
+
+# Specify the cell type columns to plot
+cell_types <- c(
+  "Tumor", "Endothelial", "Epithelial", "Stromal", "Bnv",
+  "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem",
+  "Mono", "DC", "NK", "Bas", "Eos", "Neu", "Fib"
+)
+
+# Pivot data to "long" format: one row per (sample x cell_type)
+long_data <- combined_data %>%
+  pivot_longer(
+    cols = all_of(cell_types),
+    names_to = "cell_type",
+    values_to = "proportion"
+  )
+
+# Plot: compare No Distant Mets vs. Distant Mets, coloring by MLH1 status
+ggplot(long_data, aes(x = Distant_Mets, y = proportion, fill = MLH1)) +
+  geom_boxplot() +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  labs(
+    title = "Cell Type Proportions by Distant Metastasis Status and MLH1",
+    x = "Distant Metastasis Status",
+    y = "Proportion",
+    fill = "MLH1 Status"
+  ) +
+  theme_bw()
+```
+
+```{r}
+combined_data <- combined_data %>%
+  mutate(
+    mets_cat = case_when(
+      # no metastases at all
+      any_mets == "No Mets" ~ "No Mets",  
+
+      # LN-only metastasis: any_mets == "Mets" BUT distant_mets == "No Distant Mets"
+      # i.e., LN mets == "LN Mets"
+      ln_only == "LN Mets" & Distant_Mets == "No Distant Mets" ~ "LN Mets",
+      
+      # distant metastasis
+      Distant_Mets == "Distant Mets" ~ "Distant Mets",
+      
+      TRUE ~ NA_character_
+    ),
+    # factor with 3 distinct levels
+    mets_cat = factor(mets_cat, levels = c("No Mets", "LN Mets", "Distant Mets"))
+  )
+
+```
+
+```{r}
+# Define the function
+plot_cell_types <- function(data,
+                            cell_type_cols,
+                            group_var   = "Distant_Mets",  # This can be "any_mets", "ln_only", etc.
+                            fill_var    = "MLH1",
+                            scales      = "free_y",        # free_y, free_x, or fixed
+                            plot_title  = "Cell Type Proportions",
+                            x_label     = NULL,
+                            y_label     = "Proportion") {
+  
+  # If x_label isn't specified, use group_var by default
+  if (is.null(x_label)) {
+    x_label <- group_var
+  }
+  
+  # Pivot my data to long format
+  long_data <- data %>%
+    pivot_longer(
+      cols = all_of(cell_type_cols),
+      names_to = "cell_type",
+      values_to = "proportion"
+    )
+  
+  # Create the box plot
+  ggplot(long_data, aes_string(x = group_var, y = "proportion", fill = fill_var)) +
+    geom_boxplot() +
+    facet_wrap(~ cell_type, scales = scales) +
+    labs(
+      title = plot_title,
+      x     = x_label,
+      y     = y_label,
+      fill  = fill_var
+    ) +
+    theme_bw()
+}
+
+# Suppose I have a vector of all your cell type columns:
+cell_types <- c(
+  "Tumor","Endothelial","Epithelial","Stromal","Bnv","Bmem",
+  "CD4nv","CD4mem","Treg","CD8nv","CD8mem","Mono","DC",
+  "NK","Bas","Eos","Neu","Fib"
+)
+
+# Now, just call the function with my desired grouping variable.
+
+## 1. By Distant_Mets
+plot_cell_types(
+  data           = combined_data,
+  cell_type_cols = cell_types,
+  group_var      = "Distant_Mets",      # Compare No Distant Mets vs Distant Mets
+  fill_var       = "MLH1",
+  scales         = "free_y",            # each facet has its own y-scale
+  plot_title     = "Cell Type Proportions by Distant Metastasis Status and MLH1"
+)
+
+## 2. By any_mets
+plot_cell_types(
+  data           = combined_data,
+  cell_type_cols = cell_types,
+  group_var      = "any_mets",          # Compare No Mets vs Mets
+  fill_var       = "MLH1",
+  plot_title     = "Cell Type Proportions by Any Mets Status and MLH1"
+)
+
+## 3. By ln_only
+plot_cell_types(
+  data           = combined_data,
+  cell_type_cols = cell_types,
+  group_var      = "ln_only",           # Compare No LN Mets vs LN Mets
+  fill_var       = "MLH1",
+  plot_title     = "Cell Type Proportions by LN Metastasis Status and MLH1"
+)
+```
+
+Here I am looking at No mets at all vs Distant mets, slightly different but more distinct.  The above analysis as done before includes samples that are LN mets. 
+```{r}
+
+combined_data <- combined_data %>%
+  mutate(
+    mets_binary = case_when(
+      any_mets == "No Mets"                  ~ "No Mets",
+      Distant_Mets == "Distant Mets"         ~ "Distant Mets",
+      TRUE                                   ~ NA_character_
+    ),
+    mets_binary = factor(
+      mets_binary, 
+      levels = c("No Mets", "Distant Mets")
+    )
+  )
+
+
+cell_types <- c(
+  "Tumor", "Endothelial", "Epithelial", "Stromal", "Bnv", "Bmem",
+  "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "Mono", "DC",
+  "NK", "Bas", "Eos", "Neu", "Fib"
+)
+
+long_data <- combined_data %>%
+  pivot_longer(
+    cols = all_of(cell_types),
+    names_to = "cell_type",
+    values_to = "proportion"
+  )
+
+library(ggplot2)
+
+plot_data <- long_data %>%
+  filter(!is.na(mets_binary))  # keep only No Mets & Distant Mets
+
+ggplot(plot_data, aes(x = mets_binary, y = proportion, fill = MLH1)) +
+  geom_boxplot() +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  labs(
+    title = "Cell Type Proportions: Distant Mets vs. No Mets",
+    x = "Metastasis Status",
+    y = "Proportion",
+    fill = "MLH1 Status"
+  ) +
+  theme_bw()
+```
+
+Making a function to carry out the plotting
+```{r}
+combined_data <- combined_data %>%
+  mutate(
+    # 1) No Mets vs. LN Mets only
+    no_mets_vs_ln = case_when(
+      any_mets == "No Mets"        ~ "No Mets",
+      ln_only == "LN Mets"         ~ "LN Mets",
+      TRUE                         ~ NA_character_
+    ),
+    no_mets_vs_ln = factor(no_mets_vs_ln, levels = c("No Mets", "LN Mets")),
+    
+    # 2) No Mets vs. Distant Mets
+    no_mets_vs_distant = case_when(
+      any_mets == "No Mets"          ~ "No Mets",
+      Distant_Mets == "Distant Mets" ~ "Distant Mets",
+      TRUE                           ~ NA_character_
+    ),
+    no_mets_vs_distant = factor(no_mets_vs_distant, 
+                                levels = c("No Mets", "Distant Mets")),
+    
+    # 3) No Mets vs. Any Mets
+    no_mets_vs_any = case_when(
+      any_mets == "No Mets" ~ "No Mets",
+      any_mets == "Mets"    ~ "Any Mets",
+      TRUE                  ~ NA_character_
+    ),
+    no_mets_vs_any = factor(no_mets_vs_any, levels = c("No Mets", "Any Mets"))
+  )
+
+plot_cell_types <- function(data,
+                            cell_type_cols,
+                            group_var   = "any_mets",  # or "no_mets_vs_ln", etc.
+                            fill_var    = "MLH1",
+                            scales      = "free_y",
+                            plot_title  = "Cell Type Proportions") {
+  # Pivot wide -> long, storing cell type in "cell_type", proportion in "proportion"
+  data_long <- data %>%
+    pivot_longer(
+      cols = all_of(cell_type_cols),
+      names_to = "cell_type",
+      values_to = "proportion"
+    )
+  
+  # Plot
+  ggplot(data_long, aes_string(x = group_var, y = "proportion", fill = fill_var)) +
+    geom_boxplot() +
+    facet_wrap(~ cell_type, scales = scales) +
+    labs(
+      title = plot_title,
+      x     = group_var,
+      y     = "Proportion",
+      fill  = fill_var
+    ) +
+    theme_bw()
+}
+
+# 1) No Mets vs. LN Mets
+plot_cell_types(
+  data = combined_data %>% filter(!is.na(no_mets_vs_ln)),
+  cell_type_cols = cell_types,
+  group_var      = "no_mets_vs_ln",
+  fill_var       = "MLH1",
+  scales         = "free_y",
+  plot_title     = "No Mets vs. LN Mets"
+)
+
+# 2) No Mets vs. Distant Mets
+plot_cell_types(
+  data = combined_data %>% filter(!is.na(no_mets_vs_distant)),
+  cell_type_cols = cell_types,
+  group_var      = "no_mets_vs_distant",
+  fill_var       = "MLH1",
+  scales         = "free_y",
+  plot_title     = "No Mets vs. Distant Mets"
+)
+
+# 3) No Mets vs. Any Mets
+plot_cell_types(
+  data = combined_data %>% filter(!is.na(no_mets_vs_any)),
+  cell_type_cols = cell_types,
+  group_var      = "no_mets_vs_any",
+  fill_var       = "MLH1",
+  scales         = "free_y",
+  plot_title     = "No Mets vs. Any Mets"
+)
+
+
+
+
+```
+
+
