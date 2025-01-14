@@ -71,7 +71,11 @@ RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_
 
 Looking for bad CpG's using QCinfo
 ```{r}
-sva<-ctrlsva(RGset_32)
+sva32<-ctrlsva(RGset_32)
+sva25<-ctrlsva(RGset_25)
+SVA_combined <- rbind(sva25[,1:8], sva32)
+SVA_combined_df <- as.data.frame(SVA_combined)
+
 surrogateVariables <- sva
 # Convert RGChannelSet to RGChannelSetExtended
 RGset_32_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE,extended = TRUE)
@@ -89,16 +93,23 @@ badCpG = c(qc_info32$badCpG,qc_info25$badCpG)
 cleaned_badCpG <- sub("_.*", "", badCpG)
 ```
 
-Normalizing the data
+Normalizing 
 ```{r}
 Noob_25_m = preprocessNoob(RGset_25)
 Noob_32_m = preprocessNoob(RGset_32)
+
+# Run functional normalization
+#funnorm_25 <- preprocessFunnorm(RGset_25, bgCorr = TRUE,dyeCorr = TRUE)
+#funnorm_32 <- preprocessFunnorm(RGset_32, bgCorr = TRUE,dyeCorr = TRUE)
 ```
 
-Extracting the beta values
+Extracting the beta values from the normalized samples.  I am now running functional normalization as it contains a Noob option
 ```{r}
 Betas_25<-getBeta(Noob_25_m)
 Betas_32<-getBeta(Noob_32_m)
+
+#Betas_25<-getBeta(funnorm_25)
+#Betas_32<-getBeta(funnorm_32)
 ```
 
 Colapsing the betas so that the data can be merged
@@ -147,8 +158,6 @@ Betas_32_filtered <- Betas_32_filtered[common_probes, ]
 DH_CRC_Betas <- cbind(Betas_25_filtered, Betas_32_filtered) 
 
 ```
-
-
 
 
 Running HiTIMED to generate cell type proportions
@@ -418,11 +427,13 @@ Setting up the model matrix
 ```{r}
 # Step 1: Prepare Combined Data
 HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+SVA_combined_df$SampleID <- rownames(SVA_combined_df)
 
 # Merge HiTIMED results, targets, and EpiDISH fibroblast data
 combined_data <- HiTIMED_result %>%
   left_join(targets, by = "SampleID") %>%
-  left_join(cell_type_proportions_df %>% select(SampleID, Fib), by = "SampleID")  # Add 'Fib' column
+  left_join(cell_type_proportions_df %>% select(SampleID, Fib), by = "SampleID") %>% # Add 'Fib' column
+  left_join( SVA_combined_df, by = 'SampleID')  
 
 # Step 2: Filter out Rectal Samples
 combined_data_filtered <- combined_data %>%
@@ -442,7 +453,7 @@ combined_data_filtered <- combined_data_filtered %>%
 # Step 4: Define Relevant Columns for Analysis
 relevant_columns <- c("SampleID", "MLH1", "Tumor", "Endothelial", "Epithelial", "Fib", 
                       "CD8mem", "Bmem", "DC", "Treg", "CD4mem", "age", "sex", 
-                      "any_mets", "Distant_Mets", "ln_only","node_stage")
+                      "any_mets", "Distant_Mets", "ln_only","node_stage","PC1","PC2","PC3","PC4","PC5","PC6","PC7","PC8")
 
 analysis_data <- combined_data_filtered %>%
   select(all_of(relevant_columns)) %>%
@@ -456,9 +467,7 @@ if (sum(is.na(analysis_data)) > 0) {
 
 # Step 5: Create Design Matrix
 design <- model.matrix(
-  ~ any_mets * MLH1 + age + sex + Tumor + Endothelial + node_stage + Epithelial + Fib + Treg + CD4mem + CD8mem + Bmem + DC, 
-  data = analysis_data
-)
+  ~ any_mets * MLH1 + age + sex + MLH1 + Tumor + Endothelial + node_stage + Epithelial + Fib + Treg + CD4mem + CD8mem + Bmem + DC + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8, data = analysis_data)
 
 # Make column names unique for edge cases (e.g., interactions with similar terms)
 colnames(design) <- make.names(colnames(design), unique = TRUE)
@@ -578,6 +587,73 @@ print(significant_cpgs_info)
 write.csv(significant_cpgs_info, file = "significant_cpgs_annotations.csv", row.names = FALSE)
 ```
 
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(tibble)
+
+# Convert DFrame to tibble
+significant_cpgs_info_tibble <- as_tibble(results_anno)
+
+# Create the odds ratio data frame
+odds_ratio_df <- significant_cpgs_info_tibble %>%
+  mutate(
+    significant = ifelse(pval < 0.05, "Significant", "Not Significant"),
+    methylation_status = ifelse(logFC > 0, "Hypermethylated", "Hypomethylated")
+  ) %>%
+  group_by(Relation_to_Island, methylation_status) %>%
+  summarise(
+    Significant = sum(significant == "Significant"),
+    Not_Significant = n() - sum(significant == "Significant")
+  ) %>%
+  mutate(
+    OR = (Significant / (Not_Significant + 1)) / (sum(Significant) / sum(Not_Significant + 1)),
+    lower_CI = exp(log(OR) - 1.96 * sqrt(1 / Significant + 1 / Not_Significant)),
+    upper_CI = exp(log(OR) + 1.96 * sqrt(1 / Significant + 1 / Not_Significant))
+  )
+
+# Plot Odds Ratios with color for hyper/hypomethylation
+ggplot(odds_ratio_df, aes(x = Relation_to_Island, y = OR, color = methylation_status)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI), width = 0.2, position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray") +
+  scale_color_manual(values = c("Hypomethylated" = "purple", "Hypermethylated" = "maroon")) +
+  labs(
+    title = "Odds Ratios of CpG Significance by Relation to Island (Hyper- vs Hypomethylated)",
+    x = "Relation to Island",
+    y = "Odds Ratio",
+    color = "Methylation Status"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels for readability
+```
+
+```{r}
+# Convert DFrame to tibble
+results_anno_tibble <- as_tibble(results_anno)
+
+# Add methylation status to results_anno_tibble
+results_anno_tibble <- results_anno_tibble %>%
+  mutate(
+    methylation_status = ifelse(logFC > 0, "Hypermethylated", "Hypomethylated")
+  )
+
+results_anno_tibble %>%
+  count(Relation_to_Island, methylation_status) %>%
+  ggplot(aes(x = Relation_to_Island, y = n, fill = methylation_status)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Hypermethylated" = "red", "Hypomethylated" = "blue")) +
+  labs(
+    title = "Count of Hypermethylated vs Hypomethylated CpGs",
+    x = "Relation to Island",
+    y = "Count",
+    fill = "Methylation Status"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
 Seting up my data for a heatmap
 ```{r}
 combined_data$sex = factor(combined_data$sex)
@@ -616,7 +692,7 @@ ann_colors <- list(
   )
 )
 
-# Ensure `ann_colors` matches all levels in `heat_annot`
+# Ensure `ann_colors` matches all levels in `heat_annot`=
 for (colname in names(heat_annot)) {
   if (!is.null(ann_colors[[colname]])) {
     missing_levels <- setdiff(levels(heat_annot[[colname]]), names(ann_colors[[colname]]))
