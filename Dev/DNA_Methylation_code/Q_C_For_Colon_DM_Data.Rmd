@@ -59,11 +59,6 @@ RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_
 Comparing normalization methods
 ```{r}
 ###############################################################################
-# Load libraries
-###############################################################################
-library(minfi)
-
-###############################################################################
 # 1. Preprocessing for RGset_25
 ###############################################################################
 
@@ -131,6 +126,7 @@ plotSex(swan_32_genomic)
 plotSex(quantile_32_genomic)
 
 # RGset_25
+par(mfrow = c(2, 3))
 plotSex(raw_25_genomic)
 plotSex(swan_25_genomic)
 plotSex(quantile_25_genomic)
@@ -138,6 +134,7 @@ plotSex(noob_25_genomic)
 plotSex(funnorm_25_genomic)
 
 # RGset_32
+par(mfrow = c(2, 3))
 plotSex(raw_32_genomic)
 plotSex(swan_32_genomic)
 plotSex(quantile_32_genomic)
@@ -149,38 +146,36 @@ plotSex(funnorm_32_genomic)
 ###############################################################################
 # Example for RGset_25
 par(mfrow = c(2, 3))
-plot(density(getBeta(raw_25)),       main = "Raw 25")
-plot(density(getBeta(swan_25)),      main = "SWAN 25")
-plot(density(getBeta(quantile_25)),  main = "Quantile 25")
-plot(density(getBeta(noob_25)),      main = "Noob 25")
-plot(density(getBeta(funnorm_25)),   main = "Funnorm 25")
+plot(density(getBeta(raw_25),      na.rm = TRUE), main = "Raw EPIC V2")
+plot(density(getBeta(swan_25),     na.rm = TRUE), main = "SWAN EPIC V2")
+plot(density(getBeta(quantile_25), na.rm = TRUE), main = "Quantile EPIC V2")
+plot(density(getBeta(noob_25),     na.rm = TRUE), main = "Noob EPIC V2")
+plot(density(getBeta(funnorm_25),  na.rm = TRUE), main = "Funnorm EPIC V2")
 
-# Example for RGset_32
 par(mfrow = c(2, 3))
-plot(density(getBeta(raw_32)),       main = "Raw 32")
-plot(density(getBeta(swan_32)),      main = "SWAN 32")
-plot(density(getBeta(quantile_32)),  main = "Quantile 32")
-plot(density(getBeta(noob_32)),      main = "Noob 32")
-plot(density(getBeta(funnorm_32)),   main = "Funnorm 32")
+plot(density(getBeta(raw_32),      na.rm = TRUE), main = "Raw EPIC V1")
+plot(density(getBeta(swan_32),     na.rm = TRUE), main = "SWAN EPIC V1")
+plot(density(getBeta(quantile_32), na.rm = TRUE), main = "Quantile EPIC V1")
+plot(density(getBeta(noob_32),     na.rm = TRUE), main = "Noob EPIC V1")
+plot(density(getBeta(funnorm_32),  na.rm = TRUE), main = "Funnorm EPIC V1")
 
 ###############################################################################
 # 5. MDS plots
 ###############################################################################
 # Example for RGset_25
 par(mfrow = c(2, 3))
-plotMDS(getM(raw_25),       main = "Raw 25")
-plotMDS(getM(swan_25),      main = "SWAN 25")
-plotMDS(getM(quantile_25),  main = "Quantile 25")
-plotMDS(getM(noob_25),      main = "Noob 25")
-plotMDS(getM(funnorm_25),   main = "Funnorm 25")
+plotMDS(getM(raw_25),       main = "Raw EPIC V2",      labels = 1:ncol(getM(raw_25)))
+plotMDS(getM(swan_25),      main = "SWAN EPIC V2",     labels = 1:ncol(getM(swan_25)))
+plotMDS(getM(quantile_25),  main = "Quantile EPIC V2", labels = 1:ncol(getM(quantile_25)))
+plotMDS(getM(noob_25),      main = "Noob EPIC V2",     labels = 1:ncol(getM(noob_25)))
+plotMDS(getM(funnorm_25),   main = "Funnorm EPIC V2",  labels = 1:ncol(getM(funnorm_25)))
 
-# Example for RGset_32
 par(mfrow = c(2, 3))
-plotMDS(getM(raw_32),       main = "Raw 32")
-plotMDS(getM(swan_32),      main = "SWAN 32")
-plotMDS(getM(quantile_32),  main = "Quantile 32")
-plotMDS(getM(noob_32),      main = "Noob 32")
-plotMDS(getM(funnorm_32),   main = "Funnorm 32")
+plotMDS(getM(raw_32),       main = "Raw EPIC V1",      labels = 1:ncol(getM(raw_32)))
+plotMDS(getM(swan_32),      main = "SWAN EPIC V1",     labels = 1:ncol(getM(swan_32)))
+plotMDS(getM(quantile_32),  main = "Quantile EPIC V1", labels = 1:ncol(getM(quantile_32)))
+plotMDS(getM(noob_32),      main = "Noob EPIC V1",     labels = 1:ncol(getM(noob_32)))
+plotMDS(getM(funnorm_32),   main = "Funnorm EPIC V1",  labels = 1:ncol(getM(funnorm_32)))
 ```
 Plotting variance for the different normalization methods
 ```{r}
@@ -270,8 +265,8 @@ library(tidyr)
 library(dplyr)
 
 # Combine the two datasets into a single dataframe for easier plotting
-variances_25$Dataset <- "25 Samples"
-variances_32$Dataset <- "32 Samples"
+variances_25$Dataset <- "Epic V2 Samples"
+variances_32$Dataset <- "Epic V1 Samples"
 variances_25$Probe <- rownames(variances_25)
 variances_32$Probe <- rownames(variances_32)
 
@@ -294,7 +289,7 @@ ggplot(variances_long, aes(x = Method, y = Variance, fill = Dataset)) +
   ) +
   theme_bw() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  scale_fill_manual(values = c("25 Samples" = "#66c2a5", "32 Samples" = "#fc8d62")) +
+  scale_fill_manual(values = c("Epic V2 Samples" = "#66c2a5", "Epic V1 Samples" = "#fc8d62")) +
   ylim(0, 0.01)  # Adjust the upper limit of the y-axis
 ```
 ```{r}
@@ -375,6 +370,10 @@ qc_info25 <- QCinfo(RGset_25_extended)
 #plot more QC
 ENmix::plotCtrl(RGset_32_extended)
 ENmix::plotCtrl(RGset_25_extended)
+
+#methylation data QC and preprocessing pipeline for Illuminal BeadChips
+qc_mpreprocess_25 = ENmix::mpreprocess(RGset_25_extended)
+qc_mpreprocess_32 = ENmix::mpreprocess(RGset_32_extended)
 
 # Display QC information
 print(qc_info32)

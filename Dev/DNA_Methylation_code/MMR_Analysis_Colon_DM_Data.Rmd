@@ -1,0 +1,387 @@
+---
+title: "MMR_Analysis_Colon_DM_Data"
+author: "Alos Diallo"
+date: "2024-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# =========================================================================
+# Examination of DNA Missmatch Repair genes - COAD DH Dataset
+# Code by: Alos Diallo
+# 2023,2024
+# =========================================================================
+
+
+Loading libraries:
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+library(sva)
+library(ENmix)
+library(DataExplorer)
+library(ggplot2)
+library(ggrepel)
+library(matrixStats)
+library(EpiDISH)
+library(tibble)
+library(tidyr)
+```
+
+Loading the annotation file:
+```{r}
+data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+Loading the data and metadata information
+```{r}
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+
+targets_expanded <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv")
+targets_expanded$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets_expanded) <- targets_expanded$patient
+targets_expanded$SampleID<- targets_expanded$patient
+```
+
+```{r}
+idat = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/"
+RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
+```
+
+
+Looking for bad CpG's using QCinfo
+```{r}
+sva32<-ctrlsva(RGset_32)
+sva25<-ctrlsva(RGset_25)
+SVA_combined <- rbind(sva25[,1:8], sva32)
+SVA_combined_df <- as.data.frame(SVA_combined)
+
+surrogateVariables <- sva
+# Convert RGChannelSet to RGChannelSetExtended
+RGset_32_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE,extended = TRUE)
+RGset_25_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE,extended = TRUE) 
+
+# Run QCinfo function
+qc_info32 <- QCinfo(RGset_32_extended)
+qc_info25 <- QCinfo(RGset_25_extended)
+
+# Display QC information
+#print(qc_info32)
+#print(qc_info25)
+badCpG = c(qc_info32$badCpG,qc_info25$badCpG)
+# Remove any suffix after an underscore
+cleaned_badCpG <- sub("_.*", "", badCpG)
+```
+
+
+Normalizing 
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+
+# Run functional normalization
+#funnorm_25 <- preprocessFunnorm(RGset_25, bgCorr = TRUE,dyeCorr = TRUE)
+#funnorm_32 <- preprocessFunnorm(RGset_32, bgCorr = TRUE,dyeCorr = TRUE)
+```
+
+Extracting the beta values from the normalized samples.  I am now running functional normalization as it contains a Noob option
+```{r}
+Betas_25<-getBeta(Noob_25_m)
+Betas_32<-getBeta(Noob_32_m)
+
+#Betas_25<-getBeta(funnorm_25)
+#Betas_32<-getBeta(funnorm_32)
+```
+
+Colapsing the betas so that the data can be merged
+```{r}
+Betas_25<- sesame::betasCollapseToPfx(Betas_25)
+#Betas_32<- sesame::betasCollapseToPfx(Betas_32)
+colnames(Betas_25) = colnames(Noob_25_m)
+```
+
+Filter out sex linked probes
+```{r}
+# Extract probes located on the Y chromosome
+cpg_y_probes <- rownames(anno[anno$chr == "chrY", ])  # Filter probes on Y chromosome
+
+# Filter Y chromosome probes from Betas_25
+cpg_y_probes_in_betas_25 <- cpg_y_probes[cpg_y_probes %in% rownames(Betas_25)]
+Betas_25_filtered <- Betas_25[!rownames(Betas_25) %in% cpg_y_probes_in_betas_25, ]
+
+# Filter Y chromosome probes from Betas_32
+cpg_y_probes_in_betas_32 <- cpg_y_probes[cpg_y_probes %in% rownames(Betas_32)]
+Betas_32_filtered <- Betas_32[!rownames(Betas_32) %in% cpg_y_probes_in_betas_32, ]
+
+# Extract probes located on the X chromosome
+cpg_x_probes <- rownames(anno[anno$chr == "chrX", ])
+
+# Filter X chromosome probes from Betas_25
+cpg_x_probes_in_betas_25 <- cpg_x_probes[cpg_x_probes %in% rownames(Betas_25_filtered)]
+Betas_25_filtered <- Betas_25_filtered[!rownames(Betas_25_filtered) %in% cpg_x_probes_in_betas_25, ]
+
+# Filter X chromosome probes from Betas_32
+cpg_x_probes_in_betas_32 <- cpg_x_probes[cpg_x_probes %in% rownames(Betas_32_filtered)]
+Betas_32_filtered <- Betas_32_filtered[!rownames(Betas_32_filtered) %in% cpg_x_probes_in_betas_32, ]
+```
+
+
+Merging the samples 
+```{r}
+# Ensure the same probes exist in both datasets
+common_probes <- intersect(rownames(Betas_25_filtered), rownames(Betas_32_filtered))
+
+# Subset both datasets to include only common probes
+Betas_25_filtered <- Betas_25_filtered[common_probes, ]
+Betas_32_filtered <- Betas_32_filtered[common_probes, ]
+
+# Combine the beta values from both datasets
+DH_CRC_Betas <- cbind(Betas_25_filtered, Betas_32_filtered) 
+
+```
+
+
+Running HiTIMED to generate cell type proportions
+```{r}
+HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",6,"tumor")
+```
+
+Running EpiDISH to obtain fibroblast proportions
+```{r}
+# Define the beta matrix and reference matrix
+beta_matrix <- DH_CRC_Betas  # Your dataset
+ref_matrix <- centEpiFibIC.m  # Reference matrix for EpiDISH (e.g., centEpiFibIC.m)
+
+# Run EpiDISH
+epidish_results <- epidish(beta.m = beta_matrix, ref.m = ref_matrix, method = "RPC")
+
+# Extract the estimated cell type proportions
+cell_type_proportions <- epidish_results$estF
+
+# Convert the matrix to a data frame and scale proportions to percentages
+cell_type_proportions_df <- as.data.frame(cell_type_proportions) * 100
+
+# Add SampleID as a column from the row names
+cell_type_proportions_df$SampleID <- rownames(cell_type_proportions)
+
+# Inspect the results
+head(cell_type_proportions_df)
+```
+
+
+Generate M values
+```{r}
+DH_CRC_M_value = BetaValueToMValue(DH_CRC_Betas)
+```
+
+Filter out bad CpG's
+```{r}
+# Identify good CpGs
+all_cpgs <- rownames(DH_CRC_M_value)
+good_cpgs <- setdiff(all_cpgs, cleaned_badCpG)
+# Filter the M values to keep only good CpGs
+filtered_DH_CRC_M_value <- DH_CRC_M_value[good_cpgs, ]
+DH_CRC_M_value = filtered_DH_CRC_M_value
+```
+
+
+
+
+
+I am looking at the relationship between MLH1 status and metastasis to determine if it should be included in my linear models.  Here I am making a table and then running a fisher's exact test. 
+```{r}
+# Assuming your targets data is already loaded in R
+
+# Create a contingency table for MLH1 and any_mets
+contingency_table <- table(targets$MLH1, targets$any_mets)
+
+# Add labels for clarity
+dimnames(contingency_table) <- list(
+  MLH1 = c("Wildtype", "Mutated"),
+  Metastasis = c("No Mets", "Mets")
+)
+
+# View the contingency table
+print(contingency_table)
+
+# Perform Fisher's Exact Test
+fisher_test <- fisher.test(contingency_table)
+
+# View the results of the test
+print(fisher_test)
+
+
+# Step 1: Create a new column 'MMR'
+targets_expanded$MMR <- ifelse(rowSums(targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")] == 1) > 0, 1, 0)
+
+targets_expanded$MMR = as.factor(targets_expanded$MMR)
+targets_expanded$any_mets = as.factor(targets_expanded$any_mets)
+# Step 2: Verify the new column
+table(targets_expanded$MMR)
+
+# Step 1: Generate a contingency table for MMR and any_mets
+contingency_table <- table(targets_expanded$MMR, targets_expanded$any_mets)
+contingency_table
+
+# Create a summary table for mutations in individual MMR genes
+gene_summary <- colSums(targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")] == 1)
+
+# Print the table
+print(gene_summary)
+
+# Fisher's test for a specific gene (e.g., MLH1 vs. any_mets)
+contingency_table <- table(targets_expanded$MLH1, targets_expanded$any_mets)
+fisher_test <- fisher.test(contingency_table)
+print(fisher_test)
+```
+
+No noticable difference was found.  
+
+Here I am running the same analysis on all of the categorical data:
+	•	Higher values indicate smaller (more significant) p-values.
+	•	Lower values indicate larger (less significant) p-values.
+	
+	•	\(-\log_{10}(\text{p-value}) = 1: Corresponds to a p-value of \(0.1\).
+	•	\(-\log_{10}(\text{p-value}) = 2: Corresponds to a p-value of \(0.01\).
+	•	\(-\log_{10}(\text{p-value}) = 3: Corresponds to a p-value of \(0.001\).	
+
+Generating a Venn Diagram showing overplap of MMR gene mutations with Metastasis status
+```{r}
+# Load necessary library
+library(VennDiagram)
+
+# Step 1: Create logical vectors for each MMR gene mutation
+mlh1_mutated <- targets_expanded$MLH1 == 1
+msh2_mutated <- targets_expanded$MSH2 == 1
+pms2_mutated <- targets_expanded$PMS2 == 1
+msh6_mutated <- targets_expanded$MSH6 == 1
+
+# Step 2: Generate a Venn diagram to visualize the overlap
+venn_plot <- venn.diagram(
+  x = list(
+    MLH1 = which(mlh1_mutated),
+    MSH2 = which(msh2_mutated),
+    PMS2 = which(pms2_mutated),
+    MSH6 = which(msh6_mutated)
+  ),
+  filename = NULL,  # Set to NULL to return the plot as an object
+  category.names = c("MLH1", "MSH2", "PMS2", "MSH6"),
+  fill = c("red", "blue", "green", "yellow"),
+  alpha = 0.5,
+  cat.cex = 0.8,
+  cex = 0.9,
+  margin = 0.1
+)
+
+grid.draw(venn_plot)
+# Step 3: Save the plot or display it
+pdf("MMR_gene_mutation_venn.pdf")
+grid.draw(venn_plot)
+dev.off()
+```
+
+Generating a heatmap that shows which mutations are positive for a given sample. 
+```{r}
+# Install and load pheatmap if not already installed
+if (!requireNamespace("pheatmap", quietly = TRUE)) {
+  install.packages("pheatmap")
+}
+library(pheatmap)
+
+# Step 1: Create a mutation matrix for MMR genes
+# Extract relevant columns for MMR genes (MLH1, MSH2, PMS2, MSH6)
+mmr_genes <- targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")]
+
+# Transpose the matrix so rows are genes and columns are samples
+mutation_matrix <- t(as.matrix(mmr_genes))
+
+# Step 2: Set colors for the heatmap
+# Blue for mutation (1), white for no mutation (0)
+annotation_colors <- list(
+  Mutation = c("0" = "white", "1" = "blue")
+)
+
+# Step 3: Generate the heatmap
+pheatmap(
+  mutation_matrix,
+  color = c("white", "blue"), # White for 0, blue for 1
+  cluster_rows = FALSE,       # Do not cluster rows (genes)
+  cluster_cols = FALSE,       # Do not cluster columns (samples)
+  main = "MMR Gene Mutation Heatmap",
+  fontsize = 10,
+  legend_labels = c("No Mutation", "Mutation")
+)
+```
+
+```{r}
+# Step 1: Convert appropriate columns to factors
+categorical_vars <- c("MLH1", "MSH2", "diagnosis", "node_stage", "sex", "site", "Distant_Mets", "any_mets", "ln_only")
+targets[categorical_vars] <- lapply(targets[categorical_vars], factor)
+
+# Debug: Check if all columns are converted
+str(targets[categorical_vars])
+
+# Step 2: Initialize the p-value matrix
+pval_matrix <- matrix(NA, nrow = length(categorical_vars), ncol = length(categorical_vars),
+                      dimnames = list(categorical_vars, categorical_vars))
+
+# Step 3: Compute Fisher's Exact Test for all pairs
+for (i in seq_along(categorical_vars)) {
+  for (j in seq_along(categorical_vars)) {
+    if (i != j) {
+      # Create contingency table
+      contingency_table <- table(targets[[categorical_vars[i]]], targets[[categorical_vars[j]]])
+      
+      # Check dimensions of the contingency table
+      if (nrow(contingency_table) > 1 && ncol(contingency_table) > 1) {
+        # Perform Fisher's Exact Test
+        fisher_test <- fisher.test(contingency_table,simulate.p.value = TRUE, B = 1e6)
+        
+        # Store the p-value
+        pval_matrix[i, j] <- fisher_test$p.value
+      }
+    }
+  }
+}
+
+# Debug: Check the p-value matrix
+print(pval_matrix)
+
+# Replace NA values to avoid errors in log transformation
+pval_matrix[is.na(pval_matrix)] <- 1
+
+# Step 4: Visualize as a heatmap
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+library(pheatmap)
+
+# Plot the heatmap
+pheatmap(-log10(pval_matrix), 
+         display_numbers = TRUE, 
+         number_format = "%.2f",
+         main = "Heatmap of Fisher's Exact Test (-log10 p-values)",
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE)
+
+
+```

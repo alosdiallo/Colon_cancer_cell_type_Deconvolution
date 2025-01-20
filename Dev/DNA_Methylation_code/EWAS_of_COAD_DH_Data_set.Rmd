@@ -247,181 +247,6 @@ filtered_DH_CRC_M_value <- DH_CRC_M_value[good_cpgs, ]
 DH_CRC_M_value = filtered_DH_CRC_M_value
 ```
 
-I am looking at the relationship between MLH1 status and metastasis to determine if it should be included in my linear models.  Here I am making a table and then running a fisher's exact test. 
-```{r}
-# Assuming your targets data is already loaded in R
-
-# Create a contingency table for MLH1 and any_mets
-contingency_table <- table(targets$MLH1, targets$any_mets)
-
-# Add labels for clarity
-dimnames(contingency_table) <- list(
-  MLH1 = c("Wildtype", "Mutated"),
-  Metastasis = c("No Mets", "Mets")
-)
-
-# View the contingency table
-print(contingency_table)
-
-# Perform Fisher's Exact Test
-fisher_test <- fisher.test(contingency_table)
-
-# View the results of the test
-print(fisher_test)
-
-
-# Step 1: Create a new column 'MMR'
-targets_expanded$MMR <- ifelse(rowSums(targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")] == 1) > 0, 1, 0)
-
-targets_expanded$MMR = as.factor(targets_expanded$MMR)
-targets_expanded$any_mets = as.factor(targets_expanded$any_mets)
-# Step 2: Verify the new column
-table(targets_expanded$MMR)
-
-# Step 1: Generate a contingency table for MMR and any_mets
-contingency_table <- table(targets_expanded$MMR, targets_expanded$any_mets)
-contingency_table
-
-# Create a summary table for mutations in individual MMR genes
-gene_summary <- colSums(targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")] == 1)
-
-# Print the table
-print(gene_summary)
-
-# Fisher's test for a specific gene (e.g., MLH1 vs. any_mets)
-contingency_table <- table(targets_expanded$MLH1, targets_expanded$any_mets)
-fisher_test <- fisher.test(contingency_table)
-print(fisher_test)
-```
-No noticable difference was found.  
-
-Here I am running the same analysis on all of the categorical data:
-	•	Higher values indicate smaller (more significant) p-values.
-	•	Lower values indicate larger (less significant) p-values.
-	
-	•	\(-\log_{10}(\text{p-value}) = 1: Corresponds to a p-value of \(0.1\).
-	•	\(-\log_{10}(\text{p-value}) = 2: Corresponds to a p-value of \(0.01\).
-	•	\(-\log_{10}(\text{p-value}) = 3: Corresponds to a p-value of \(0.001\).	
-
-Generating a Venn Diagram showing overplap of MMR gene mutations with Metastasis status
-```{r}
-# Load necessary library
-library(VennDiagram)
-
-# Step 1: Create logical vectors for each MMR gene mutation
-mlh1_mutated <- targets_expanded$MLH1 == 1
-msh2_mutated <- targets_expanded$MSH2 == 1
-pms2_mutated <- targets_expanded$PMS2 == 1
-msh6_mutated <- targets_expanded$MSH6 == 1
-
-# Step 2: Generate a Venn diagram to visualize the overlap
-venn_plot <- venn.diagram(
-  x = list(
-    MLH1 = which(mlh1_mutated),
-    MSH2 = which(msh2_mutated),
-    PMS2 = which(pms2_mutated),
-    MSH6 = which(msh6_mutated)
-  ),
-  filename = NULL,  # Set to NULL to return the plot as an object
-  category.names = c("MLH1", "MSH2", "PMS2", "MSH6"),
-  fill = c("red", "blue", "green", "yellow"),
-  alpha = 0.5,
-  cat.cex = 0.8,
-  cex = 0.9,
-  margin = 0.1
-)
-
-grid.draw(venn_plot)
-# Step 3: Save the plot or display it
-pdf("MMR_gene_mutation_venn.pdf")
-grid.draw(venn_plot)
-dev.off()
-```
-Generating a heatmap that shows which mutations are positive for a given sample. 
-```{r}
-# Install and load pheatmap if not already installed
-if (!requireNamespace("pheatmap", quietly = TRUE)) {
-  install.packages("pheatmap")
-}
-library(pheatmap)
-
-# Step 1: Create a mutation matrix for MMR genes
-# Extract relevant columns for MMR genes (MLH1, MSH2, PMS2, MSH6)
-mmr_genes <- targets_expanded[, c("MLH1", "MSH2", "PMS2", "MSH6")]
-
-# Transpose the matrix so rows are genes and columns are samples
-mutation_matrix <- t(as.matrix(mmr_genes))
-
-# Step 2: Set colors for the heatmap
-# Blue for mutation (1), white for no mutation (0)
-annotation_colors <- list(
-  Mutation = c("0" = "white", "1" = "blue")
-)
-
-# Step 3: Generate the heatmap
-pheatmap(
-  mutation_matrix,
-  color = c("white", "blue"), # White for 0, blue for 1
-  cluster_rows = FALSE,       # Do not cluster rows (genes)
-  cluster_cols = FALSE,       # Do not cluster columns (samples)
-  main = "MMR Gene Mutation Heatmap",
-  fontsize = 10,
-  legend_labels = c("No Mutation", "Mutation")
-)
-```
-
-
-```{r}
-# Step 1: Convert appropriate columns to factors
-categorical_vars <- c("MLH1", "MSH2", "diagnosis", "node_stage", "sex", "site", "Distant_Mets", "any_mets", "ln_only")
-targets[categorical_vars] <- lapply(targets[categorical_vars], factor)
-
-# Debug: Check if all columns are converted
-str(targets[categorical_vars])
-
-# Step 2: Initialize the p-value matrix
-pval_matrix <- matrix(NA, nrow = length(categorical_vars), ncol = length(categorical_vars),
-                      dimnames = list(categorical_vars, categorical_vars))
-
-# Step 3: Compute Fisher's Exact Test for all pairs
-for (i in seq_along(categorical_vars)) {
-  for (j in seq_along(categorical_vars)) {
-    if (i != j) {
-      # Create contingency table
-      contingency_table <- table(targets[[categorical_vars[i]]], targets[[categorical_vars[j]]])
-      
-      # Check dimensions of the contingency table
-      if (nrow(contingency_table) > 1 && ncol(contingency_table) > 1) {
-        # Perform Fisher's Exact Test
-        fisher_test <- fisher.test(contingency_table,simulate.p.value = TRUE, B = 1e6)
-        
-        # Store the p-value
-        pval_matrix[i, j] <- fisher_test$p.value
-      }
-    }
-  }
-}
-
-# Debug: Check the p-value matrix
-print(pval_matrix)
-
-# Replace NA values to avoid errors in log transformation
-pval_matrix[is.na(pval_matrix)] <- 1
-
-# Step 4: Visualize as a heatmap
-if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
-library(pheatmap)
-
-# Plot the heatmap
-pheatmap(-log10(pval_matrix), 
-         display_numbers = TRUE, 
-         number_format = "%.2f",
-         main = "Heatmap of Fisher's Exact Test (-log10 p-values)",
-         cluster_rows = FALSE, 
-         cluster_cols = FALSE)
-
-
-```
 
 Setting up the model matrix
 ```{r}
@@ -480,6 +305,269 @@ if (!all(rownames(design) == colnames(DH_CRC_M_value_filtered))) {
 # Print Summary
 print(dim(design))  # Size of the design matrix
 print(colnames(design))  # Predictor names
+
+```
+
+```{r}
+# Load required libraries
+library(GenomicRanges)
+library(ggplot2)
+
+# Subset M-value matrix and annotation data
+common_probes <- intersect(rownames(DH_CRC_M_value), anno$Name)
+m_matrix_sub <- DH_CRC_M_value[common_probes, ]
+anno_sub <- anno[match(rownames(m_matrix_sub), anno$Name), ]
+
+# Create a GenomicRanges object for probe locations
+gr_anno <- makeGRangesFromDataFrame(
+  df = anno_sub,
+  seqnames.field     = "chr",    # Chromosome information
+  start.field        = "pos",    # Start position (for EPIC arrays, start = end)
+  end.field          = "pos",    # End position
+  strand.field       = "strand", # Strand information
+  keep.extra.columns = TRUE      # Keep additional columns for annotation
+)
+
+# Add a new column 'Mets' to metadata for metastasis grouping
+combined_data$Mets <- combined_data$any_mets  # Already TRUE/FALSE
+
+# Create GenomicRatioSet
+gRatioSet <- makeGenomicRatioSetFromMatrix(
+  mat       = m_matrix_sub,
+  rownames  = rownames(m_matrix_sub),  # Probe IDs
+  pData     = combined_data,           # Metadata
+  array     = "IlluminaHumanMethylationEPIC",
+  annotation = "ilm10b4.hg19",         # Adjust annotation if needed
+  what      = "M"
+)
+
+# Create masks for metastatic vs. non-metastatic samples
+mask_mets <- pData(gRatioSet)$Mets == TRUE
+mask_no_mets <- pData(gRatioSet)$Mets == FALSE
+
+# Subset GenomicRatioSets
+gRatioSet_met <- gRatioSet[, mask_mets]
+gRatioSet_nonmet <- gRatioSet[, mask_no_mets]
+
+# Run compartments analysis for chr22
+comp_chr22_met <- compartments(
+  object     = gRatioSet_met,
+  resolution = 100 * 1000,
+  what       = "OpenSea",  # Could also be "Beta" or "Body", etc.
+  chr        = "chr22",
+  method     = "pearson",
+  keep       = TRUE
+)
+
+comp_chr22_nonmet <- compartments(
+  object     = gRatioSet_nonmet,
+  resolution = 100 * 1000,
+  what       = "OpenSea",
+  chr        = "chr22",
+  method     = "pearson",
+  keep       = TRUE
+)
+
+# Convert to data frames for plotting
+df_comp_met <- as.data.frame(comp_chr22_met)
+df_comp_nonmet <- as.data.frame(comp_chr22_nonmet)
+
+# Add a label for each group
+df_comp_met$group <- "Metastatic"
+df_comp_nonmet$group <- "Non-Metastatic"
+
+# Combine both data frames
+df_combined <- rbind(df_comp_met, df_comp_nonmet)
+
+# Calculate midpoint for bins
+df_combined$mid <- (df_combined$start + df_combined$end) / 2
+
+# Plot compartment eigenvector scores by metastasis status
+ggplot(df_combined, aes(x = mid, y = pc, color = group)) +
+  geom_line() +
+  theme_minimal() +
+  scale_color_manual(values = c("Metastatic" = "red", "Non-Metastatic" = "blue")) +
+  labs(
+    title = "Chromosome 22: Compartment PC1 by Metastasis Status",
+    x = "Genomic Position (chr22)",
+    y = "PC (Eigenvector Score)",
+    color = "Group"
+  )
+
+# Ribbon plot for compartment openness (A/B)
+ggplot(df_combined, aes(x = mid)) +
+  geom_ribbon(
+    aes(
+      ymin = ifelse(pc < 0, pc, 0),
+      ymax = ifelse(pc > 0, pc, 0),
+      fill = compartment
+    ),
+    alpha = 0.4,
+    color = NA
+  ) +
+  facet_wrap(~group, ncol = 1) +
+  theme_minimal() +
+  scale_fill_manual(values = c("closed" = "blue", "open" = "gray")) +
+  labs(
+    title = "Compartment Openness by Metastasis Status",
+    x = "Genomic Position (chr22)",
+    y = "Compartment Score (PC1)"
+  )
+```
+```{r}
+# MSI-relevant chromosome (change this to test other chromosomes)
+msi_chr <- "chr2"  # Example chromosome involved in MSI
+
+# Run compartments analysis for MSI chromosome
+comp_msi_met <- compartments(
+  object     = gRatioSet_met,
+  resolution = 100 * 1000,
+  what       = "OpenSea",  # Could also be "Beta" or "Body", etc.
+  chr        = msi_chr,
+  method     = "pearson",
+  keep       = TRUE
+)
+
+comp_msi_nonmet <- compartments(
+  object     = gRatioSet_nonmet,
+  resolution = 100 * 1000,
+  what       = "OpenSea",
+  chr        = msi_chr,
+  method     = "pearson",
+  keep       = TRUE
+)
+
+# Convert to data frames for plotting
+df_comp_met <- as.data.frame(comp_msi_met)
+df_comp_nonmet <- as.data.frame(comp_msi_nonmet)
+
+# Add a label for each group
+df_comp_met$group <- "Metastatic"
+df_comp_nonmet$group <- "Non-Metastatic"
+
+# Combine both data frames
+df_combined <- rbind(df_comp_met, df_comp_nonmet)
+
+# Calculate midpoint for bins
+df_combined$mid <- (df_combined$start + df_combined$end) / 2
+
+# Plot compartment eigenvector scores by metastasis status
+ggplot(df_combined, aes(x = mid, y = pc, color = group)) +
+  geom_line() +
+  theme_minimal() +
+  scale_color_manual(values = c("Metastatic" = "red", "Non-Metastatic" = "blue")) +
+  labs(
+    title = paste0(msi_chr, ": Compartment PC1 by Metastasis Status"),
+    x = paste0("Genomic Position (", msi_chr, ")"),
+    y = "PC (Eigenvector Score)",
+    color = "Group"
+  )
+
+# Ribbon plot for compartment openness (A/B)
+ggplot(df_combined, aes(x = mid)) +
+  geom_ribbon(
+    aes(
+      ymin = ifelse(pc < 0, pc, 0),
+      ymax = ifelse(pc > 0, pc, 0),
+      fill = compartment
+    ),
+    alpha = 0.4,
+    color = NA
+  ) +
+  facet_wrap(~group, ncol = 1) +
+  theme_minimal() +
+  scale_fill_manual(values = c("closed" = "blue", "open" = "gray")) +
+  labs(
+    title = paste0("Compartment Openness by Metastasis Status (", msi_chr, ")"),
+    x = paste0("Genomic Position (", msi_chr, ")"),
+    y = "Compartment Score (PC1)"
+  )
+
+```
+```{r}
+# Convert to data frames for plotting
+df_comp_met <- as.data.frame(comp_msi_met)
+df_comp_nonmet <- as.data.frame(comp_msi_nonmet)
+
+# Add a label for each group
+df_comp_met$group <- "Metastatic"
+df_comp_nonmet$group <- "Non-Metastatic"
+
+# Combine both data frames
+df_combined <- rbind(df_comp_met, df_comp_nonmet)
+
+# Calculate midpoint for bins
+df_combined$mid <- (df_combined$start + df_combined$end) / 2
+
+# 3. Add genes of interest
+genes_of_interest <- data.frame(
+  gene = c("MLH1", "MSH2"),  # Gene names
+  chr = c("chr2", "chr2"),   # Change chromosome as needed
+  start = c(48000000, 49000000),  # Example start positions (adjust to real coordinates)
+  end = c(48200000, 49200000)     # Example end positions (adjust to real coordinates)
+)
+
+# Subset genes for the MSI chromosome being analyzed
+genes_highlight <- genes_of_interest[genes_of_interest$chr == msi_chr, ]
+
+# 4. Plot compartment eigenvector scores by metastasis status
+ggplot(df_combined, aes(x = mid, y = pc, color = group)) +
+  geom_line() +
+  geom_rect(
+    data = genes_highlight,
+    aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = "yellow",
+    alpha = 0.2
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("Metastatic" = "red", "Non-Metastatic" = "blue")) +
+  labs(
+    title = paste0(msi_chr, ": Compartment PC1 by Metastasis Status"),
+    x = paste0("Genomic Position (", msi_chr, ")"),
+    y = "PC (Eigenvector Score)",
+    color = "Group"
+  )
+
+# Adjust centromere position for the correct genome build
+centromere_chr2 <- 92450000  # Adjust to 93050000 for GRCh37 if needed
+
+# Recenter the coordinates for the ribbon plot
+df_combined$mid_centered <- df_combined$mid - centromere_chr2
+genes_highlight$start_centered <- genes_highlight$start - centromere_chr2
+genes_highlight$end_centered <- genes_highlight$end - centromere_chr2
+
+# Ribbon plot with centered coordinates
+ggplot(df_combined, aes(x = mid_centered)) +
+  geom_ribbon(
+    aes(
+      ymin = ifelse(pc < 0, pc, 0),
+      ymax = ifelse(pc > 0, pc, 0),
+      fill = compartment
+    ),
+    alpha = 0.4,
+    color = NA
+  ) +
+  geom_rect(
+    data = genes_highlight,
+    aes(xmin = start_centered, xmax = end_centered, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = "darkred",
+    alpha = 0.9
+  ) +
+  facet_wrap(~group, ncol = 1) +
+  theme_minimal() +
+  scale_fill_manual(values = c("closed" = "blue", "open" = "gray")) +
+  scale_x_continuous(
+    labels = scales::comma,  # Format x-axis labels with commas
+    breaks = seq(-100000000, 100000000, by = 25000000)  # Tick intervals
+  ) +
+  labs(
+    title = paste0("Compartment Openness by Metastasis Status (", msi_chr, ")"),
+    x = paste0("Genomic Position Relative to Centromere (", msi_chr, ")"),
+    y = "Compartment Score (PC1)"
+  ) +
+  coord_cartesian(xlim = c(-100000000, 100000000))  # Centered range
 ```
 
 

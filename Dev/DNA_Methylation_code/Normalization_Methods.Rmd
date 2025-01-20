@@ -1,0 +1,442 @@
+---
+title: "Normalization_examination_of_COAD_DH_Data_set"
+author: "Alos Diallo"
+date: "2024-11-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# =========================================================================
+# Normalization - COAD DH Dataset
+# Code by: Alos Diallo
+# 2024,2025
+# =========================================================================
+
+
+Loading libraries:
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+library(sva)
+library(ENmix)
+library(DataExplorer)
+library(ggplot2)
+library(ggrepel)
+library(matrixStats)
+library(EpiDISH)
+library(tibble)
+library(tidyr)
+```
+
+Loading the annotation file:
+```{r}
+data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+Loading the data and metadata information
+```{r}
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+
+targets_expanded <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv")
+targets_expanded$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets_expanded) <- targets_expanded$patient
+targets_expanded$SampleID<- targets_expanded$patient
+```
+
+```{r}
+idat = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/"
+RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
+```
+
+TCGA Data
+```{r}
+tcga.data <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/TCGA_data.rds")
+tcga.dnam <- tcga.data[["dnam"]]
+tcga.pheno <- tcga.data[["pheno"]]
+tcga.cell <- tcga.data[["cell_types"]]
+msi_dat<-readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/msi_tcga.rds")
+tcga.cell$COAD_Deconv1#$MSS
+tcga.cell$COAD_Deconv2#MASS
+
+tcga_T = t(tcga.dnam)
+```
+
+
+
+Comparing normalization methods
+```{r}
+###############################################################################
+# 1. Preprocessing for RGset_25
+###############################################################################
+
+# 1A) Preprocessing: raw, SWAN, Quantile, Noob, Funnorm, ENmix, Illumina
+raw_25       <- preprocessRaw(RGset_25)
+swan_25      <- preprocessSWAN(RGset_25, mSet = raw_25)
+quantile_25  <- preprocessQuantile(RGset_25)
+noob_25      <- preprocessNoob(RGset_25)
+funnorm_25   <- preprocessFunnorm(RGset_25, bgCorr = TRUE, dyeCorr = TRUE)
+ENmix_25     <- preprocessENmix(RGset_25)
+illumina_25  <- preprocessIllumina(RGset_25)
+
+# 1B) Convert to GenomicMethylSet or GenomicRatioSet so we can use addSex/plotSex
+raw_25_genomic       <- addSex(mapToGenome(raw_25))
+swan_25_genomic      <- addSex(mapToGenome(swan_25))
+quantile_25_genomic  <- addSex(mapToGenome(quantile_25))
+noob_25_genomic      <- addSex(mapToGenome(noob_25))
+funnorm_25_genomic   <- addSex(funnorm_25)
+ENmix_25_genomic     <- addSex(mapToGenome(ENmix_25))
+illumina_25_genomic  <- addSex(mapToGenome(illumina_25))
+
+###############################################################################
+# 2. Preprocessing for RGset_32
+###############################################################################
+
+# 2A) Preprocessing: raw, SWAN, Quantile, Noob, Funnorm, ENmix, Illumina
+raw_32       <- preprocessRaw(RGset_32)
+swan_32      <- preprocessSWAN(RGset_32, mSet = raw_32)
+quantile_32  <- preprocessQuantile(RGset_32)
+noob_32      <- preprocessNoob(RGset_32)
+funnorm_32   <- preprocessFunnorm(RGset_32, bgCorr = TRUE, dyeCorr = TRUE)
+ENmix_32     <- preprocessENmix(RGset_32)
+illumina_32  <- preprocessIllumina(RGset_32)
+
+# 2B) Convert for plotSex()
+raw_32_genomic       <- addSex(mapToGenome(raw_32))
+swan_32_genomic      <- addSex(mapToGenome(swan_32))
+quantile_32_genomic  <- addSex(mapToGenome(quantile_32))
+noob_32_genomic      <- addSex(mapToGenome(noob_32))
+funnorm_32_genomic   <- addSex(funnorm_32)
+ENmix_32_genomic     <- addSex(mapToGenome(ENmix_32))
+illumina_32_genomic  <- addSex(mapToGenome(illumina_32))
+
+###############################################################################
+# 3. Compare using plotSex()
+###############################################################################
+
+par(mfrow = c(3, 3))
+plotSex(raw_25_genomic)
+plotSex(swan_25_genomic)
+plotSex(quantile_25_genomic)
+plotSex(noob_25_genomic)
+plotSex(funnorm_25_genomic)
+plotSex(ENmix_25_genomic)
+plotSex(illumina_25_genomic)
+
+par(mfrow = c(3, 3))
+plotSex(raw_32_genomic)
+plotSex(swan_32_genomic)
+plotSex(quantile_32_genomic)
+plotSex(noob_32_genomic)
+plotSex(funnorm_32_genomic)
+plotSex(ENmix_32_genomic)
+plotSex(illumina_32_genomic)
+
+###############################################################################
+# 4. Beta-value density comparisons
+###############################################################################
+
+par(mfrow = c(3, 3))
+plot(density(getBeta(raw_25),       na.rm = TRUE), main = "Raw EPIC V2")
+plot(density(getBeta(swan_25),      na.rm = TRUE), main = "SWAN EPIC V2")
+plot(density(getBeta(quantile_25),  na.rm = TRUE), main = "Quantile EPIC V2")
+plot(density(getBeta(noob_25),      na.rm = TRUE), main = "Noob EPIC V2")
+plot(density(getBeta(funnorm_25),   na.rm = TRUE), main = "Funnorm EPIC V2")
+plot(density(getBeta(ENmix_25),     na.rm = TRUE), main = "ENmix EPIC V2")
+plot(density(getBeta(illumina_25),  na.rm = TRUE), main = "Illumina EPIC V2")
+
+par(mfrow = c(3, 3))
+plot(density(getBeta(raw_32),       na.rm = TRUE), main = "Raw EPIC V1")
+plot(density(getBeta(swan_32),      na.rm = TRUE), main = "SWAN EPIC V1")
+plot(density(getBeta(quantile_32),  na.rm = TRUE), main = "Quantile EPIC V1")
+plot(density(getBeta(noob_32),      na.rm = TRUE), main = "Noob EPIC V1")
+plot(density(getBeta(funnorm_32),   na.rm = TRUE), main = "Funnorm EPIC V1")
+plot(density(getBeta(ENmix_32),     na.rm = TRUE), main = "ENmix EPIC V1")
+plot(density(getBeta(illumina_32),  na.rm = TRUE), main = "Illumina EPIC V1")
+
+###############################################################################
+# 5. MDS plots
+###############################################################################
+
+par(mfrow = c(3, 3))
+plotMDS(getM(raw_25),       main = "Raw EPIC V2",      labels = 1:ncol(getM(raw_25)))
+plotMDS(getM(swan_25),      main = "SWAN EPIC V2",     labels = 1:ncol(getM(swan_25)))
+plotMDS(getM(quantile_25),  main = "Quantile EPIC V2", labels = 1:ncol(getM(quantile_25)))
+plotMDS(getM(noob_25),      main = "Noob EPIC V2",     labels = 1:ncol(getM(noob_25)))
+plotMDS(getM(funnorm_25),   main = "Funnorm EPIC V2",  labels = 1:ncol(getM(funnorm_25)))
+plotMDS(getM(ENmix_25),     main = "ENmix EPIC V2",    labels = 1:ncol(getM(ENmix_25)))
+plotMDS(getM(illumina_25),  main = "Illumina EPIC V2", labels = 1:ncol(getM(illumina_25)))
+
+par(mfrow = c(3, 3))
+plotMDS(getM(raw_32),       main = "Raw EPIC V1",      labels = 1:ncol(getM(raw_32)))
+plotMDS(getM(swan_32),      main = "SWAN EPIC V1",     labels = 1:ncol(getM(swan_32)))
+plotMDS(getM(quantile_32),  main = "Quantile EPIC V1", labels = 1:ncol(getM(quantile_32)))
+plotMDS(getM(noob_32),      main = "Noob EPIC V1",     labels = 1:ncol(getM(noob_32)))
+plotMDS(getM(funnorm_32),   main = "Funnorm EPIC V1",  labels = 1:ncol(getM(funnorm_32)))
+plotMDS(getM(ENmix_32),     main = "ENmix EPIC V1",    labels = 1:ncol(getM(ENmix_32)))
+plotMDS(getM(illumina_32),  main = "Illumina EPIC V1", labels = 1:ncol(getM(illumina_32)))
+```
+Plotting variance for the different normalization methods
+```{r}
+# 1. Get Beta matrices
+beta_raw       <- getBeta(raw_25)
+beta_swan      <- getBeta(swan_25)
+beta_quantile  <- getBeta(quantile_25)
+beta_noob      <- getBeta(noob_25)
+beta_funnorm   <- getBeta(funnorm_25)
+
+# 2. Find intersecting probes
+common_probes <- Reduce(intersect, list(
+  rownames(beta_raw),
+  rownames(beta_swan),
+  rownames(beta_quantile),
+  rownames(beta_noob),
+  rownames(beta_funnorm)
+))
+
+# 3. Subset each matrix to the common probe set
+beta_raw       <- beta_raw[common_probes, ]
+beta_swan      <- beta_swan[common_probes, ]
+beta_quantile  <- beta_quantile[common_probes, ]
+beta_noob      <- beta_noob[common_probes, ]
+beta_funnorm   <- beta_funnorm[common_probes, ]
+
+# 4. Calculate variances and combine in a single data frame
+calculate_variances <- function(beta_matrix) {
+  apply(beta_matrix, 1, var, na.rm = TRUE)
+}
+
+variances_25 <- data.frame(
+  Raw      = calculate_variances(beta_raw),
+  SWAN     = calculate_variances(beta_swan),
+  Quantile = calculate_variances(beta_quantile),
+  Noob     = calculate_variances(beta_noob),
+  Funnorm  = calculate_variances(beta_funnorm)
+)
+
+head(variances_25)
+
+# 1. Extract Beta matrices from each normalization
+beta_raw_32       <- getBeta(raw_32)
+beta_swan_32      <- getBeta(swan_32)
+beta_quantile_32  <- getBeta(quantile_32)
+beta_noob_32      <- getBeta(noob_32)
+beta_funnorm_32   <- getBeta(funnorm_32)
+
+# 2. Find the common probe IDs across all five matrices
+common_probes_32 <- Reduce(intersect, list(
+  rownames(beta_raw_32),
+  rownames(beta_swan_32),
+  rownames(beta_quantile_32),
+  rownames(beta_noob_32),
+  rownames(beta_funnorm_32)
+))
+
+# 3. Subset each Beta matrix to the common probes
+beta_raw_32       <- beta_raw_32[common_probes_32, ]
+beta_swan_32      <- beta_swan_32[common_probes_32, ]
+beta_quantile_32  <- beta_quantile_32[common_probes_32, ]
+beta_noob_32      <- beta_noob_32[common_probes_32, ]
+beta_funnorm_32   <- beta_funnorm_32[common_probes_32, ]
+
+# (Make sure calculate_variances() is defined; e.g.)
+# calculate_variances <- function(beta_matrix) {
+#   apply(beta_matrix, 1, var, na.rm = TRUE)
+# }
+
+# 4. Calculate variances and store in a data frame
+variances_32 <- data.frame(
+  Raw      = calculate_variances(beta_raw_32),
+  SWAN     = calculate_variances(beta_swan_32),
+  Quantile = calculate_variances(beta_quantile_32),
+  Noob     = calculate_variances(beta_noob_32),
+  Funnorm  = calculate_variances(beta_funnorm_32)
+)
+
+# Now variances_32 should have the same number of rows for each column.
+head(variances_32)
+
+
+#Plotting:
+# Load necessary libraries
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Combine the two datasets into a single dataframe for easier plotting
+variances_25$Dataset <- "Epic V2 Samples"
+variances_32$Dataset <- "Epic V1 Samples"
+variances_25$Probe <- rownames(variances_25)
+variances_32$Probe <- rownames(variances_32)
+
+# Combine into one dataframe
+combined_variances <- bind_rows(variances_25, variances_32)
+
+# Convert to long format for ggplot
+variances_long <- combined_variances %>%
+  pivot_longer(cols = c("Raw", "SWAN", "Quantile", "Noob", "Funnorm"),
+               names_to = "Method", values_to = "Variance")
+
+# Plot using ggplot2
+ggplot(variances_long, aes(x = Method, y = Variance, fill = Dataset)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  facet_wrap(~Dataset) +
+  labs(
+    title = "Probe Variance Across Normalization Methods",
+    x = "Normalization Method",
+    y = "Probe Variance"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("Epic V2 Samples" = "#66c2a5", "Epic V1 Samples" = "#fc8d62")) +
+  ylim(0, 0.01)  # Adjust the upper limit of the y-axis
+```
+
+```{r}
+# 1. Get Beta matrices
+beta_raw       <- getBeta(raw_25)
+beta_swan      <- getBeta(swan_25)
+beta_quantile  <- getBeta(quantile_25)
+beta_noob      <- getBeta(noob_25)
+beta_funnorm   <- getBeta(funnorm_25)
+beta_ENmix     <- getBeta(ENmix_25)
+beta_illumina  <- getBeta(illumina_25)
+
+# 2. Find intersecting probes
+common_probes <- Reduce(intersect, list(
+  rownames(beta_raw),
+  rownames(beta_swan),
+  rownames(beta_quantile),
+  rownames(beta_noob),
+  rownames(beta_funnorm),
+  rownames(beta_ENmix),
+  rownames(beta_illumina)
+))
+
+# 3. Subset each matrix to the common probe set
+beta_raw       <- beta_raw[common_probes, ]
+beta_swan      <- beta_swan[common_probes, ]
+beta_quantile  <- beta_quantile[common_probes, ]
+beta_noob      <- beta_noob[common_probes, ]
+beta_funnorm   <- beta_funnorm[common_probes, ]
+beta_ENmix     <- beta_ENmix[common_probes, ]
+beta_illumina  <- beta_illumina[common_probes, ]
+
+# 4. Calculate variances and combine in a single data frame
+calculate_variances <- function(beta_matrix) {
+  apply(beta_matrix, 1, var, na.rm = TRUE)
+}
+
+variances_25 <- data.frame(
+  Raw      = calculate_variances(beta_raw),
+  SWAN     = calculate_variances(beta_swan),
+  Quantile = calculate_variances(beta_quantile),
+  Noob     = calculate_variances(beta_noob),
+  Funnorm  = calculate_variances(beta_funnorm),
+  ENmix    = calculate_variances(beta_ENmix),
+  Illumina = calculate_variances(beta_illumina)
+)
+
+head(variances_25)
+
+# 1. Extract Beta matrices from each normalization
+beta_raw_32       <- getBeta(raw_32)
+beta_swan_32      <- getBeta(swan_32)
+beta_quantile_32  <- getBeta(quantile_32)
+beta_noob_32      <- getBeta(noob_32)
+beta_funnorm_32   <- getBeta(funnorm_32)
+beta_ENmix_32     <- getBeta(ENmix_32)
+beta_illumina_32  <- getBeta(illumina_32)
+
+# 2. Find the common probe IDs across all matrices
+common_probes_32 <- Reduce(intersect, list(
+  rownames(beta_raw_32),
+  rownames(beta_swan_32),
+  rownames(beta_quantile_32),
+  rownames(beta_noob_32),
+  rownames(beta_funnorm_32),
+  rownames(beta_ENmix_32),
+  rownames(beta_illumina_32)
+))
+
+# 3. Subset each Beta matrix to the common probes
+beta_raw_32       <- beta_raw_32[common_probes_32, ]
+beta_swan_32      <- beta_swan_32[common_probes_32, ]
+beta_quantile_32  <- beta_quantile_32[common_probes_32, ]
+beta_noob_32      <- beta_noob_32[common_probes_32, ]
+beta_funnorm_32   <- beta_funnorm_32[common_probes_32, ]
+beta_ENmix_32     <- beta_ENmix_32[common_probes_32, ]
+beta_illumina_32  <- beta_illumina_32[common_probes_32, ]
+
+# 4. Calculate variances and store in a data frame
+variances_32 <- data.frame(
+  Raw      = calculate_variances(beta_raw_32),
+  SWAN     = calculate_variances(beta_swan_32),
+  Quantile = calculate_variances(beta_quantile_32),
+  Noob     = calculate_variances(beta_noob_32),
+  Funnorm  = calculate_variances(beta_funnorm_32),
+  ENmix    = calculate_variances(beta_ENmix_32),
+  Illumina = calculate_variances(beta_illumina_32)
+)
+
+# Now variances_32 should have the same number of rows for each column.
+head(variances_32)
+
+
+#Plotting:
+# Load necessary libraries
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Combine the two datasets into a single dataframe for easier plotting
+variances_25$Dataset <- "Epic V2 Samples"
+variances_32$Dataset <- "Epic V1 Samples"
+variances_25$Probe <- rownames(variances_25)
+variances_32$Probe <- rownames(variances_32)
+
+# Combine into one dataframe
+combined_variances <- bind_rows(variances_25, variances_32)
+
+# Convert to long format for ggplot
+variances_long <- combined_variances %>%
+  pivot_longer(cols = c("Raw", "SWAN", "Quantile", "Noob", "Funnorm", "ENmix", "Illumina"),
+               names_to = "Method", values_to = "Variance")
+
+# Plot using ggplot2
+ggplot(variances_long, aes(x = Method, y = Variance, fill = Dataset)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  facet_wrap(~Dataset) +
+  labs(
+    title = "Probe Variance Across Normalization Methods",
+    x = "Normalization Method",
+    y = "Probe Variance"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("Epic V2 Samples" = "#66c2a5", "Epic V1 Samples" = "#fc8d62")) +
+  ylim(0, 0.01)  # Adjust the upper limit of the y-axis
+
+```
+
+
