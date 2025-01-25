@@ -99,10 +99,6 @@ Normalizing
 ```{r}
 Noob_25_m = preprocessNoob(RGset_25)
 Noob_32_m = preprocessNoob(RGset_32)
-
-# Run functional normalization
-#funnorm_25 <- preprocessFunnorm(RGset_25, bgCorr = TRUE,dyeCorr = TRUE)
-#funnorm_32 <- preprocessFunnorm(RGset_32, bgCorr = TRUE,dyeCorr = TRUE)
 ```
 
 Extracting the beta values from the normalized samples.  I am now running functional normalization as it contains a Noob option

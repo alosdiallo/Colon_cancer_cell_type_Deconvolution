@@ -1,0 +1,438 @@
+---
+title: "A_and_B_Compartment_of_COAD_DH_Data_set"
+author: "Alos Diallo"
+date: "2024-11-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# =========================================================================
+# Work on A and B compartments for - COAD DH Dataset
+# Code by: Alos Diallo
+# 2025
+# =========================================================================
+
+Loading libraries:
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(sva)
+library(ENmix)
+library(ggrepel)
+library(matrixStats)
+library(tibble)
+library(tidyr)
+```
+
+Loading the annotation file:
+```{r}
+data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+Loading the data and metadata information
+```{r}
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+
+targets_expanded <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv")
+targets_expanded$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets_expanded) <- targets_expanded$patient
+targets_expanded$SampleID<- targets_expanded$patient
+```
+
+```{r}
+idat = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/"
+RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
+```
+
+
+Looking for bad CpG's using QCinfo
+```{r}
+sva32<-ctrlsva(RGset_32)
+sva25<-ctrlsva(RGset_25)
+SVA_combined <- rbind(sva25[,1:8], sva32)
+SVA_combined_df <- as.data.frame(SVA_combined)
+
+surrogateVariables <- sva
+# Convert RGChannelSet to RGChannelSetExtended
+RGset_32_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE,extended = TRUE)
+RGset_25_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE,extended = TRUE) 
+
+# Run QCinfo function
+qc_info32 <- QCinfo(RGset_32_extended)
+qc_info25 <- QCinfo(RGset_25_extended)
+
+# Display QC information
+#print(qc_info32)
+#print(qc_info25)
+badCpG = c(qc_info32$badCpG,qc_info25$badCpG)
+# Remove any suffix after an underscore
+cleaned_badCpG <- sub("_.*", "", badCpG)
+```
+
+Normalizing 
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+
+# Run functional normalization
+#funnorm_25 <- preprocessFunnorm(RGset_25, bgCorr = TRUE,dyeCorr = TRUE)
+#funnorm_32 <- preprocessFunnorm(RGset_32, bgCorr = TRUE,dyeCorr = TRUE)
+```
+
+Extracting the beta values from the normalized samples.  I am now running functional normalization as it contains a Noob option
+```{r}
+Betas_25<-getBeta(Noob_25_m)
+Betas_32<-getBeta(Noob_32_m)
+
+#Betas_25<-getBeta(funnorm_25)
+#Betas_32<-getBeta(funnorm_32)
+```
+
+Colapsing the betas so that the data can be merged
+```{r}
+Betas_25<- sesame::betasCollapseToPfx(Betas_25)
+#Betas_32<- sesame::betasCollapseToPfx(Betas_32)
+colnames(Betas_25) = colnames(Noob_25_m)
+```
+
+
+Filter out sex linked probes
+```{r}
+# Extract probes located on the Y chromosome
+cpg_y_probes <- rownames(anno[anno$chr == "chrY", ])  # Filter probes on Y chromosome
+
+# Filter Y chromosome probes from Betas_25
+cpg_y_probes_in_betas_25 <- cpg_y_probes[cpg_y_probes %in% rownames(Betas_25)]
+Betas_25_filtered <- Betas_25[!rownames(Betas_25) %in% cpg_y_probes_in_betas_25, ]
+
+# Filter Y chromosome probes from Betas_32
+cpg_y_probes_in_betas_32 <- cpg_y_probes[cpg_y_probes %in% rownames(Betas_32)]
+Betas_32_filtered <- Betas_32[!rownames(Betas_32) %in% cpg_y_probes_in_betas_32, ]
+
+# Extract probes located on the X chromosome
+cpg_x_probes <- rownames(anno[anno$chr == "chrX", ])
+
+# Filter X chromosome probes from Betas_25
+cpg_x_probes_in_betas_25 <- cpg_x_probes[cpg_x_probes %in% rownames(Betas_25_filtered)]
+Betas_25_filtered <- Betas_25_filtered[!rownames(Betas_25_filtered) %in% cpg_x_probes_in_betas_25, ]
+
+# Filter X chromosome probes from Betas_32
+cpg_x_probes_in_betas_32 <- cpg_x_probes[cpg_x_probes %in% rownames(Betas_32_filtered)]
+Betas_32_filtered <- Betas_32_filtered[!rownames(Betas_32_filtered) %in% cpg_x_probes_in_betas_32, ]
+```
+
+
+Merging the samples 
+```{r}
+# Ensure the same probes exist in both datasets
+common_probes <- intersect(rownames(Betas_25_filtered), rownames(Betas_32_filtered))
+
+# Subset both datasets to include only common probes
+Betas_25_filtered <- Betas_25_filtered[common_probes, ]
+Betas_32_filtered <- Betas_32_filtered[common_probes, ]
+
+# Combine the beta values from both datasets
+DH_CRC_Betas <- cbind(Betas_25_filtered, Betas_32_filtered) 
+
+```
+
+
+Generate M values
+```{r}
+DH_CRC_M_value = BetaValueToMValue(DH_CRC_Betas)
+```
+
+
+Filter out bad CpG's
+```{r}
+# Identify good CpGs
+all_cpgs <- rownames(DH_CRC_M_value)
+good_cpgs <- setdiff(all_cpgs, cleaned_badCpG)
+# Filter the M values to keep only good CpGs
+filtered_DH_CRC_M_value <- DH_CRC_M_value[good_cpgs, ]
+DH_CRC_M_value = filtered_DH_CRC_M_value
+```
+
+
+```{r}
+# Load required libraries
+library(GenomicRanges)
+library(ggplot2)
+
+# Subset M-value matrix and annotation data
+common_probes <- intersect(rownames(DH_CRC_M_value), anno$Name)
+m_matrix_sub <- DH_CRC_M_value[common_probes, ]
+anno_sub <- anno[match(rownames(m_matrix_sub), anno$Name), ]
+
+# Create a GenomicRanges object for probe locations
+gr_anno <- makeGRangesFromDataFrame(
+  df = anno_sub,
+  seqnames.field     = "chr",    # Chromosome information
+  start.field        = "pos",    # Start position (for EPIC arrays, start = end)
+  end.field          = "pos",    # End position
+  strand.field       = "strand", # Strand information
+  keep.extra.columns = TRUE      # Keep additional columns for annotation
+)
+
+# Add a new column 'Mets' to metadata for metastasis grouping
+combined_data$Mets <- combined_data$any_mets  # Already TRUE/FALSE
+
+# Create GenomicRatioSet
+gRatioSet <- makeGenomicRatioSetFromMatrix(
+  mat       = m_matrix_sub,
+  rownames  = rownames(m_matrix_sub),  # Probe IDs
+  pData     = combined_data,           # Metadata
+  array     = "IlluminaHumanMethylationEPIC",
+  annotation = "ilm10b4.hg19",         # Adjust annotation if needed
+  what      = "M"
+)
+
+# Create masks for metastatic vs. non-metastatic samples
+mask_mets <- pData(gRatioSet)$Mets == TRUE
+mask_no_mets <- pData(gRatioSet)$Mets == FALSE
+
+# Subset GenomicRatioSets
+gRatioSet_met <- gRatioSet[, mask_mets]
+gRatioSet_nonmet <- gRatioSet[, mask_no_mets]
+
+# Run compartments analysis for chr22
+comp_chr22_met <- compartments(
+  object     = gRatioSet_met,
+  resolution = 100 * 1000,
+  what       = "OpenSea",  # Could also be "Beta" or "Body", etc.
+  chr        = "chr22",
+  method     = "pearson",
+  keep       = TRUE
+)
+
+comp_chr22_nonmet <- compartments(
+  object     = gRatioSet_nonmet,
+  resolution = 100 * 1000,
+  what       = "OpenSea",
+  chr        = "chr22",
+  method     = "pearson",
+  keep       = TRUE
+)
+
+# Convert to data frames for plotting
+df_comp_met <- as.data.frame(comp_chr22_met)
+df_comp_nonmet <- as.data.frame(comp_chr22_nonmet)
+
+# Add a label for each group
+df_comp_met$group <- "Metastatic"
+df_comp_nonmet$group <- "Non-Metastatic"
+
+# Combine both data frames
+df_combined <- rbind(df_comp_met, df_comp_nonmet)
+
+# Calculate midpoint for bins
+df_combined$mid <- (df_combined$start + df_combined$end) / 2
+
+# Plot compartment eigenvector scores by metastasis status
+ggplot(df_combined, aes(x = mid, y = pc, color = group)) +
+  geom_line() +
+  theme_minimal() +
+  scale_color_manual(values = c("Metastatic" = "red", "Non-Metastatic" = "blue")) +
+  labs(
+    title = "Chromosome 22: Compartment PC1 by Metastasis Status",
+    x = "Genomic Position (chr22)",
+    y = "PC (Eigenvector Score)",
+    color = "Group"
+  )
+
+# Ribbon plot for compartment openness (A/B)
+ggplot(df_combined, aes(x = mid)) +
+  geom_ribbon(
+    aes(
+      ymin = ifelse(pc < 0, pc, 0),
+      ymax = ifelse(pc > 0, pc, 0),
+      fill = compartment
+    ),
+    alpha = 0.4,
+    color = NA
+  ) +
+  facet_wrap(~group, ncol = 1) +
+  theme_minimal() +
+  scale_fill_manual(values = c("closed" = "blue", "open" = "gray")) +
+  labs(
+    title = "Compartment Openness by Metastasis Status",
+    x = "Genomic Position (chr22)",
+    y = "Compartment Score (PC1)"
+  )
+```
+```{r}
+# MSI-relevant chromosome (change this to test other chromosomes)
+msi_chr <- "chr2"  # Example chromosome involved in MSI
+
+# Run compartments analysis for MSI chromosome
+comp_msi_met <- compartments(
+  object     = gRatioSet_met,
+  resolution = 100 * 1000,
+  what       = "OpenSea",  # Could also be "Beta" or "Body", etc.
+  chr        = msi_chr,
+  method     = "pearson",
+  keep       = TRUE
+)
+
+comp_msi_nonmet <- compartments(
+  object     = gRatioSet_nonmet,
+  resolution = 100 * 1000,
+  what       = "OpenSea",
+  chr        = msi_chr,
+  method     = "pearson",
+  keep       = TRUE
+)
+
+# Convert to data frames for plotting
+df_comp_met <- as.data.frame(comp_msi_met)
+df_comp_nonmet <- as.data.frame(comp_msi_nonmet)
+
+# Add a label for each group
+df_comp_met$group <- "Metastatic"
+df_comp_nonmet$group <- "Non-Metastatic"
+
+# Combine both data frames
+df_combined <- rbind(df_comp_met, df_comp_nonmet)
+
+# Calculate midpoint for bins
+df_combined$mid <- (df_combined$start + df_combined$end) / 2
+
+# Plot compartment eigenvector scores by metastasis status
+ggplot(df_combined, aes(x = mid, y = pc, color = group)) +
+  geom_line() +
+  theme_minimal() +
+  scale_color_manual(values = c("Metastatic" = "red", "Non-Metastatic" = "blue")) +
+  labs(
+    title = paste0(msi_chr, ": Compartment PC1 by Metastasis Status"),
+    x = paste0("Genomic Position (", msi_chr, ")"),
+    y = "PC (Eigenvector Score)",
+    color = "Group"
+  )
+
+# Ribbon plot for compartment openness (A/B)
+ggplot(df_combined, aes(x = mid)) +
+  geom_ribbon(
+    aes(
+      ymin = ifelse(pc < 0, pc, 0),
+      ymax = ifelse(pc > 0, pc, 0),
+      fill = compartment
+    ),
+    alpha = 0.4,
+    color = NA
+  ) +
+  facet_wrap(~group, ncol = 1) +
+  theme_minimal() +
+  scale_fill_manual(values = c("closed" = "blue", "open" = "gray")) +
+  labs(
+    title = paste0("Compartment Openness by Metastasis Status (", msi_chr, ")"),
+    x = paste0("Genomic Position (", msi_chr, ")"),
+    y = "Compartment Score (PC1)"
+  )
+
+```
+
+
+```{r}
+# Convert to data frames for plotting
+df_comp_met <- as.data.frame(comp_msi_met)
+df_comp_nonmet <- as.data.frame(comp_msi_nonmet)
+
+# Add a label for each group
+df_comp_met$group <- "Metastatic"
+df_comp_nonmet$group <- "Non-Metastatic"
+
+# Combine both data frames
+df_combined <- rbind(df_comp_met, df_comp_nonmet)
+
+# Calculate midpoint for bins
+df_combined$mid <- (df_combined$start + df_combined$end) / 2
+
+# 3. Add genes of interest
+genes_of_interest <- data.frame(
+  gene = c("MLH1", "MSH2"),  # Gene names
+  chr = c("chr2", "chr2"),   # Change chromosome as needed
+  start = c(48000000, 49000000),  # Example start positions (adjust to real coordinates)
+  end = c(48200000, 49200000)     # Example end positions (adjust to real coordinates)
+)
+
+# Subset genes for the MSI chromosome being analyzed
+genes_highlight <- genes_of_interest[genes_of_interest$chr == msi_chr, ]
+
+# 4. Plot compartment eigenvector scores by metastasis status
+ggplot(df_combined, aes(x = mid, y = pc, color = group)) +
+  geom_line() +
+  geom_rect(
+    data = genes_highlight,
+    aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = "yellow",
+    alpha = 0.2
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("Metastatic" = "red", "Non-Metastatic" = "blue")) +
+  labs(
+    title = paste0(msi_chr, ": Compartment PC1 by Metastasis Status"),
+    x = paste0("Genomic Position (", msi_chr, ")"),
+    y = "PC (Eigenvector Score)",
+    color = "Group"
+  )
+
+# Adjust centromere position for the correct genome build
+centromere_chr2 <- 92450000  # Adjust to 93050000 for GRCh37 if needed
+
+# Recenter the coordinates for the ribbon plot
+df_combined$mid_centered <- df_combined$mid - centromere_chr2
+genes_highlight$start_centered <- genes_highlight$start - centromere_chr2
+genes_highlight$end_centered <- genes_highlight$end - centromere_chr2
+
+# Ribbon plot with centered coordinates
+ggplot(df_combined, aes(x = mid_centered)) +
+  geom_ribbon(
+    aes(
+      ymin = ifelse(pc < 0, pc, 0),
+      ymax = ifelse(pc > 0, pc, 0),
+      fill = compartment
+    ),
+    alpha = 0.4,
+    color = NA
+  ) +
+  geom_rect(
+    data = genes_highlight,
+    aes(xmin = start_centered, xmax = end_centered, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = "darkred",
+    alpha = 0.9
+  ) +
+  facet_wrap(~group, ncol = 1) +
+  theme_minimal() +
+  scale_fill_manual(values = c("closed" = "blue", "open" = "gray")) +
+  scale_x_continuous(
+    labels = scales::comma,  # Format x-axis labels with commas
+    breaks = seq(-100000000, 100000000, by = 25000000)  # Tick intervals
+  ) +
+  labs(
+    title = paste0("Compartment Openness by Metastasis Status (", msi_chr, ")"),
+    x = paste0("Genomic Position Relative to Centromere (", msi_chr, ")"),
+    y = "Compartment Score (PC1)"
+  ) +
+  coord_cartesian(xlim = c(-100000000, 100000000))  # Centered range
+```
+
