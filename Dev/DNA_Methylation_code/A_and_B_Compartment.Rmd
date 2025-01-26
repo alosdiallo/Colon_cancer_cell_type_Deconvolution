@@ -48,11 +48,6 @@ targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.
 targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
 rownames(targets) <- targets$patient
 targets$SampleID<- targets$patient
-
-targets_expanded <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv")
-targets_expanded$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
-rownames(targets_expanded) <- targets_expanded$patient
-targets_expanded$SampleID<- targets_expanded$patient
 ```
 
 ```{r}
@@ -65,12 +60,6 @@ RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_
 
 Looking for bad CpG's using QCinfo
 ```{r}
-sva32<-ctrlsva(RGset_32)
-sva25<-ctrlsva(RGset_25)
-SVA_combined <- rbind(sva25[,1:8], sva32)
-SVA_combined_df <- as.data.frame(SVA_combined)
-
-surrogateVariables <- sva
 # Convert RGChannelSet to RGChannelSetExtended
 RGset_32_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE,extended = TRUE)
 RGset_25_extended <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE,extended = TRUE) 
@@ -171,7 +160,6 @@ filtered_DH_CRC_M_value <- DH_CRC_M_value[good_cpgs, ]
 DH_CRC_M_value = filtered_DH_CRC_M_value
 ```
 
-
 ```{r}
 # Load required libraries
 library(GenomicRanges)
@@ -181,6 +169,14 @@ library(ggplot2)
 common_probes <- intersect(rownames(DH_CRC_M_value), anno$Name)
 m_matrix_sub <- DH_CRC_M_value[common_probes, ]
 anno_sub <- anno[match(rownames(m_matrix_sub), anno$Name), ]
+
+
+# Reorder targets (or combined_data) to match m_matrix_sub
+combined_data <- targets[match(colnames(m_matrix_sub), rownames(targets)), ]
+
+# Ensure alignment
+all(colnames(m_matrix_sub) == rownames(combined_data))
+
 
 # Create a GenomicRanges object for probe locations
 gr_anno <- makeGRangesFromDataFrame(
@@ -278,6 +274,8 @@ ggplot(df_combined, aes(x = mid)) +
     y = "Compartment Score (PC1)"
   )
 ```
+
+
 ```{r}
 # MSI-relevant chromosome (change this to test other chromosomes)
 msi_chr <- "chr2"  # Example chromosome involved in MSI
@@ -434,5 +432,81 @@ ggplot(df_combined, aes(x = mid_centered)) +
     y = "Compartment Score (PC1)"
   ) +
   coord_cartesian(xlim = c(-100000000, 100000000))  # Centered range
+```
+
+Compartments for any chromosome 
+```{r}
+# Define a function to analyze and plot ribbon plots for specified chromosomes
+analyze_and_plot_ribbon <- function(chromosomes, gRatioSet_met, gRatioSet_nonmet, resolution = 100 * 1000, what = "OpenSea", method = "pearson") {
+  # Loop through the list of chromosomes
+  for (chr in chromosomes) {
+    # Run compartments analysis for the specified chromosome
+    comp_met <- compartments(
+      object     = gRatioSet_met,
+      resolution = resolution,
+      what       = what,
+      chr        = chr,
+      method     = method,
+      keep       = TRUE
+    )
+    
+    comp_nonmet <- compartments(
+      object     = gRatioSet_nonmet,
+      resolution = resolution,
+      what       = what,
+      chr        = chr,
+      method     = method,
+      keep       = TRUE
+    )
+    
+    # Convert to data frames for plotting
+    df_comp_met <- as.data.frame(comp_met)
+    df_comp_nonmet <- as.data.frame(comp_nonmet)
+    
+    # Add labels for each group
+    df_comp_met$group <- "Metastatic"
+    df_comp_nonmet$group <- "Non-Metastatic"
+    
+    # Combine both data frames
+    df_combined <- rbind(df_comp_met, df_comp_nonmet)
+    
+    # Calculate midpoint for bins
+    df_combined$mid <- (df_combined$start + df_combined$end) / 2
+    
+    # Generate the ribbon plot
+    print(
+      ggplot(df_combined, aes(x = mid)) +
+        geom_ribbon(
+          aes(
+            ymin = ifelse(pc < 0, pc, 0),
+            ymax = ifelse(pc > 0, pc, 0),
+            fill = compartment
+          ),
+          alpha = 0.4,
+          color = NA
+        ) +
+        facet_wrap(~group, ncol = 1) +
+        theme_minimal() +
+        scale_fill_manual(values = c("closed" = "blue", "open" = "gray")) +
+        labs(
+          title = paste0("Compartment Openness by Metastasis Status (", chr, ")"),
+          x = paste0("Genomic Position (", chr, ")"),
+          y = "Compartment Score (PC1)"
+        )
+    )
+  }
+}
+
+```
+
+
+```{r}
+# Example usage
+chromosomes_to_analyze <- c("chr1", "chr3")  # Specify chromosomes of interest
+analyze_and_plot_ribbon(
+  chromosomes = chromosomes_to_analyze,
+  gRatioSet_met = gRatioSet_met,
+  gRatioSet_nonmet = gRatioSet_nonmet
+)
 ```
 
