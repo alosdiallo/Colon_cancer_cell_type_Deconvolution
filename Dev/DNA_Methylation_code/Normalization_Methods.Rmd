@@ -73,19 +73,6 @@ RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_
 RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
 ```
 
-TCGA Data
-```{r}
-tcga.data <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/TCGA_data.rds")
-tcga.dnam <- tcga.data[["dnam"]]
-tcga.pheno <- tcga.data[["pheno"]]
-tcga.cell <- tcga.data[["cell_types"]]
-msi_dat<-readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/msi_tcga.rds")
-tcga.cell$COAD_Deconv1#$MSS
-tcga.cell$COAD_Deconv2#MASS
-
-tcga_T = t(tcga.dnam)
-```
-
 
 
 Comparing normalization methods
@@ -94,7 +81,7 @@ Comparing normalization methods
 # 1. Preprocessing for RGset_25
 ###############################################################################
 
-# 1A) Preprocessing: raw, SWAN, Quantile, Noob, Funnorm, ENmix, Illumina
+# 1A) Preprocessing: raw, SWAN, Quantile, Noob, Funnorm, ENmix, Illumina, Functional normalization from miffel
 raw_25       <- preprocessRaw(RGset_25)
 swan_25      <- preprocessSWAN(RGset_25, mSet = raw_25)
 quantile_25  <- preprocessQuantile(RGset_25)
@@ -102,6 +89,12 @@ noob_25      <- preprocessNoob(RGset_25)
 funnorm_25   <- preprocessFunnorm(RGset_25, bgCorr = TRUE, dyeCorr = TRUE)
 ENmix_25     <- preprocessENmix(RGset_25)
 illumina_25  <- preprocessIllumina(RGset_25)
+samplesheet_25 <- meffil.create.samplesheet(
+     path = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",
+     recursive = TRUE
+)
+norm_25 <- meffil.normalize.dataset(samplesheet = samplesheet_25)
+#minfi::preprocessRaw(norm_25$beta)
 
 # 1B) Convert to GenomicMethylSet or GenomicRatioSet so we can use addSex/plotSex
 raw_25_genomic       <- addSex(mapToGenome(raw_25))
@@ -124,6 +117,11 @@ noob_32      <- preprocessNoob(RGset_32)
 funnorm_32   <- preprocessFunnorm(RGset_32, bgCorr = TRUE, dyeCorr = TRUE)
 ENmix_32     <- preprocessENmix(RGset_32)
 illumina_32  <- preprocessIllumina(RGset_32)
+samplesheet_32 <- meffil.create.samplesheet(
+     path = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",
+     recursive = TRUE
+)
+norm_32 <- meffil.normalize.dataset(samplesheet = samplesheet_32)
 
 # 2B) Convert for plotSex()
 raw_32_genomic       <- addSex(mapToGenome(raw_32))
