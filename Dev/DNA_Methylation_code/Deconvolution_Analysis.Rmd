@@ -48,6 +48,12 @@ targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
 rownames(targets) <- targets$patient
 targets$SampleID<- targets$patient
 
+targets_expanded <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv")
+targets_expanded$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets_expanded) <- targets_expanded$patient
+targets_expanded$SampleID<- targets_expanded$patient
+targets = targets_expanded
+
 
 # Convert relevant columns in `targets` to factors
 targets <- targets %>%
@@ -159,13 +165,76 @@ combined_data <- combined_data %>%
   )
 ```
 
+Stacked Barplots:
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)  # for percent_format()
+
+# Define your cell-type variables (matching columns in combined_data).
+cell_type_vars <- c("Tumor", "Endothelial", 
+                        "Epithelial", "Stromal", "Bnv", "Bmem", 
+                        "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", 
+                        "Mono", "DC", "NK", "Bas", "Eos", "Neu")
+
+# Recode any_mets so that "FALSE" = "No Mets", "TRUE" = "Mets" (if not already done)
+combined_data$any_mets <- factor(combined_data$any_mets,
+                                 levels = c("No Mets", "Mets"))
+# Alternatively:
+# combined_data$any_mets <- factor(combined_data$any_mets,
+#                                  levels = c("FALSE","TRUE"),
+#                                  labels = c("No Mets","Mets"))
+
+# 1) Reshape data to long format
+df_long <- combined_data %>%
+  select(SampleID, any_mets, all_of(cell_type_vars)) %>%
+  pivot_longer(cols = cell_type_vars,
+               names_to = "CellType",
+               values_to = "Proportion")
+
+# 2) Separate the data into No Metastasis vs. Metastasis
+df_no_mets <- df_long %>% filter(any_mets == "No Mets")
+df_mets    <- df_long %>% filter(any_mets == "Mets")
+
+my_14_colors <- c(
+  "#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3",
+  "#A6D854", "#FFD92F", "#E5C494", "#B3B3B3",
+  "#1F78B4", "#33A02C", "#FB9A99", "#FDBF6F",
+  "#CAB2D6", "#6A3D9A","#E31A1C","#B15928","#C51B8A"
+)
+
+# 3) Plot for No Metastasis
+ggplot(df_no_mets, aes(x = SampleID, y = Proportion, fill = CellType)) +
+  geom_bar(stat = "identity", position = "fill") + 
+  scale_fill_manual(values = my_14_colors) +
+  scale_y_continuous(labels = percent_format()) +  # display y-axis in percentages
+  labs(x = "Sample ID", 
+       y = "Cell Type Proportion (%)", 
+       title = "Cell Type Proportions: No Metastasis") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) + 
+  theme_minimal()
+
+# 4) Plot for Metastasis
+ggplot(df_mets, aes(x = SampleID, y = Proportion, fill = CellType)) +
+  geom_bar(stat = "identity", position = "fill") + 
+  scale_fill_manual(values = my_14_colors) + 
+  scale_y_continuous(labels = percent_format()) + 
+  labs(x = "Sample ID", 
+       y = "Cell Type Proportion (%)", 
+       title = "Cell Type Proportions: Metastasis") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  theme_minimal()
+```
+
 
 ```{r}
 # ----- 2. Reshape your data for plotting -----
 # Define my relevant cell-type columns based on the HiTIMED paper:
-cell_types <- c(
-  "Tumor","Endothelial","Epithelial","Stromal","Bnv","Bmem","CD4nv","CD4mem",
-  "Treg","CD8nv","CD8mem","Mono","DC","NK","Bas","Eos","Neu","Fib"
+cell_types <- c("Tumor", "Endothelial", 
+                        "Epithelial", "Stromal", "Bnv", "Bmem", 
+                        "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", 
+                        "Mono", "DC", "NK", "Bas", "Eos", "Neu","Fib"
 )
 
 long_data <- combined_data %>%
@@ -753,5 +822,60 @@ ggplot(long_ratios, aes(x = no_mets_vs_ln, y = ratio_value, fill = no_mets_vs_ln
     y     = "Ratio Value"
   ) +
   theme_bw()
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# Assuming 'CD8mem' is your column for CD8 proportions
+# and 'mets_cat' has levels: "No Metastasis", "LN Metastasis", "Distant Metastasis"
+# Also assuming 'MLH1' has exactly two levels: "MLH1 Negative", "MLH1 Positive"
+
+p_MLH1_pos <- combined_data %>%
+  filter(MLH1 == "MLH1 Positive") %>%
+  ggplot(aes(x = mets_cat, y = Epithelial)) +
+  geom_boxplot(fill = "#66C2A5") +
+  labs(
+    title = "Epithelial Proportions: MLH1 Positive",
+    x = "Metastasis Category",
+    y = "Epithelial Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_MLH1_neg <- combined_data %>%
+  filter(MLH1 == "MLH1 Negative") %>%
+  ggplot(aes(x = mets_cat, y = Epithelial)) +
+  geom_boxplot(fill = "#FC8D62") +
+  labs(
+    title = "Epithelial Proportions: MLH1 Negative",
+    x = "Metastasis Category",
+    y = "Epithelial Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display both plots side by side
+p_MLH1_pos + p_MLH1_neg
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# One box plot showing Fib proportions for all MLH1 statuses
+# across your three metastasis categories.
+p_fib_all <- combined_data %>%
+  ggplot(aes(x = mets_cat, y = Tumor)) +
+  geom_boxplot(fill = "#66C2A5") +
+  labs(
+    title = "Tumor Proportions (All MLH1 Statuses)",
+    x = "Metastasis Category",
+    y = "Tumor Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_fib_all
 ```
 

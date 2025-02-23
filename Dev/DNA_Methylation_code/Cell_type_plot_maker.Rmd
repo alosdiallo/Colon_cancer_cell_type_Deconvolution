@@ -1,0 +1,268 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+###############################################################################
+# 0) Load necessary packages
+###############################################################################
+library(minfi)
+library(sesame)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+library(sva)
+library(ENmix)
+library(DataExplorer)
+library(tidyr)
+library(EpiDISH)
+library(tibble)
+library(vegan)
+library(rstatix)
+
+###############################################################################
+# 1) Load metadata (targets) & factorize relevant columns
+###############################################################################
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID, targets$Sentrix_Position, sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID <- targets$patient
+
+# Convert relevant columns in `targets` to factors
+targets <- targets %>%
+  mutate(
+    MLH1         = factor(MLH1, levels = c(0, 1), labels = c("MLH1 Negative", "MLH1 Positive")),
+    MSH2         = factor(MSH2),
+    sex          = factor(sex, levels = c("M", "F")),
+    Distant_Mets = factor(Distant_Mets, levels = c(FALSE, TRUE), labels = c("No Distant Mets", "Distant Mets")),
+    any_mets     = factor(any_mets, levels = c(FALSE, TRUE), labels = c("No Mets", "Mets")),
+    ln_only      = factor(ln_only, levels = c(FALSE, TRUE), labels = c("No LN Mets", "LN Mets"))
+  )
+
+###############################################################################
+# 2) Read IDATs & preprocess
+###############################################################################
+RGset_32 <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/", recursive = TRUE) 
+RGset_25 <- read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/", recursive = TRUE) 
+
+# Normalize with preprocessNoob
+Noob_25_m <- preprocessNoob(RGset_25)
+Noob_32_m <- preprocessNoob(RGset_32)
+
+# Extract Beta values
+Betas_25 <- getBeta(Noob_25_m)
+Betas_32 <- getBeta(Noob_32_m)
+
+# Optional: collapse probe names if needed
+Betas_25 <- sesame::betasCollapseToPfx(Betas_25)
+# Betas_32 <- sesame::betasCollapseToPfx(Betas_32)  # if desired
+
+# Merge Beta matrices
+colnames(Betas_25) <- colnames(Noob_25_m)
+DH_CRC_Betas <- merge(Betas_25, Betas_32, by = "row.names")
+rownames(DH_CRC_Betas) <- DH_CRC_Betas$Row.names
+DH_CRC_Betas <- DH_CRC_Betas[, -1]  # remove the Row.names column
+```
+
+```{r}
+###############################################################################
+# 3) EpiDISH (EpiScore) to get Fibroblast proportions
+#    (Assumes DH_CRC_Betas and targets are already loaded from previous steps.)
+###############################################################################
+ref_matrix <- centEpiFibIC.m  # from EpiDISH
+epidish_results <- epidish(
+  beta.m = DH_CRC_Betas, 
+  ref.m  = ref_matrix, 
+  method = "RPC"
+)
+
+cell_type_proportions_df <- as.data.frame(epidish_results$estF) * 100  # scale to %
+cell_type_proportions_df$SampleID <- rownames(cell_type_proportions_df)
+# Now we have "Fib" (the fibroblast proportion) + "SampleID"
+
+###############################################################################
+# 4) Run multiple levels of HiTIMED & combine columns
+###############################################################################
+run_hitimed_levels <- function(
+  beta_matrix,
+  levels_vec   = c(1:6),  # You can pick whatever set of levels you want
+  cancer_type  = "COAD",
+  sample_type  = "tumor"
+) {
+  results_list <- list()
+  
+  for (lvl in levels_vec) {
+    message("Running HiTIMED for level = ", lvl, " ...")
+    # HiTIMED_deconvolution returns a matrix with rownames = sample IDs
+    res_mat <- HiTIMED_deconvolution(
+      beta_matrix, 
+      cancer_type,
+      lvl,
+      sample_type
+    )
+    
+    # Convert to a data.frame & move row names to a 'SampleID' column
+    res_df <- as.data.frame(res_mat)
+    res_df$SampleID <- rownames(res_df)
+    rownames(res_df) <- NULL
+    
+    # Append suffix "_levelX" to each cell-type column
+    old_cols <- colnames(res_df)
+    for (col_nm in old_cols) {
+      if (col_nm != "SampleID") {
+        new_nm <- paste0(col_nm, "_level", lvl)
+        colnames(res_df)[colnames(res_df) == col_nm] <- new_nm
+      }
+    }
+    
+    results_list[[paste0("lvl", lvl)]] <- res_df
+  }
+  
+  # Merge them all together by "SampleID"
+  merged_df <- results_list[[1]]
+  if (length(results_list) > 1) {
+    for (nm in names(results_list)[-1]) {
+      merged_df <- merged_df %>%
+        left_join(results_list[[nm]], by = "SampleID")
+    }
+  }
+  
+  return(merged_df)
+}
+
+# Actually run multiple-level HiTIMED
+multi_level_hitimed <- run_hitimed_levels(
+  beta_matrix = DH_CRC_Betas,
+  levels_vec  = c(1:6),    # or c(3,4,5,6,7,8), etc.
+  cancer_type = "COAD",
+  sample_type = "tumor"
+)
+
+###############################################################################
+# 5) Merge (HiTIMED multi-level) + (EpiScore fibroblasts) + (sample metadata)
+###############################################################################
+# First, rename the factor levels of any_mets so it shows "No Metastasis" vs "Metastasis"
+targets <- targets %>%
+  mutate(
+    any_mets = recode(any_mets,
+                      "No Mets" = "No Metastasis",
+                      "Mets"    = "Metastasis")
+  )
+
+combined_data <- multi_level_hitimed %>%
+  left_join(cell_type_proportions_df %>% select(SampleID, Fib), by = "SampleID") %>%
+  left_join(targets, by = "SampleID")
+
+###############################################################################
+# 6) Define a flexible plotting function
+###############################################################################
+plot_cell_proportions_flex <- function(
+    data,
+    cell_type_cols,                # e.g. c("Tumor_level2","Endothelial_level2","Fib") 
+    group_var   = "any_mets",      # x-axis grouping
+    fill_var    = group_var,       # fill color grouping (often same)
+    subset_expr = NULL,            # optional subsetting, e.g. "MLH1 == 'MLH1 Positive'"
+    scales      = "free_y",
+    plot_title  = "Cell Type Proportions",
+    x_label     = NULL,
+    y_label     = "Proportion"
+) {
+  if (is.null(x_label)) x_label <- group_var
+  
+  # Optionally subset the data
+  if (!is.null(subset_expr)) {
+    data <- data %>% filter(eval(parse(text = subset_expr)))
+  }
+  
+  # Pivot the specified cell-type columns to long format
+  data_long <- data %>%
+    pivot_longer(
+      cols = all_of(cell_type_cols),
+      names_to = "cell_type",
+      values_to = "proportion"
+    )
+  
+  # Make the plot
+  p <- ggplot(data_long, aes_string(x = group_var, y = "proportion", fill = fill_var)) +
+    geom_boxplot() +
+    labs(
+      title = plot_title,
+      x     = x_label,
+      y     = y_label,
+      fill  = fill_var
+    ) +
+    theme_bw() +
+    theme(
+      # Optionally rotate x-axis labels if you have many cell types
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  
+  # We'll facet by cell_type only (one row per cell_type).
+  # If you prefer multi-row layout, you can do facet_wrap(~ cell_type, scales="free_y").
+  p <- p + facet_wrap(~ cell_type, scales = scales)
+  
+  return(p)
+}
+
+###############################################################################
+# 7) Loop over each HiTIMED level; produce two sets of plots:
+#    1) MLH1+ only
+#    2) MLH1- only
+#    grouping & fill by "any_mets"
+###############################################################################
+levels_of_interest <- c(1:6)  # same as above or could define again
+for (lvl in levels_of_interest) {
+  
+  # Identify the columns for this level (those ending with _levelX)
+  lvl_pattern <- paste0("_level", lvl, "$")
+  lvl_cols <- grep(lvl_pattern, colnames(combined_data), value = TRUE)
+  
+  # Add "Fib" from EpiScore
+  cell_cols <- c(lvl_cols, "Fib")
+  
+  # Plot (A) MLH1+ only
+  p_MLH1pos <- plot_cell_proportions_flex(
+    data           = combined_data,
+    cell_type_cols = cell_cols,
+    group_var      = "any_mets",
+    fill_var       = "any_mets",
+    subset_expr    = "MLH1 == 'MLH1 Positive'",
+    plot_title     = paste0("HiTIMED level ", lvl, " + Fib (MLH1+ only)")
+  )
+  print(p_MLH1pos)
+  
+  # Plot (B) MLH1- only
+  p_MLH1neg <- plot_cell_proportions_flex(
+    data           = combined_data,
+    cell_type_cols = cell_cols,
+    group_var      = "any_mets",
+    fill_var       = "any_mets",
+    subset_expr    = "MLH1 == 'MLH1 Negative'",
+    plot_title     = paste0("HiTIMED level ", lvl, " + Fib (MLH1- only)")
+  )
+  print(p_MLH1neg)
+  
+  # If you also want an ALL (both MLH1 statuses), you could do a third call
+  # without the subset_expr. But if it's "unreadable," you can skip it.
+}
+
+###############################################################################
+# Done!
+# This code:
+#  - Runs EpiDISH for fibroblasts
+#  - Runs HiTIMED across levels 2..8
+#  - Merges everything
+#  - Recodes "any_mets" to "No Metastasis"/"Metastasis"
+#  - Generates separate plots for MLH1+ vs. MLH1- for each level
+###############################################################################
+```
+

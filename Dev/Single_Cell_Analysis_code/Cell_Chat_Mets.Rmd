@@ -50,14 +50,14 @@ options(future.globals.maxSize = 600 * 1024^2)
 
 
 ```{r}
-combinded_data <- readRDS(file = "/Users/adiallo/Desktop/Thesis/Data_Documents/Single_cell_samples/Single Cell/combined_data.rds")
+combinded_data <- readRDS(file = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Single_cell/Single_cell_samples/Single Cell/combined_data.rds")
 ```
 
 
 ```{r}
 
 # Load the Seurat object from an RDS file
-atlas <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/Visium_Data/data/atlas_data.rds")
+atlas <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/atlas_data.rds")
 
 # Normalize the atlas data using LogNormalize
 atlas <- NormalizeData(atlas, normalization.method = "LogNormalize", scale.factor = 10000)
@@ -194,7 +194,7 @@ non_mets_data.input <- non_metastatic_data[["RNA"]]$data
 
 ```
 
-
+Non of this code block works and breaks the code
 ```{r}
 # Convert the labels to a factor (if not already)
 mets_meta$labels <- as.factor(mets_meta$labels)
@@ -217,21 +217,13 @@ mets_meta <- mets_meta[mets_meta$labels %in% valid_labels, , drop = FALSE]  # Ke
 # Drop unused levels
 mets_meta$labels <- droplevels(mets_meta$labels)
 
-# Re-create the CellChat object if necessary
-cellchat_mets <- createCellChat(object = metastatic_data, meta = mets_meta, group.by = "labels")
 
-
-# Compute communication probabilities using triMean
-cellchat_mets <- computeCommunProb(cellchat_mets, type = "triMean")
-
-nonmets_meta$labels = droplevels(factor(nonmets_meta$labels), exclude = setdiff(levels(factor(nonmets_meta$labels),unique(nonmets_meta$labels))))
-
-cellchat_mets <- computeCommunProb(cellchat_mets, type = "triMean")
-cellchat_non_Mets <- computeCommunProb(cellchat_non_Mets, type = "triMean") 
 ```
 
 
 ```{r}
+cellchat_mets = NULL
+cellchat_non_Mets = NULL
 # Create CellChat object
 cellchat_mets <- createCellChat(object = mets_data.input, meta = mets_meta, group.by = "labels")
 # Create CellChat object
@@ -243,7 +235,7 @@ CellChatDB <- CellChatDB.human
 
 ```{r}
 # use a subset of CellChatDB for cell-cell communication analysis
-CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") # use Secreted Signaling
+CellChatDB.use <- subsetDB(CellChatDB, search = "Cell-Cell Contact", key = "annotation") # use Secreted Signaling
 
 # Only uses the Secreted Signaling from CellChatDB v1
 #  CellChatDB.use <- subsetDB(CellChatDB, search = list(c("Secreted Signaling"), c("CellChatDB v1")), key = c("annotation", "version"))
@@ -263,6 +255,7 @@ cellchat_non_Mets@DB <- CellChatDB.use
 
 
 ```{r}
+options(future.globals.maxSize = 4000 * 1024^2)
 #devtools::install_github("immunogenomics/presto")
 #Needs presto package
 # subset the expression data of signaling genes for saving computation cost
@@ -282,4 +275,60 @@ cellchat_non_Mets <- identifyOverExpressedInteractions(cellchat_non_Mets)
 #cellchat <- CellChat::projectData(cellchat, PPI.human)
 ```
 
+
+```{r}
+cellchat_mets <- computeCommunProb(cellchat_mets, type = "triMean")
+cellchat_non_Mets <- computeCommunProb(cellchat_non_Mets, type = "triMean")
+```
+Filter out cells
+```{r}
+cellchat_mets <- filterCommunication(cellchat_mets, min.cells = 3)
+cellchat_non_Mets <- filterCommunication(cellchat_non_Mets, min.cells = 10)
+```
+
+
+```{r}
+cellchat_mets <- computeCommunProbPathway(cellchat_mets)
+cellchat_non_Mets <- computeCommunProbPathway(cellchat_non_Mets)
+```
+
+
+```{r}
+cellchat_mets <- aggregateNet(cellchat_mets)
+cellchat_non_Mets <- aggregateNet(cellchat_non_Mets)
+```
+
+```{r}
+groupSize <- as.numeric(table(cellchat_mets@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat_mets@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cellchat_mets@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+```
+```{r}
+mat <- cellchat_mets@net$weight
+par(mfrow = c(3,4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+```
+```{r}
+pathways.show <- c("DESMOSOME") 
+# Hierarchy plot
+# Here we define `vertex.receive` so that the left portion of the hierarchy plot shows signaling to fibroblast and the right portion shows signaling to immune cells 
+vertex.receiver = seq(1,4) # a numeric vector. 
+netVisual_aggregate(cellchat_non_Mets, signaling = pathways.show,  vertex.receiver = vertex.receiver)
+# Circle plot
+par(mfrow=c(1,2))
+netVisual_aggregate(cellchat_non_Mets, signaling = pathways.show, layout = "circle")
+
+netVisual_aggregate(cellchat_mets, signaling = pathways.show, layout = "circle")
+
+
+```
+```{r}
+cellchat_mets@dr$umap <- Embeddings(metastatic_data, "umap")
+cellchat_non_Mets@dr$umap <- Embeddings(non_metastatic_data, "umap")
+```
 
