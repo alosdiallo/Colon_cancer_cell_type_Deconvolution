@@ -823,10 +823,16 @@ ggplot(long_ratios, aes(x = no_mets_vs_ln, y = ratio_value, fill = no_mets_vs_ln
   ) +
   theme_bw()
 ```
+
+
 ```{r}
 library(ggplot2)
 library(dplyr)
 library(patchwork)
+combined_data <- combined_data %>%
+  mutate(
+    cd8_total   =  (CD8nv + CD8mem)
+  )
 
 # Assuming 'CD8mem' is your column for CD8 proportions
 # and 'mets_cat' has levels: "No Metastasis", "LN Metastasis", "Distant Metastasis"
@@ -834,24 +840,24 @@ library(patchwork)
 
 p_MLH1_pos <- combined_data %>%
   filter(MLH1 == "MLH1 Positive") %>%
-  ggplot(aes(x = mets_cat, y = Epithelial)) +
+  ggplot(aes(x = mets_cat, y = Tumor)) +
   geom_boxplot(fill = "#66C2A5") +
   labs(
-    title = "Epithelial Proportions: MLH1 Positive",
+    title = "Tumor Proportions: MLH1 Positive",
     x = "Metastasis Category",
-    y = "Epithelial Proportion"
+    y = "Tumor Proportion"
   ) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
 p_MLH1_neg <- combined_data %>%
   filter(MLH1 == "MLH1 Negative") %>%
-  ggplot(aes(x = mets_cat, y = Epithelial)) +
+  ggplot(aes(x = mets_cat, y = Tumor)) +
   geom_boxplot(fill = "#FC8D62") +
   labs(
-    title = "Epithelial Proportions: MLH1 Negative",
+    title = "Tumor Proportions: MLH1 Negative",
     x = "Metastasis Category",
-    y = "Epithelial Proportion"
+    y = "Tumor Proportion"
   ) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
@@ -859,6 +865,7 @@ p_MLH1_neg <- combined_data %>%
 # Display both plots side by side
 p_MLH1_pos + p_MLH1_neg
 ```
+
 ```{r}
 library(ggplot2)
 library(dplyr)
