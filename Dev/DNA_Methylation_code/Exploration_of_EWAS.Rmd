@@ -10,12 +10,17 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 # =========================================================================
+
 # EWAS - COAD DH Dataset
+
 # Code by: Alos Diallo
+
 # 2023,2024
+
 # =========================================================================
 
 Loading libraries:
+
 ```{r message=FALSE, warning=FALSE, include=FALSE}
 library(minfi)
 library(sesame)
@@ -43,6 +48,7 @@ library(methylGSA)
 ```
 
 Loading the annotation file:
+
 ```{r}
 data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
 anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
@@ -53,6 +59,7 @@ manifest <- getManifest(IlluminaHumanMethylationEPICmanifest)
 ```
 
 Loading the data and metadata information
+
 ```{r}
 targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
 targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
@@ -73,8 +80,8 @@ RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_
 RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
 ```
 
-
 Looking for bad CpG's using QCinfo
+
 ```{r}
 sva32<-ctrlsva(RGset_32)
 sva25<-ctrlsva(RGset_25)
@@ -98,26 +105,29 @@ badCpG = c(qc_info32$badCpG,qc_info25$badCpG)
 cleaned_badCpG <- sub("_.*", "", badCpG)
 ```
 
+Normalizing
 
-Normalizing 
 ```{r}
 Noob_25_m = preprocessNoob(RGset_25)
 Noob_32_m = preprocessNoob(RGset_32)
 ```
 
-Extracting the beta values from the normalized samples.  I am now running functional normalization as it contains a Noob option
+Extracting the beta values from the normalized samples. I am now running functional normalization as it contains a Noob option
+
 ```{r}
 Betas_25<-getBeta(Noob_25_m)
 Betas_32<-getBeta(Noob_32_m)
 ```
 
 Colapsing the betas so that the data can be merged
+
 ```{r}
 Betas_25<- sesame::betasCollapseToPfx(Betas_25)
 colnames(Betas_25) = colnames(Noob_25_m)
 ```
 
 Filter out sex linked probes
+
 ```{r}
 # Extract probes located on the Y chromosome
 cpg_y_probes <- rownames(anno[anno$chr == "chrY", ])  # Filter probes on Y chromosome
@@ -142,8 +152,8 @@ cpg_x_probes_in_betas_32 <- cpg_x_probes[cpg_x_probes %in% rownames(Betas_32_fil
 Betas_32_filtered <- Betas_32_filtered[!rownames(Betas_32_filtered) %in% cpg_x_probes_in_betas_32, ]
 ```
 
+Merging the samples
 
-Merging the samples 
 ```{r}
 # Ensure the same probes exist in both datasets
 common_probes <- intersect(rownames(Betas_25_filtered), rownames(Betas_32_filtered))
@@ -157,13 +167,14 @@ DH_CRC_Betas <- cbind(Betas_25_filtered, Betas_32_filtered)
 
 ```
 
-
 Running HiTIMED to generate cell type proportions
+
 ```{r}
 HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",6,"tumor")
 ```
 
 Running EpiDISH to obtain fibroblast proportions
+
 ```{r}
 # Define the beta matrix and reference matrix
 beta_matrix <- DH_CRC_Betas  # Your dataset
@@ -186,6 +197,7 @@ head(cell_type_proportions_df)
 ```
 
 Examining Variance and limiting the dataset size
+
 ```{r}
 # Assuming beta_matrix is a dataframe or matrix where rows are CpG sites and columns are samples
 
@@ -230,13 +242,14 @@ low_variance_indices <- variances <= threshold
 
 ```
 
-
 Generate M values
+
 ```{r}
 DH_CRC_M_value = BetaValueToMValue(DH_CRC_Betas)
 ```
 
 Filter out bad CpG's
+
 ```{r}
 # Identify good CpGs
 all_cpgs <- rownames(DH_CRC_M_value)
@@ -392,40 +405,118 @@ print(volcano_plot)
 
 
 ```
-GO and Pathway analysis for adjusted model.
+
+GO and Pathway analysis for adjusted model. Hallmarks of Cancer
+
 ```{r}
+# 1) Order CpG sites by p-value (smallest to largest)
+top_100_cpg <- adjusted_results %>%
+  arrange(P.Value) %>%   # Sort by p-value (ascending)
+  head(2000)              # Keep the top 100 CpG sites
+
+# 2) Extract CpG site names and p-values
+cpg_sites <- rownames(top_100_cpg)      # Get the CpG site names
+p_values  <- top_100_cpg$P.Value        # Get corresponding p-values
+
+# 2.5) Create a named vector for methylGSA
+cpg_pval <- setNames(p_values, cpg_sites)
+
+library(dplyr)
+
+h_gene_sets_df = msigdbr(species = "human", category = "H")
+
+# If your methylation annotation uses gene SYMBOL:
+hallmark_symbol_list <- h_gene_sets_df %>%
+  group_by(gs_name) %>%
+  summarize(genes = list(unique(gene_symbol)), .groups = "drop") %>%
+  # Convert to a named list
+  pull(genes) %>%
+  setNames(h_gene_sets_df %>% distinct(gs_name) %>% pull(gs_name))
+
+# If your methylation annotation uses ENTREZ IDs:
+
+hallmark_entrez_list <- h_gene_sets_df %>%
+  group_by(gs_name) %>%
+  summarize(genes = list(unique(as.character(entrez_gene))), .groups = "drop") %>%
+  pull(genes) %>%
+  setNames(unique(h_gene_sets_df$gs_name))
+
+library(methylGSA)
+hallmark_results_methylGSA <- methylglm(
+  cpg.pval  = cpg_pval,
+  array.type = "EPIC",             # or "450K"
+  group      = "all",              # or "body"/"promoter1"/"promoter2"
+  GS.list    = hallmark_entrez_list,  # <--- your custom list here
+  GS.idtype  = "ENTREZID",            # must match how your hallmark list is stored
+  minsize    = 100,
+  maxsize    = 500,
+  parallel   = FALSE
+  # Notice: we do NOT use GS.type here.
+)
+
+head(hallmark_results_methylGSA)
+library(ggplot2)
+library(dplyr)
+
+# Select the top 5 significant terms (sorted by p-value)
+top_terms <- hallmark_results_methylGSA %>%
+  arrange(pvalue) %>%
+  head(15)
+
+# Convert ID to factor with ordered levels for proper sorting
+top_terms$ID <- factor(top_terms$ID, levels = rev(top_terms$ID))
+
+# Create a ggplot barplot
+ggplot(top_terms, aes(x = ID, y = Size, fill = pvalue)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient(low = "blue", high = "red") +  # Color by p-value (red = more significant)
+  coord_flip() +  # Flip for Enrichr-style horizontal bars
+  labs(x = "", y = "Size", title = "Top 5 Enriched Hallmark Pathways (methylGSA)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold"))
+
+
+head(hallmark_results_methylGSA, n =20)
+```
+
+```{r}
+
 # -----------------------------
 # GSEA for the Adjusted Results
 # -----------------------------
 
-# 1) Extract CpG sites and p-values from the rownames and columns
+# # 1) Extract CpG sites and p-values from the rownames and columns
 cpg_sites <- rownames(adjusted_results)     # row names of adjusted_results
 p_values  <- adjusted_results$P.Value       # the raw p-values (or adjusted if you wish)
-
-# 2) Create a named vector for methylGSA
+# 
+# # 2) Create a named vector for methylGSA
 cpg_pval <- setNames(p_values, cpg_sites)
+# 
 
-# 3) Run methylGSA (Gene Ontology as an example)
-go_results_methylGSA <- methylglm(
-  cpg.pval  = cpg_pval,
-  array.type = "EPIC",   # or "450K" if your data is from 450K
-  group = "all",
-  GS.type = "GO",        # Choose "GO", "KEGG", or "Reactome"
-  minsize = 100,
-  maxsize = 500,
-  parallel = FALSE
-)
-
-# Check the top results
-head(go_results_methylGSA)
-
-# Optionally display top 10 terms as a nice table
-library(kableExtra)
-go_results_methylGSA %>%
-  arrange(pvalue) %>%
-  head(20) %>%
-  kable(caption = "Top Enriched GO Terms (Adjusted Model)") %>%
-  kable_styling(full_width = FALSE)
+#Don't use this as the DB is not really helpful here.
+# # 3) Run methylGSA (Gene Ontology as an example)
+# go_results_methylGSA <- methylglm(
+#   cpg.pval  = cpg_pval,
+#   array.type = "EPIC",   # or "450K" if your data is from 450K
+#   group = "all",
+#   GS.type = "GO",        # Choose "GO", "KEGG", or "Reactome"
+#   minsize = 100,
+#   maxsize = 500,
+#   parallel = FALSE
+# )
+# 
+# # Check the top results
+# head(go_results_methylGSA)
+# 
+# # Optionally display top 10 terms as a nice table
+# library(kableExtra)
+# go_results_methylGSA %>%
+#   arrange(pvalue) %>%
+#   head(20) %>%
+#   kable(caption = "Top Enriched GO Terms (Adjusted Model)") %>%
+#   kable_styling(full_width = FALSE)
 
 # ----------------------------------------
 # GSEA for the Adjusted Results (KEGG)
@@ -446,8 +537,6 @@ kegg_results_methylGSA %>%
   kable(caption = "Top Enriched KEGG Pathways (Adjusted Model)") %>%
   kable_styling(full_width = FALSE)
 ```
-
-
 
 ```{r}
 #########################################
@@ -550,6 +639,7 @@ manhattan(
 ```
 
 Volcano plot using the same data:
+
 ```{r}
 library(EnhancedVolcano)
 
@@ -575,6 +665,7 @@ EnhancedVolcano(manhattan_data,
     col = c("gray", "blue", "red", "green")
 )
 ```
+
 ```{r}
 ##############################
 # 0) Load Required Libraries
@@ -657,7 +748,6 @@ hypo_top20 %>%
   kable("html", caption = "Top 20 Hypo-Methylated CpGs (by p-value)") %>%
   kable_styling(full_width = FALSE)
 ```
-
 
 ```{r}
 ###############################################################
@@ -896,8 +986,8 @@ Heatmap(heatmap_mat,
         column_labels = paste("Model", 1:ncol(heatmap_mat)))
 ```
 
+Here I am generating lists based on the top 20 hyper and hypo methylated GpG's for a given EWAS condition
 
-Here I am generating lists based on the top 20 hyper and hypo methylated GpG's for a given EWAS condition 
 ```{r}
 # Step 1: Prepare Combined Data
 HiTIMED_result$SampleID <- rownames(HiTIMED_result)
@@ -1030,9 +1120,8 @@ kable(top_hyper_unadjusted[, c("probe", "logFC", "P.Value", "Gene")], caption = 
 kable(top_hypo_unadjusted[, c("probe", "logFC", "P.Value", "Gene")], caption = "Top 20 Hypo-Methylated CpGs (Unadjusted Model)")
 ```
 
+Now I want to perform GSEA on the data to investigate it further.
 
-
-Now I want to perform GSEA on the data to investigate it further. 
 ```{r}
 # Ensure that probe names and p-values are properly extracted
 cpg_sites <- adjusted_results$probe  # Extract CpG probe IDs
@@ -1086,8 +1175,8 @@ kegg_results_methylGSA %>%
   kable_styling(full_width = FALSE)
 ```
 
-
 Looking at contrasts:
+
 ```{r}
 # Load required packages
 library(dplyr)
@@ -1226,8 +1315,6 @@ volcano_plot <- volcano_plot +
 print(volcano_plot)
 ```
 
-
-
 ```{r}
 library(dplyr)
 library(ggplot2)
@@ -1273,7 +1360,6 @@ volcano_plot <- volcano_plot +
 
 print(volcano_plot)
 ```
-
 
 ```{r}
 # --------------------------
@@ -1347,7 +1433,6 @@ go_results_table %>%
 
 ```
 
-
 ```{r}
 # --------------------------
 # For the MLH1 = 0 contrast:
@@ -1405,15 +1490,18 @@ kegg_results_MLH1_1 %>%
   kable(caption = "Top Enriched KEGG Pathways for MLH1 = 1") %>%
   kable_styling(full_width = FALSE)
 ```
+
 # manhattan plot
+
 # 
-#   
-#  
-#   
-#   
 
+# 
 
+# 
 
+# 
+
+# 
 
 Trying to run bumpbunter
 
@@ -1503,8 +1591,6 @@ cat("Significant DMRs (FWER < 0.05) in MLH1 = 0 group:", nrow(sig_DMRs_MLH1_0), 
 cat("Significant DMRs (FWER < 0.05) in MLH1 = 1 group:", nrow(sig_DMRs_MLH1_1), "\n")
 ```
 
-
-
 ```{r}
 # Minimal test with a subset of 1000 probes
 test_probes <- rownames(DH_CRC_M_value_filtered)[1:1000]
@@ -1527,7 +1613,6 @@ grset_test <- makeGenomicRatioSetFromMatrix(
 
 print(grset_test)
 ```
-
 
 VIF work:
 
@@ -1606,6 +1691,7 @@ vif_table <- data.frame(
 library(knitr)
 kable(vif_table, caption = "Average VIF Values for Model Covariates")
 ```
+
 ```{r}
 library(ggplot2)
 library(knitr)
@@ -1708,6 +1794,7 @@ corrplot(cor_matrix, method = "color", type = "upper",
          tl.col = "black", tl.srt = 45, addCoef.col = "black",
          title = "Correlation Matrix of Numeric Predictors", mar=c(0,0,1,0))
 ```
+
 ```{r}
 # Load necessary packages
 library(dplyr)
@@ -1784,7 +1871,6 @@ pheatmap(-log10(pval_matrix),
          cluster_rows = FALSE, 
          cluster_cols = FALSE)
 ```
-
 
 ```{r}
 # Load necessary packages
@@ -1886,7 +1972,6 @@ print(combined_volcano)
 ggsave("combined_volcano.pdf", combined_volcano, width = 16, height = 6, units = "in")
 ```
 
-
 ```{r}
 library(EnhancedVolcano)
 library(patchwork)
@@ -1946,9 +2031,6 @@ print(combined_volcano)
 ggsave("combined_volcano.png", combined_volcano, width = 16, height = 10, units = "in")
 ```
 
-
-
-
 ```{r}
 # Load required package
 library(ggcorrplot)
@@ -1973,7 +2055,9 @@ ggcorrplot(cor_matrix,
            lab_size = 3,
            title = "Correlation Matrix for Cell Types")
 ```
+
 Look at contingency tables T-tests
+
 ```{r}
 # Load necessary packages
 library(dplyr)
@@ -2068,7 +2152,6 @@ final_table %>%
   add_header_above(c(" " = 1, "No Metastasis" = 3, "Metastasis" = 3, " " = 1)) %>%
   kable_styling(full_width = FALSE)
 ```
-
 
 ```{r}
 # ------------------------------------------------
@@ -2262,9 +2345,8 @@ print(cluster_means)
 
 ```
 
+Recreating Figure 6 from Oncogenic RAS Signaling Promotes Tumor Immunoresistance by Stabilizing PD-L1 mRNA
 
-Recreating Figure 6 from Oncogenic RAS Signaling Promotes Tumor
-Immunoresistance by Stabilizing PD-L1 mRNA
 ```{r}
 # ----------------------------------------------------
 # Load required packages
@@ -2379,6 +2461,7 @@ pheatmap(
   main = "Methylation Heatmap of Immune Evasion Genes"
 )
 ```
+
 ```{r}
 # Load required packages
 library(dplyr)
@@ -2491,6 +2574,7 @@ pheatmap(
 ```
 
 # 1. Extract SNP Probes
+
 ```{r include=FALSE}
 # Extract TypeSnpI data from the manifest
 typeSnpI_data <- get("TypeSnpI", envir = manifest@data)
@@ -2516,4 +2600,69 @@ snp_betas <- DH_CRC_Betas[combined_snp_ids, ]
 
 # Check the dimensions of the snp_betas matrix
 dim(snp_betas)
+```
+
+Test MsigDB code:
+
+```{r}
+library(dplyr)
+
+h_gene_sets_df = msigdbr(species = "human", category = "H")
+
+# If your methylation annotation uses gene SYMBOL:
+hallmark_symbol_list <- h_gene_sets_df %>%
+  group_by(gs_name) %>%
+  summarize(genes = list(unique(gene_symbol)), .groups = "drop") %>%
+  # Convert to a named list
+  pull(genes) %>%
+  setNames(h_gene_sets_df %>% distinct(gs_name) %>% pull(gs_name))
+
+# If your methylation annotation uses ENTREZ IDs:
+
+hallmark_entrez_list <- h_gene_sets_df %>%
+  group_by(gs_name) %>%
+  summarize(genes = list(unique(as.character(entrez_gene))), .groups = "drop") %>%
+  pull(genes) %>%
+  setNames(unique(h_gene_sets_df$gs_name))
+```
+
+```{r}
+library(methylGSA)
+hallmark_results_methylGSA <- methylglm(
+  cpg.pval  = cpg_pval,
+  array.type = "EPIC",             # or "450K"
+  group      = "all",              # or "body"/"promoter1"/"promoter2"
+  GS.list    = hallmark_entrez_list,  # <--- your custom list here
+  GS.idtype  = "ENTREZID",            # must match how your hallmark list is stored
+  minsize    = 100,
+  maxsize    = 500,
+  parallel   = FALSE
+  # Notice: we do NOT use GS.type here.
+)
+
+head(hallmark_results_methylGSA)
+library(ggplot2)
+library(dplyr)
+
+# Select the top 5 significant terms (sorted by p-value)
+top_terms <- hallmark_results_methylGSA %>%
+  arrange(pvalue) %>%
+  head(10)
+
+# Convert ID to factor with ordered levels for proper sorting
+top_terms$ID <- factor(top_terms$ID, levels = rev(top_terms$ID))
+
+# Create a ggplot barplot
+ggplot(top_terms, aes(x = ID, y = Size, fill = pvalue)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient(low = "blue", high = "red") +  # Color by p-value (red = more significant)
+  coord_flip() +  # Flip for Enrichr-style horizontal bars
+  labs(x = "", y = "Size", title = "Top 5 Enriched Hallmark Pathways (methylGSA)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold"))
+
+
+head(hallmark_results_methylGSA, n =10)
 ```

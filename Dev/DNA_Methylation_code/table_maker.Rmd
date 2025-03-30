@@ -1,0 +1,549 @@
+---
+title: "Table_maker_Colon_project"
+author: "Alos Diallo"
+date: "2024-03-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading packages
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(table1)
+library(data.table)
+library(reshape2) 
+library(tidyverse)
+require(grid)
+library(dplyr)
+```
+
+Loading Data
+
+```{r}
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+colnames(targets)
+```
+
+	•	Ascending: "cecum", "hepatic flexure", "right colon"
+	•	Transverse: "transverse colon", (and possibly "splenic flexure" if you want to include it here)
+	•	Descending: "left colon", "sigmoid", "rectum"
+	
+
+```{r}
+###############################################################################
+# 1) PREP DATA
+###############################################################################
+library(table1)
+
+# Convert site entries to lowercase for consistency
+targets$site <- tolower(targets$site)
+targets$site <- factor(targets$site)
+
+# Create a list for PATIENT
+PATIENT <- list()
+
+## MLH1
+PATIENT$MLH1 <- factor(
+  targets$MLH1,
+  levels = c(0, 1),
+  labels = c("MLH1 Deficient", "MLH1 Intact")
+)
+label(PATIENT$MLH1) <- "MLH1 Status"
+
+## FEMALE: numeric 0/1
+# We'll keep it numeric so table1 sees it as "continuous" but
+# we'll provide a custom summary for it.
+PATIENT$FEMALE <- ifelse(targets$sex == "F", 1, 0)
+label(PATIENT$FEMALE) <- "Female"
+
+## Tumor Grade
+PATIENT$TUMOR_GRADE <- factor(
+  targets$Grade,
+  levels = c("1", "2", "3"),
+  labels = c("Well Differentiated (Grade 1)",
+             "Moderately Differentiated (Grade 2)",
+             "Poorly Differentiated (Grade 3)")
+)
+label(PATIENT$TUMOR_GRADE) <- "Tumor Grade"
+
+## Site in Colon
+PATIENT$SITE <- factor(
+  targets$site,
+  levels = c("cecum", "hepatic flexure", "right colon",
+             "transverse colon", "splenic flexure", "left colon",
+             "sigmoid", "rectum"),
+  labels = c("Ascending", "Ascending", "Ascending",
+             "Transverse", "Transverse", "Descending",
+             "Descending", "Descending")
+)
+label(PATIENT$SITE) <- "Site in Colon"
+
+## AGE: numeric for "Mean (Range)"
+PATIENT$AGE <- targets$age
+label(PATIENT$AGE) <- "Age"
+units(PATIENT$AGE) <- "years"
+
+## ANY METASTASIS (Yes/No)
+# If any_mets is logical, convert it to factor with labels:
+PATIENT$ANY_METS <- factor(
+  targets$any_mets,
+  levels = c(FALSE, TRUE),
+  labels = c("No", "Yes")
+)
+label(PATIENT$ANY_METS) <- "Any Metastasis"
+
+## DISTANT METASTASIS (M0 vs. M1)
+PATIENT$DIST_METS <- factor(
+  targets$Distant_Mets,
+  levels = c(FALSE, TRUE),
+  labels = c("M0", "M1")
+)
+label(PATIENT$DIST_METS) <- "Distant Metastasis"
+
+## LYMPH NODE ONLY (Yes/No)
+PATIENT$LN_ONLY <- factor(
+  targets$ln_only,
+  levels = c(FALSE, TRUE),
+  labels = c("No", "Yes")
+)
+label(PATIENT$LN_ONLY) <- "Lymph Node Only"
+
+## SINGLE MET CATEGORY (optional, if you still need it)
+PATIENT$MET_CATEGORY <- with(targets,
+  ifelse(!any_mets, "No Mets",
+    ifelse(ln_only & !Distant_Mets, "LN Only", "Distant")
+  )
+)
+PATIENT$MET_CATEGORY <- factor(
+  PATIENT$MET_CATEGORY,
+  levels = c("No Mets", "LN Only", "Distant"),
+  labels = c("No Metastasis", "Lymph Node", "Distant Metastasis")
+)
+label(PATIENT$MET_CATEGORY) <- "Metastasis Category"
+
+
+###############################################################################
+# 2) DEFINE CUSTOM RENDER FUNCTION
+###############################################################################
+# We'll identify "Age" vs. "Female" based on 0/1 check.
+# This approach works if FEMALE is the *only* 0/1 numeric variable in the table.
+
+my.render.continuous <- function(x, ...) {
+  nonmissing <- x[!is.na(x)]
+  uniq_vals  <- unique(nonmissing)
+  
+  # If the numeric vector is strictly {0,1}, treat it as "Female"
+  # -> n (percent)
+  if (length(uniq_vals) <= 2 && all(uniq_vals %in% c(0, 1))) {
+    n_female <- sum(x, na.rm = TRUE)
+    N        <- length(nonmissing)
+    pct      <- 100 * n_female / N
+    return(sprintf("%d (%.1f%%)", n_female, pct))
+    
+  } else {
+    # Otherwise, assume it's "Age" (or another truly continuous var)
+    mean_val  <- mean(x, na.rm = TRUE)
+    rnge      <- range(x, na.rm = TRUE)
+    sprintf("%.1f (%d-%d)", mean_val, floor(rnge[1]), ceiling(rnge[2]))
+  }
+}
+
+
+###############################################################################
+# 3) BUILD THE TABLE
+###############################################################################
+caption  <- "Table 1: Patient and Disease Characteristics"
+footnote <- "All patients have Stage PT3 Adenocarcinoma. N is the total number of samples."
+
+mytable <- table1(
+  # In the formula, each variable is listed => each becomes a row
+  ~ AGE + FEMALE + TUMOR_GRADE + ANY_METS + DIST_METS + LN_ONLY + SITE + MLH1,
+  data              = PATIENT,
+  overall           = c(left = "Total"),
+  caption           = caption,
+  footnote          = footnote,
+  render.continuous = my.render.continuous
+)
+
+mytable
+```
+
+
+```{r}
+###############################################################################
+# 1) PREP DATA
+###############################################################################
+library(table1)
+
+# Convert site entries to lowercase for consistency
+targets$site <- tolower(targets$site)
+targets$site <- factor(targets$site)
+
+PATIENT <- list()
+
+# MLH1
+PATIENT$MLH1 <- factor(
+  targets$MLH1,
+  levels = c(0, 1),
+  labels = c("MLH1 Deficient", "MLH1 Intact")
+)
+label(PATIENT$MLH1) <- "MLH1 Status"
+
+# FEMALE as numeric 0/1
+PATIENT$FEMALE <- ifelse(targets$sex == "F", 1, 0)
+label(PATIENT$FEMALE) <- "Female"
+
+# Tumor Grade
+PATIENT$TUMOR_GRADE <- factor(
+  targets$Grade, 
+  levels = c("1", "2", "3"),
+  labels = c("Well Differentiated (Grade 1)",
+             "Moderately Differentiated (Grade 2)",
+             "Poorly Differentiated (Grade 3)")
+)
+label(PATIENT$TUMOR_GRADE) <- "Tumor Grade"
+
+# Site
+PATIENT$SITE <- factor(
+  targets$site, 
+  levels = c("cecum", "hepatic flexure", "right colon",
+             "transverse colon", "splenic flexure", "left colon",
+             "sigmoid", "rectum"),
+  labels = c("Ascending", "Ascending", "Ascending",
+             "Transverse", "Transverse", "Descending",
+             "Descending", "Descending")
+)
+label(PATIENT$SITE) <- "Site in Colon"
+
+# Age (numeric)
+PATIENT$AGE <- targets$age
+label(PATIENT$AGE) <- "Age"
+units(PATIENT$AGE) <- "years"
+
+# Metastasis Category (3 levels) 
+#   "No Metastasis", "Lymph Node", "Distant Metastasis"
+PATIENT$MET_CATEGORY <- with(targets,
+  ifelse(!any_mets, "No Mets",
+         ifelse(ln_only & !Distant_Mets, "LN Only", "Distant"))
+)
+PATIENT$MET_CATEGORY <- factor(
+  PATIENT$MET_CATEGORY,
+  levels = c("No Mets", "LN Only", "Distant"),
+  labels = c("No Metastasis", "Lymph Node Metastasis", "Distant Metastasis")
+)
+label(PATIENT$MET_CATEGORY) <- "Metastasis Category"
+
+
+###############################################################################
+# 2) CUSTOM RENDER FOR CONTINUOUS VARIABLES
+###############################################################################
+# Distinguish Age (many numeric values) vs. Female (0/1)
+my.render.continuous <- function(x, ...) {
+  nonmissing <- x[!is.na(x)]
+  uniq_vals  <- unique(nonmissing)
+  
+  # If strictly {0,1} => 'Female': n (percent)
+  if (length(uniq_vals) <= 2 && all(uniq_vals %in% c(0, 1))) {
+    n_female <- sum(x, na.rm = TRUE)
+    N        <- length(nonmissing)
+    pct      <- 100 * n_female / N
+    return(sprintf("%d (%.1f%%)", n_female, pct))
+    
+  } else {
+    # Otherwise => Age: Mean (Min–Max)
+    mean_val  <- mean(x, na.rm = TRUE)
+    rnge      <- range(x, na.rm = TRUE)
+    sprintf("%.1f (%d-%d)", mean_val, floor(rnge[1]), ceiling(rnge[2]))
+  }
+}
+
+
+###############################################################################
+# 3) BUILD TABLE STRATIFIED BY MET_CATEGORY
+###############################################################################
+caption  <- "Table 1: Patient Characteristics Stratified by Metastasis Category"
+footnote <- "All patients have Stage PT3 Adenocarcinoma. N is the total number of samples."
+
+mytable <- table1(
+  # NOTE: The '|' indicates stratification by MET_CATEGORY
+  ~ AGE + FEMALE + TUMOR_GRADE + SITE + MLH1 | MET_CATEGORY,
+  data              = PATIENT,
+  overall           = FALSE,        # do not show "Total" column
+  caption           = caption,
+  footnote          = footnote,
+  render.continuous = my.render.continuous
+)
+
+mytable
+```
+
+
+
+```{r}
+###############################################################################
+# 1) PREP DATA
+###############################################################################
+library(table1)
+
+# Convert site entries to lowercase for consistency
+targets$site <- tolower(targets$site)
+targets$site <- factor(targets$site)
+
+# Create a list for PATIENT
+PATIENT <- list()
+
+## MLH1
+PATIENT$MLH1 <- factor(
+  targets$MLH1,
+  levels = c(0, 1),
+  labels = c("MLH1 Deficient", "MLH1 Intact")
+)
+label(PATIENT$MLH1) <- "MLH1 Status"
+
+## FEMALE: numeric 0/1
+# We'll keep it numeric so table1 sees it as "continuous" 
+# but we'll provide a custom summary for it.
+PATIENT$FEMALE <- ifelse(targets$sex == "F", 1, 0)
+label(PATIENT$FEMALE) <- "Female"
+
+## Tumor Grade
+PATIENT$TUMOR_GRADE <- factor(
+  targets$Grade,
+  levels = c("1", "2", "3"),
+  labels = c("Well Differentiated (Grade 1)",
+             "Moderately Differentiated (Grade 2)",
+             "Poorly Differentiated (Grade 3)")
+)
+label(PATIENT$TUMOR_GRADE) <- "Tumor Grade"
+
+## Site in Colon
+PATIENT$SITE <- factor(
+  targets$site,
+  levels = c("cecum", "hepatic flexure", "right colon",
+             "transverse colon", "splenic flexure", "left colon",
+             "sigmoid", "rectum"),
+  labels = c("Ascending", "Ascending", "Ascending",
+             "Transverse", "Transverse", "Descending",
+             "Descending", "Descending")
+)
+label(PATIENT$SITE) <- "Site in Colon"
+
+## AGE: numeric for "Mean (Range)"
+PATIENT$AGE <- targets$age
+label(PATIENT$AGE) <- "Age"
+units(PATIENT$AGE) <- "years"
+
+## ANY METASTASIS (Yes/No)
+PATIENT$ANY_METS <- factor(
+  targets$any_mets,
+  levels = c(FALSE, TRUE),
+  labels = c("No Metastasis", "Any Metastasis")
+)
+label(PATIENT$ANY_METS) <- "Any Metastasis"
+
+## DISTANT METASTASIS (M0 vs. M1)
+PATIENT$DIST_METS <- factor(
+  targets$Distant_Mets,
+  levels = c(FALSE, TRUE),
+  labels = c("M0", "M1")
+)
+label(PATIENT$DIST_METS) <- "Distant Metastasis"
+
+## LYMPH NODE ONLY (Yes/No)
+PATIENT$LN_ONLY <- factor(
+  targets$ln_only,
+  levels = c(FALSE, TRUE),
+  labels = c("No", "Yes")
+)
+label(PATIENT$LN_ONLY) <- "Lymph Node Only"
+
+
+###############################################################################
+# 2) DEFINE A SINGLE CUSTOM RENDER FUNCTION
+###############################################################################
+# We'll distinguish "Age" vs. "Female" by checking if the numeric
+# vector is strictly {0,1}. This works if FEMALE is the only 0/1 numeric.
+
+my.render.continuous <- function(x, ...) {
+  nonmissing <- x[!is.na(x)]
+  uniq_vals  <- unique(nonmissing)
+  
+  # If strictly {0,1} => 'Female': n (percent)
+  if (length(uniq_vals) <= 2 && all(uniq_vals %in% c(0, 1))) {
+    n_female <- sum(x, na.rm = TRUE)
+    N        <- length(nonmissing)
+    pct      <- 100 * n_female / N
+    return(sprintf("%d (%.1f%%)", n_female, pct))
+  } else {
+    # Otherwise => Age: Mean (Min–Max)
+    mean_val  <- mean(x, na.rm = TRUE)
+    rnge      <- range(x, na.rm = TRUE)
+    return(sprintf("%.1f (%d-%d)", mean_val, floor(rnge[1]), ceiling(rnge[2])))
+  }
+}
+
+###############################################################################
+# 3) BUILD TABLE STRATIFIED BY ANY_METS
+###############################################################################
+# The '|' in the formula means "stratify by ANY_METS," 
+# so we get columns for ANY_METS == "No" vs. "Yes"
+# plus an overall column by default.
+
+caption  <- "Table 1: Patient and Disease Characteristics Stratified by Any Metastasis"
+footnote <- "All patients have Stage PT3 Adenocarcinoma. N is the total number of samples."
+
+mytable <- table1(
+  # Row variables
+  ~ AGE + FEMALE + TUMOR_GRADE + LN_ONLY + DIST_METS + SITE + MLH1 
+  # Stratified by ANY_METS
+  | ANY_METS,  
+  data              = PATIENT,
+  overall           = c(left = "Total"),  # Keep "Total" column 
+  caption           = caption,
+  footnote          = footnote,
+  render.continuous = my.render.continuous
+)
+
+mytable
+```
+
+```{r}
+###############################################################################
+# 1) PREP DATA
+###############################################################################
+library(table1)
+
+# Convert site entries to lowercase for consistency
+targets$site <- tolower(targets$site)
+targets$site <- factor(targets$site)
+
+# Create a list for PATIENT
+PATIENT <- list()
+
+## MLH1
+PATIENT$MLH1 <- factor(
+  targets$MLH1,
+  levels = c(0, 1),
+  labels = c("MLH1 Deficient", "MLH1 Intact")
+)
+label(PATIENT$MLH1) <- "MLH1 Status"
+
+## FEMALE: numeric 0/1 (will do custom summary)
+PATIENT$FEMALE <- ifelse(targets$sex == "F", 1, 0)
+label(PATIENT$FEMALE) <- "Female"
+
+## Tumor Grade
+PATIENT$TUMOR_GRADE <- factor(
+  targets$Grade,
+  levels = c("1", "2", "3"),
+  labels = c("Well Differentiated (Grade 1)",
+             "Moderately Differentiated (Grade 2)",
+             "Poorly Differentiated (Grade 3)")
+)
+label(PATIENT$TUMOR_GRADE) <- "Tumor Grade"
+
+## Site in Colon
+PATIENT$SITE <- factor(
+  targets$site,
+  levels = c("cecum", "hepatic flexure", "right colon",
+             "transverse colon", "splenic flexure", "left colon",
+             "sigmoid", "rectum"),
+  labels = c("Ascending", "Ascending", "Ascending",
+             "Transverse", "Transverse", "Descending",
+             "Descending", "Descending")
+)
+label(PATIENT$SITE) <- "Site in Colon"
+
+## AGE: numeric for "Mean (Range)"
+PATIENT$AGE <- targets$age
+label(PATIENT$AGE) <- "Age"
+units(PATIENT$AGE) <- "years"
+
+## ANY METASTASIS (Yes/No)
+PATIENT$ANY_METS <- factor(
+  targets$any_mets,
+  levels = c(FALSE, TRUE),
+  labels = c("No Metastasis", "Any Metastasis")
+)
+label(PATIENT$ANY_METS) <- "Any Metastasis"
+
+## DISTANT METASTASIS (M0 vs. M1)
+PATIENT$DIST_METS <- factor(
+  targets$Distant_Mets,
+  levels = c(FALSE, TRUE),
+  labels = c("M0", "M1")
+)
+label(PATIENT$DIST_METS) <- "Distant Metastasis"
+
+###############################################################################
+# 2) NODE_STAGE FACTOR
+###############################################################################
+# Your node_stage data look like: "0", "1a", "1b", "1c", "2", "2a", "2b", etc.
+# Let's convert them to a factor. We'll map them to typical N labels, or 
+# keep them as is if you prefer. For example:
+# - "0"  => "N0"
+# - "1a" => "N1a"
+# - "1b" => "N1b"
+# - "1c" => "N1c"
+# - "2"  => "N2"
+# - "2a" => "N2a"
+# - "2b" => "N2b"
+# If you prefer the raw strings in the table, skip `labels`.
+
+PATIENT$NODE_STAGE <- factor(
+  targets$node_stage,
+  levels = c("0", "1a", "1b", "1c", "2", "2a", "2b"),
+  labels = c("N0", "N1", "N1", "N1", "N2", "N2", "N2")
+)
+label(PATIENT$NODE_STAGE) <- "Lymph Node Stage"
+
+###############################################################################
+# 3) CUSTOM RENDER FUNCTION (Age vs. Female)
+###############################################################################
+my.render.continuous <- function(x, ...) {
+  nonmissing <- x[!is.na(x)]
+  uniq_vals  <- unique(nonmissing)
+  
+  # If strictly {0,1} => 'Female': n (percent)
+  if (length(uniq_vals) <= 2 && all(uniq_vals %in% c(0, 1))) {
+    n_female <- sum(x, na.rm = TRUE)
+    N        <- length(nonmissing)
+    pct      <- 100 * n_female / N
+    return(sprintf("%d (%.1f%%)", n_female, pct))
+  } else {
+    # Otherwise => Age: Mean (Min–Max)
+    mean_val  <- mean(x, na.rm = TRUE)
+    rnge      <- range(x, na.rm = TRUE)
+    return(sprintf("%.1f (%d-%d)", mean_val, floor(rnge[1]), ceiling(rnge[2])))
+  }
+}
+
+###############################################################################
+# 4) CREATE TABLE STRATIFIED BY ANY_METS
+###############################################################################
+caption  <- "Table 1: Patient and Disease Characteristics Stratified by Any Metastasis"
+footnote <- "All patients have Stage PT3 Adenocarcinoma. N is the total number of samples."
+
+mytable <- table1(
+  # We replace LN_ONLY with NODE_STAGE in the row variables
+  ~ AGE + FEMALE + TUMOR_GRADE + NODE_STAGE + DIST_METS + SITE + MLH1 
+  # Stratified by ANY_METS
+  | ANY_METS,
+  data              = PATIENT,
+  overall           = c(left = "Total"),  # Keep "Total" column
+  caption           = caption,
+  footnote          = footnote,
+  render.continuous = my.render.continuous
+)
+
+mytable
+```
+
+
+

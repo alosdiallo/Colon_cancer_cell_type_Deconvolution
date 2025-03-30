@@ -1,0 +1,119 @@
+---
+title: "Testing Controls"
+output: html_notebook
+---
+
+How to interface with TCGA
+https://bioconductor.org/packages/devel/bioc/vignettes/TCGAbiolinks/inst/doc/index.html
+https://bioconductor.org/packages/release/workflows/vignettes/TCGAWorkflow/inst/doc/TCGAWorkflow.html#Environment
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(minfi)
+library(sesame)
+library(pheatmap)
+library(minfiData)
+library(FlowSorted.Blood.EPIC)
+library(HiTIMED)
+library(ggplot2)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(IlluminaHumanMethylationEPICv2manifest)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(IlluminaHumanMethylationEPICmanifest)
+library(limma)
+library(qvalue)
+library(sva)
+library(ENmix)
+library(ggplot2)
+library(ggrepel)
+library(matrixStats)
+library(EpiDISH)
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(methylGSA)
+```
+
+Loading the annotation file:
+```{r}
+data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+load("/Users/adiallo/Desktop/Dartmouth/Christiansen_lab/CF_Project/Methylation/Annotation/EPIC.hg19.manifest.RDATA")
+attach(annotation)
+manifest <- getManifest(IlluminaHumanMethylationEPICmanifest)
+
+```
+
+Loading the data and metadata information
+```{r}
+targets <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/dm_57_samples.csv")
+targets$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets) <- targets$patient
+targets$SampleID<- targets$patient
+
+targets_expanded <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv")
+targets_expanded$patient <- paste(targets$Sentrix_ID,targets$Sentrix_Position,sep="_")
+rownames(targets_expanded) <- targets_expanded$patient
+targets_expanded$SampleID<- targets_expanded$patient
+targets = targets_expanded
+```
+
+```{r}
+idat = "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/"
+RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/",recursive = TRUE) 
+#RGset_25 = openSesame(idat , func = getBetas) 
+RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
+```
+
+Get GTEx data
+```{r}
+
+Betas_GTEx = readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/GTEx/GTEx_samples.rds")
+targets_GTEx <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/GTEx/targets.csv")
+targets_GTEx$patient <- targets_GTEx$Filename
+rownames(targets_GTEx) <- targets_GTEx$patient
+targets_GTEx$SampleID<- targets_GTEx$patient
+
+```
+
+Get TCGA data
+
+```{r}
+tcga.data <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/TCGA_data.rds")
+tcga.dnam <- tcga.data[["dnam"]]
+tcga.pheno <- tcga.data[["pheno"]]
+tcga.cell <- tcga.data[["cell_types"]]
+msi_dat<-readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/msi_tcga.rds")
+tcga.cell$COAD_Deconv1#$MSS
+tcga.cell$COAD_Deconv2#MASS
+
+tcga_T = t(tcga.dnam)
+
+# MSet_noob_T <- preprocessNoob(tcga.dnam)
+# beta_matrix_TCGA<-getBeta(MSet_noob_T)
+
+```
+
+
+
+
+For obtaining more data
+```{r}
+library(TCGAbiolinks)
+
+# Specify the exact data type (usually beta-values)
+query.met <- GDCquery(
+  project = "TCGA-COAD",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",
+  platform = "Illumina Human Methylation 450"
+)
+
+files <- getResults(query.met)
+head(files$file_id)
+# Download the data
+GDCdownload(query.met)
+
+# Prepare data for analysis
+data.met <- GDCprepare(query.met)
+```
+

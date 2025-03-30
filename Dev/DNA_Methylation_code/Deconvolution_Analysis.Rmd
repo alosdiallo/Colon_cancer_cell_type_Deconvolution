@@ -126,9 +126,13 @@ head(cell_type_proportions_df)
 
 Running HiTIMED to generate cell type proportions
 ```{r}
-HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",6,"tumor")
+HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",5,"tumor")
 
 HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+
+HiTIMED_result_immune<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",2,"tumor")
+
+HiTIMED_result_immune$SampleID <- rownames(HiTIMED_result)
 ```
 
 
@@ -166,75 +170,117 @@ combined_data <- combined_data %>%
 ```
 
 Stacked Barplots:
+
 ```{r}
 library(dplyr)
 library(tidyr)
 library(ggplot2)
-library(scales)  # for percent_format()
+library(scales)
 
-# Define your cell-type variables (matching columns in combined_data).
-cell_type_vars <- c("Tumor", "Endothelial", 
-                        "Epithelial", "Stromal", "Bnv", "Bmem", 
-                        "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", 
-                        "Mono", "DC", "NK", "Bas", "Eos", "Neu")
+# Define cell-type variables
+cell_type_vars <- c("Tumor", "Bas", "Eos", "Neu", "Mono", "DC", "Bnv", "Bmem", "CD4T", 
+                    "CD8T", "NK", "Endothelial", "Epithelial", "Stromal")
 
-# Recode any_mets so that "FALSE" = "No Mets", "TRUE" = "Mets" (if not already done)
-combined_data$any_mets <- factor(combined_data$any_mets,
-                                 levels = c("No Mets", "Mets"))
-# Alternatively:
-# combined_data$any_mets <- factor(combined_data$any_mets,
-#                                  levels = c("FALSE","TRUE"),
-#                                  labels = c("No Mets","Mets"))
+# Ensure mets_cat is a factor with the correct order
+combined_data$mets_cat <- factor(combined_data$mets_cat, 
+                                 levels = c("No Metastasis", "LN Metastasis", "Distant Metastasis"))
 
-# 1) Reshape data to long format
+# Reshape data to long format
 df_long <- combined_data %>%
-  select(SampleID, any_mets, all_of(cell_type_vars)) %>%
-  pivot_longer(cols = cell_type_vars,
-               names_to = "CellType",
-               values_to = "Proportion")
+  select(SampleID, mets_cat, all_of(cell_type_vars)) %>%
+  pivot_longer(cols = cell_type_vars, names_to = "CellType", values_to = "Proportion")
 
-# 2) Separate the data into No Metastasis vs. Metastasis
-df_no_mets <- df_long %>% filter(any_mets == "No Mets")
-df_mets    <- df_long %>% filter(any_mets == "Mets")
+# 1️⃣ Order samples within each metastasis category by "Tumor" proportion
+tumor_order <- df_long %>%
+  filter(CellType == "Tumor") %>%
+  arrange(mets_cat, desc(Proportion)) %>%  # Sort within each disease state
+  pull(SampleID)  # Extract ordered SampleID
 
+# Convert SampleID to factor to enforce order in plots
+df_long$SampleID <- factor(df_long$SampleID, levels = tumor_order)
+
+# 2️⃣ Order cell types from most to least abundant (across all samples)
+cell_type_order <- df_long %>%
+  group_by(CellType) %>%
+  summarize(MeanProportion = mean(Proportion, na.rm = TRUE)) %>%
+  arrange(desc(MeanProportion)) %>%  # Most abundant first
+  pull(CellType)  # Extract ordered cell type names
+
+# Convert CellType to factor with ordered levels (most abundant at bottom of stacked bar)
+df_long$CellType <- factor(df_long$CellType, levels = rev(cell_type_order))  # Reverse to put most abundant at bottom
+
+# Define custom colors
 my_14_colors <- c(
   "#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3",
   "#A6D854", "#FFD92F", "#E5C494", "#B3B3B3",
   "#1F78B4", "#33A02C", "#FB9A99", "#FDBF6F",
-  "#CAB2D6", "#6A3D9A","#E31A1C","#B15928","#C51B8A"
+  "#CAB2D6", "#6A3D9A", "#E31A1C", "#B15928", "#C51B8A"
 )
 
-# 3) Plot for No Metastasis
-ggplot(df_no_mets, aes(x = SampleID, y = Proportion, fill = CellType)) +
-  geom_bar(stat = "identity", position = "fill") + 
-  scale_fill_manual(values = my_14_colors) +
-  scale_y_continuous(labels = percent_format()) +  # display y-axis in percentages
-  labs(x = "Sample ID", 
-       y = "Cell Type Proportion (%)", 
-       title = "Cell Type Proportions: No Metastasis") +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) + 
-  theme_minimal()
+# Function to generate plots for each metastasis category
+plot_cell_proportions <- function(data, metastasis_label) {
+  ggplot(data, aes(x = SampleID, y = Proportion, fill = CellType)) +
+    geom_bar(stat = "identity", position = "fill") + 
+    scale_fill_manual(values = my_14_colors) +
+    scale_y_continuous(labels = percent_format()) +  
+    labs(x = "Sample ID", 
+         y = "Cell Type Proportion (%)", 
+         title = paste("Cell Type Proportions:", metastasis_label)) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    theme_minimal()
+}
 
-# 4) Plot for Metastasis
-ggplot(df_mets, aes(x = SampleID, y = Proportion, fill = CellType)) +
-  geom_bar(stat = "identity", position = "fill") + 
-  scale_fill_manual(values = my_14_colors) + 
-  scale_y_continuous(labels = percent_format()) + 
-  labs(x = "Sample ID", 
-       y = "Cell Type Proportion (%)", 
-       title = "Cell Type Proportions: Metastasis") +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
-  theme_minimal()
+# Generate plots for each metastasis category with the ordered SampleID and CellType
+df_no_mets <- df_long %>% filter(mets_cat == "No Metastasis")
+df_ln_mets <- df_long %>% filter(mets_cat == "LN Metastasis")
+df_dist_mets <- df_long %>% filter(mets_cat == "Distant Metastasis")
+
+plot_cell_proportions(df_no_mets, "No Metastasis")
+plot_cell_proportions(df_ln_mets, "LN Metastasis")
+plot_cell_proportions(df_dist_mets, "Distant Metastasis")
 ```
 
 
+
 ```{r}
+# Load necessary libraries
+library(dplyr)
+
+# Define cell-type variables
+cell_type_vars <- c("Tumor", "Bas", "Eos", "Neu", "Mono", "DC", "Bnv", "Bmem", 
+                    "CD4T", "CD8T", "NK", "Endothelial", "Epithelial", "Stromal", "Fib")
+
+# Compute summary statistics for each cell type across metastasis categories
+summary_stats <- combined_data %>%
+  group_by(mets_cat) %>%
+  summarise(across(all_of(cell_type_vars), 
+                   list(mean = mean, median = median, sd = sd, min = min, 
+                        q1 = ~quantile(.x, 0.25), q3 = ~quantile(.x, 0.75), max = max), 
+                   .names = "{.col}_{.fn}"))
+
+# Print summary statistics
+print(summary_stats)
+
+# If you want to save the results to a CSV file:
+# write.csv(summary_stats, "cell_type_summary_stats.csv", row.names = FALSE)
+```
+
+
+"Tumor", "Bas", "Eos", 
+                      "Neu", "Mono", "DC", "Bnv", "Bmem", "CD4T", 
+                      "CD8T", "NK", "Endothelial", "Epithelial", 
+                      "Stromal","Fib"
+
+
+	
+```{r}
+CD4T_Norm = combined_data$CD4T/HiTIMED_result_immune$Immune
+combined_data$CD4T_Norm = CD4T_Norm
+
+
 # ----- 2. Reshape your data for plotting -----
 # Define my relevant cell-type columns based on the HiTIMED paper:
-cell_types <- c("Tumor", "Endothelial", 
-                        "Epithelial", "Stromal", "Bnv", "Bmem", 
-                        "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", 
-                        "Mono", "DC", "NK", "Bas", "Eos", "Neu","Fib"
+cell_types <- c("CD4T_Norm"
 )
 
 long_data <- combined_data %>%
@@ -243,22 +289,267 @@ long_data <- combined_data %>%
     names_to = "cell_type",
     values_to = "proportion"
   )
-```
-	
-	
-```{r}
-# ----- 3. Plot using ggplot2 -----
-# A single faceted figure for all cell types:
-ggplot(long_data, aes(x = mets_cat, y = proportion, fill = MLH1)) +
+
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(ggpubr)  # for stat_compare_means()
+library(viridis)
+
+# Define the pairwise comparisons between metastasis categories
+comparisons <- list(
+  c("No Metastasis", "LN Metastasis"),
+  c("No Metastasis", "Distant Metastasis"),
+  c("LN Metastasis", "Distant Metastasis")
+)
+
+# Create the plot with statistics overlaid
+ggplot(long_data, aes(x = mets_cat, y = proportion, fill = mets_cat)) +
   geom_boxplot() +
+  geom_jitter(color = "black", size = 0.4, alpha = 0.9) + 
   facet_wrap(~ cell_type, scales = "free_y") +
+  scale_fill_viridis(discrete = TRUE, option = "plasma", alpha = 0.6) +
   labs(
-    title = "Cell Type Proportions by Metastasis Category and MLH1 Status",
+    title = "Cell Type Proportions by Metastasis Category",
     x = "Metastasis Category",
-    y = "Proportion",
-    fill = "MLH1 Status"
+    y = "Proportion"
   ) +
-  theme_bw()
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+
+###############################################################################
+# FULL EXAMPLE CODE BLOCK
+###############################################################################
+
+# Load Required Libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)       # for stat_compare_means()
+library(viridis)
+
+#------------------------------------------------------------------------------
+# 1) Compute Normalized Columns in combined_data
+#    (Adjust if your column names differ)
+#------------------------------------------------------------------------------
+combined_data$CD8T_Norm <- combined_data$CD8T / HiTIMED_result_immune$Immune
+combined_data$CD4_Norm  <- combined_data$CD4T / HiTIMED_result_immune$Immune
+combined_data$Mono_Norm <- combined_data$Mono / HiTIMED_result_immune$Immune
+combined_data$NK_Norm   <- combined_data$NK   / HiTIMED_result_immune$Immune
+
+#------------------------------------------------------------------------------
+# 2) Create a Column with Three Metastasis Categories
+#    (Adapt this to match however your metastasis info is stored)
+#------------------------------------------------------------------------------
+# ----- 1. Create a metastasis category factor -----
+combined_data <- combined_data %>%
+  mutate(
+    mets_cat = case_when(
+      any_mets == "No Mets" ~ "No Metastasis",
+      # Ensure that LN-only does not include Distant Mets
+      ln_only == "LN Mets" & Distant_Mets == "No Distant Mets" ~ "LN Metastasis",
+      Distant_Mets == "Distant Mets" ~ "Distant Metastasis",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(
+    mets_cat = factor(
+      mets_cat,
+      levels = c("No Metastasis", "LN Metastasis", "Distant Metastasis")
+    )
+  )
+
+#------------------------------------------------------------------------------
+# 3) Pivot to Long Format
+#------------------------------------------------------------------------------
+cell_types <- c("CD8T_Norm", "CD4_Norm", "Mono_Norm", "NK_Norm")
+
+long_data <- combined_data %>%
+  pivot_longer(
+    cols      = all_of(cell_types),
+    names_to  = "cell_type",
+    values_to = "proportion"
+  )
+
+#------------------------------------------------------------------------------
+# 4) Define Pairwise Comparisons for the Three Groups
+#------------------------------------------------------------------------------
+comparisons <- list(
+  c("No Metastasis", "LN Metastasis"),
+  c("No Metastasis", "Distant Metastasis"),
+  c("LN Metastasis", "Distant Metastasis")
+)
+
+
+# Ensure mets_cat is a factor with the correct order
+combined_data$mets_cat <- factor(combined_data$mets_cat, 
+                                 levels = c("No Metastasis", "LN Metastasis", "Distant Metastasis"))
+#------------------------------------------------------------------------------
+# 5) Generate the Faceted Plot with T-Test Results Overlaid
+#------------------------------------------------------------------------------
+ggplot(long_data, aes(x = mets_cat, y = proportion, fill = mets_cat)) +
+  geom_boxplot() +
+  geom_jitter(
+    width = 0.2,   # Horizontal jitter so points don't overlap
+    color = "black",
+    size  = 0.5,
+    alpha = 0.8
+  ) +
+  facet_wrap(~ cell_type, scales = "free_y") + # One facet per cell type
+  stat_compare_means(
+    comparisons      = comparisons,  # Pairwise t-tests among the 3 categories
+    method           = "t.test",
+    label            = "p.signif",   # "p.signif" = stars; "p.format" = numeric p-values
+    p.adjust.method  = "BH"          # e.g., Benjamini-Hochberg correction for multiple comparisons
+  ) +
+  scale_fill_viridis(
+    discrete = TRUE,
+    option   = "plasma",
+    alpha    = 0.6
+  ) +
+  labs(
+    title = "Cell Type Proportions by Metastasis Category",
+    x     = "Metastasis Category",
+    y     = "Proportion"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+```{r}
+
+cell_types <- c("Fib", "CD8T", "Tumor")  # ✅ Now includes all three key cell types
+long_data <- combined_data %>%
+  pivot_longer(
+    cols = all_of(cell_types),
+    names_to = "cell_type",
+    values_to = "proportion"
+  )
+
+
+# Define the key cell types to visualize
+selected_cells <- c("Fib", "CD8T", "Tumor")
+
+# Compute mean proportions for these cell types across metastasis categories
+trend_data <- long_data %>%
+  filter(cell_type %in% selected_cells) %>%
+  group_by(cell_type, mets_cat) %>%
+  summarise(mean_proportion = mean(proportion, na.rm = TRUE), .groups = "drop")
+
+# Convert data to ensure correct factor ordering for metastasis categories
+trend_data$mets_cat <- factor(trend_data$mets_cat, 
+                              levels = c("No Metastasis", "LN Metastasis", "Distant Metastasis"))
+
+# Create the line plot
+ggplot(trend_data, aes(x = mets_cat, y = mean_proportion, group = cell_type, color = cell_type)) +
+  geom_line(size = 1.5) +  # Line for each cell type
+  geom_point(size = 3) +   # Points for each mean value
+  scale_color_manual(values = c("Fib" = "red", "CD8T" = "blue", "Tumor" = "black")) + # Custom colors
+  labs(
+    title = "Trends of Fibroblasts, CD8 T-cells, and Tumors Across Metastasis Categories",
+    x = "Metastasis Category",
+    y = "Mean Cell Type Proportion",
+    color = "Cell Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+Cell Type Plots stratified by MLH1:
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+# combined_data <- combined_data %>%
+#   mutate(
+#     cd8_total   =  (CD8nv + CD8mem)
+#   )
+
+# Assuming 'CD8mem' is your column for CD8 proportions
+# and 'mets_cat' has levels: "No Metastasis", "LN Metastasis", "Distant Metastasis"
+# Also assuming 'MLH1' has exactly two levels: "MLH1 Negative", "MLH1 Positive"
+
+p_MLH1_pos <- combined_data %>%
+  filter(MLH1 == "MLH1 Positive") %>%
+  ggplot(aes(x = mets_cat, y = CD8_Norm)) +
+  geom_boxplot(fill = "#66C2A5") +
+  labs(
+    title = "CD8 Proportions: MLH1 Positive",
+    x = "Metastasis Category",
+    y = "CD8 Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_MLH1_neg <- combined_data %>%
+  filter(MLH1 == "MLH1 Negative") %>%
+  ggplot(aes(x = mets_cat, y = CD8_Norm)) +
+  geom_boxplot(fill = "#FC8D62") +
+  labs(
+    title = "CD8 Proportions: MLH1 Negative",
+    x = "Metastasis Category",
+    y = "CD8 Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display both plots side by side
+p_MLH1_pos + p_MLH1_neg
+```
+Looking at Tumor Grade
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+# combined_data <- combined_data %>%
+#   mutate(
+#     cd8_total   =  (CD8nv + CD8mem)
+#   )
+
+# Assuming 'CD8mem' is your column for CD8 proportions
+# and 'mets_cat' has levels: "No Metastasis", "LN Metastasis", "Distant Metastasis"
+# Also assuming 'MLH1' has exactly two levels: "MLH1 Negative", "MLH1 Positive"
+
+p_Grade_one <- combined_data %>%
+  filter(Grade == "1") %>%
+  ggplot(aes(x = mets_cat, y = Fib)) +
+  geom_boxplot(fill = "#66C2A5") +
+  labs(
+    title = "Fibroblast Proportions: Tumor Grade 1",
+    x = "Metastasis Category",
+    y = "Fibroblast Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_Grade_two <- combined_data %>%
+  filter(Grade == "2") %>%
+  ggplot(aes(x = mets_cat, y = Fib)) +
+  geom_boxplot(fill = "#FC8D62") +
+  labs(
+    title = "Fibroblast Proportions: Tumor Grade 2",
+    x = "Metastasis Category",
+    y = "Fibroblast Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_Grade_three <- combined_data %>%
+  filter(Grade == "3") %>%
+  ggplot(aes(x = mets_cat, y = Fib)) +
+  geom_boxplot(fill = "#FC8D62") +
+  labs(
+    title = "Fibroblast Proportions: Tumor Grade 3",
+    x = "Metastasis Category",
+    y = "Fibroblast Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display both plots side by side
+p_Grade_one + p_Grade_two + p_Grade_three
 ```
 
 Here I am looking at Distant Mets colored by MLH1
@@ -823,16 +1114,10 @@ ggplot(long_ratios, aes(x = no_mets_vs_ln, y = ratio_value, fill = no_mets_vs_ln
   ) +
   theme_bw()
 ```
-
-
 ```{r}
 library(ggplot2)
 library(dplyr)
 library(patchwork)
-combined_data <- combined_data %>%
-  mutate(
-    cd8_total   =  (CD8nv + CD8mem)
-  )
 
 # Assuming 'CD8mem' is your column for CD8 proportions
 # and 'mets_cat' has levels: "No Metastasis", "LN Metastasis", "Distant Metastasis"
@@ -840,24 +1125,24 @@ combined_data <- combined_data %>%
 
 p_MLH1_pos <- combined_data %>%
   filter(MLH1 == "MLH1 Positive") %>%
-  ggplot(aes(x = mets_cat, y = Tumor)) +
+  ggplot(aes(x = mets_cat, y = Epithelial)) +
   geom_boxplot(fill = "#66C2A5") +
   labs(
-    title = "Tumor Proportions: MLH1 Positive",
+    title = "Epithelial Proportions: MLH1 Positive",
     x = "Metastasis Category",
-    y = "Tumor Proportion"
+    y = "Epithelial Proportion"
   ) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
 p_MLH1_neg <- combined_data %>%
   filter(MLH1 == "MLH1 Negative") %>%
-  ggplot(aes(x = mets_cat, y = Tumor)) +
+  ggplot(aes(x = mets_cat, y = Epithelial)) +
   geom_boxplot(fill = "#FC8D62") +
   labs(
-    title = "Tumor Proportions: MLH1 Negative",
+    title = "Epithelial Proportions: MLH1 Negative",
     x = "Metastasis Category",
-    y = "Tumor Proportion"
+    y = "Epithelial Proportion"
   ) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
@@ -865,7 +1150,6 @@ p_MLH1_neg <- combined_data %>%
 # Display both plots side by side
 p_MLH1_pos + p_MLH1_neg
 ```
-
 ```{r}
 library(ggplot2)
 library(dplyr)
