@@ -64,6 +64,66 @@ RGset_32 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_
 RGset_25 = read.metharray.exp("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/",recursive = TRUE) 
 ```
 
+Normalize my Data
+```{r}
+Noob_25_m = preprocessNoob(RGset_25)
+Noob_32_m = preprocessNoob(RGset_32)
+```
+
+Getting the beta values
+```{r}
+Betas_25<-getBeta(Noob_25_m)
+Betas_32<-getBeta(Noob_32_m)
+```
+
+```{r}
+Betas_25<- sesame::betasCollapseToPfx(Betas_25)
+#Betas_32<- sesame::betasCollapseToPfx(Betas_32)
+colnames(Betas_25) = colnames(Noob_25_m)
+```
+
+```{r}
+DH_CRC_Betas <- merge(Betas_25, Betas_32, by = "row.names")
+rownames(DH_CRC_Betas) <- DH_CRC_Betas$Row.names
+DH_CRC_Betas <- DH_CRC_Betas[,-1] 
+```
+
+
+Running EpiDish to obtain Fibroblast information
+```{r}
+# Define the beta matrix and reference matrix
+beta_matrix <- DH_CRC_Betas  # Your dataset
+ref_matrix <- centEpiFibIC.m  # Reference matrix for EpiDISH (e.g., centEpiFibIC.m)
+
+# Run EpiDISH
+epidish_results <- epidish(beta.m = beta_matrix, ref.m = ref_matrix, method = "RPC")
+
+# Extract the estimated cell type proportions
+cell_type_proportions <- epidish_results$estF
+
+# Convert the matrix to a data frame and scale proportions to percentages
+cell_type_proportions_df <- as.data.frame(cell_type_proportions) * 100
+
+# Add SampleID as a column from the row names
+cell_type_proportions_df$SampleID <- rownames(cell_type_proportions)
+
+# Inspect the results
+head(cell_type_proportions_df)
+```
+
+
+Running HiTIMED to generate cell type proportions
+```{r}
+HiTIMED_result<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",5,"tumor")
+
+HiTIMED_result$SampleID <- rownames(HiTIMED_result)
+
+HiTIMED_result_immune<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",2,"tumor")
+
+HiTIMED_result_immune$SampleID <- rownames(HiTIMED_result)
+```
+
+
 Get GTEx data
 ```{r}
 
@@ -72,6 +132,27 @@ targets_GTEx <- read.csv("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/
 targets_GTEx$patient <- targets_GTEx$Filename
 rownames(targets_GTEx) <- targets_GTEx$patient
 targets_GTEx$SampleID<- targets_GTEx$patient
+
+# --- Harmonize CpGs ---
+common_cpgs_GTEx <- intersect(rownames(Betas_GTEx), rownames(centEpiFibIC.m))
+betas_GTEx_filtered <- Betas_GTEx[common_cpgs_GTEx, ]
+ref_filtered_GTEx <- centEpiFibIC.m[common_cpgs_GTEx, ]
+
+# --- Run EpiDISH ---
+epidish_GTEx <- epidish(beta.m = betas_GTEx_filtered, ref.m = ref_filtered_GTEx, method = "RPC")
+cell_props_GTEx <- as.data.frame(epidish_GTEx$estF) * 100
+cell_props_GTEx$SampleID <- rownames(cell_props_GTEx)
+
+# Optional: Merge with metadata
+cell_props_GTEx <- merge(cell_props_GTEx, targets_GTEx, by = "SampleID")
+
+HiTIMED_result_GTEx<-HiTIMED_deconvolution(Betas_GTEx,"COAD",h = 5,"tumor")
+
+HiTIMED_result_GTEx$SampleID <- rownames(HiTIMED_result_GTEx)
+
+HiTIMED_result_immune_GTEx<-HiTIMED_deconvolution(Betas_GTEx,"COAD",h = 2,"tumor")
+
+HiTIMED_result_immune_GTEx$SampleID <- rownames(HiTIMED_result_GTEx)
 
 ```
 
@@ -88,15 +169,172 @@ tcga.cell$COAD_Deconv2#MASS
 
 tcga_T = t(tcga.dnam)
 
-# MSet_noob_T <- preprocessNoob(tcga.dnam)
-# beta_matrix_TCGA<-getBeta(MSet_noob_T)
+# Transpose back to p x n for EpiDISH (rows = CpGs)
+tcga_T_beta <- t(tcga_T)
+
+# Ensure you're using tcga_T as is, not transposed again
+common_cpgs_TCGA <- intersect(rownames(tcga_T), rownames(centEpiFibIC.m))
+betas_TCGA_filtered <- tcga_T[common_cpgs_TCGA, ]
+ref_filtered_TCGA <- centEpiFibIC.m[common_cpgs_TCGA, ]
+
+# Run EpiDISH
+epidish_TCGA <- epidish(beta.m = betas_TCGA_filtered, ref.m = ref_filtered_TCGA, method = "RPC")
+cell_props_TCGA <- as.data.frame(epidish_TCGA$estF) * 100
+cell_props_TCGA$SampleID <- rownames(cell_props_TCGA)
+
+# Optional: Merge with TCGA phenotype data
+tcga.pheno$SampleID <- rownames(tcga.pheno)
+
+cell_props_TCGA <- merge(
+  cell_props_TCGA,
+  tcga.pheno,
+  by = "SampleID"
+)
+#cell_props_TCGA <- merge(cell_props_TCGA, tcga.pheno, by = "SampleID")
+
+HiTIMED_result_TCGA<-HiTIMED_deconvolution(tumor_beta = tcga_T,tumor_type = "COAD",h = 5)
+
+HiTIMED_result_TCGA$SampleID <- rownames(HiTIMED_result_TCGA)
+
+HiTIMED_result_immune_TCGA<-HiTIMED_deconvolution(tumor_beta = tcga_T,tumor_type = "COAD",h = 2)
+
+HiTIMED_result_immune_TCGA$SampleID <- rownames(HiTIMED_result_TCGA)
 
 ```
 
 
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggpubr)
+
+# ---- Function to Reshape Data ----
+extract_subset <- function(df, source_label, cell_types = c("CD8T", "Tumor", "Epithelial")) {
+  df %>%
+    select(all_of(cell_types), SampleID) %>%
+    pivot_longer(-SampleID, names_to = "CellType", values_to = "Proportion") %>%
+    mutate(Source = source_label)
+}
+
+# ---- Combine Datasets ----
+df_DH <- extract_subset(HiTIMED_result, "DH")
+df_GTEx <- extract_subset(HiTIMED_result_GTEx, "GTEx")
+df_TCGA <- extract_subset(HiTIMED_result_TCGA, "TCGA")
+
+combined_df <- bind_rows(df_DH, df_GTEx, df_TCGA)
+
+# ---- Define comparisons ----
+comparisons <- list(c("DH", "GTEx"), c("DH", "TCGA"))
+
+# ---- Boxplot with Significance Annotations ----
+ggplot(combined_df, aes(x = Source, y = Proportion, fill = Source)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  facet_wrap(~ CellType, scales = "free_y") +
+  stat_compare_means(comparisons = comparisons, method = "wilcox.test",
+                     label = "p.signif", hide.ns = TRUE) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Cell Type Proportions Across Datasets",
+       y = "Estimated Proportion",
+       x = "Dataset") +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(size = 14),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggpubr)
+
+# ---- Function to Extract Cell Types ----
+extract_subset <- function(df, source_label, cell_types = c("CD8T", "Tumor", "Epithelial")) {
+  df %>%
+    select(all_of(cell_types), SampleID) %>%
+    pivot_longer(-SampleID, names_to = "CellType", values_to = "Proportion") %>%
+    mutate(Source = source_label)
+}
+
+# ---- Combine Only DH and GTEx ----
+df_DH <- extract_subset(HiTIMED_result, "DH")
+df_GTEx <- extract_subset(HiTIMED_result_GTEx, "GTEx")
+
+combined_df <- bind_rows(df_DH, df_GTEx)
+
+# ---- Define Comparisons ----
+comparisons <- list(c("DH", "GTEx"))
+
+# ---- Plot ----
+ggplot(combined_df, aes(x = Source, y = Proportion, fill = Source)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  facet_wrap(~ CellType, scales = "free_y") +
+  stat_compare_means(comparisons = comparisons, method = "wilcox.test",
+                     label = "p.signif", hide.ns = TRUE) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Comparison of Cell Type Proportions: DH vs GTEx",
+       y = "Estimated Proportion",
+       x = "Dataset") +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(size = 14),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
 
 
-For obtaining more data
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggpubr)
+
+# ---- Function to Extract HiTIMED Cell Types ----
+extract_subset_hitimed <- function(df, source_label, cell_types = c("CD8T", "Tumor", "Epithelial")) {
+  df %>%
+    select(all_of(cell_types), SampleID) %>%
+    pivot_longer(-SampleID, names_to = "CellType", values_to = "Proportion") %>%
+    mutate(Source = source_label)
+}
+
+# ---- Extract HiTIMED Results for DH and GTEx ----
+df_DH_hitimed <- extract_subset_hitimed(HiTIMED_result, "DH")
+df_GTEx_hitimed <- extract_subset_hitimed(HiTIMED_result_GTEx, "GTEx")
+
+# ---- Function to Extract Fibroblast Estimates from EpiDISH/EpiScore ----
+extract_subset_fib <- function(epi_df, source_label) {
+  epi_df %>% 
+    select(Fib, SampleID) %>% 
+    pivot_longer(-SampleID, names_to = "CellType", values_to = "Proportion") %>% 
+    mutate(Source = source_label)
+}
+
+# ---- Extract Fibroblast Results for DH and GTEx ----
+df_DH_fib <- extract_subset_fib(cell_type_proportions_df, "DH")
+df_GTEx_fib <- extract_subset_fib(cell_props_GTEx, "GTEx")
+
+# ---- Combine All Results ----
+combined_df <- bind_rows(df_DH_hitimed, df_GTEx_hitimed, df_DH_fib, df_GTEx_fib)
+
+# ---- Define Comparisons (DH vs GTEx for each cell type) ----
+comparisons <- list(c("DH", "GTEx"))
+
+# ---- Plot: Faceted Boxplots by CellType ----
+ggplot(combined_df, aes(x = Source, y = Proportion, fill = Source)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  facet_wrap(~ CellType, scales = "free_y") +
+  stat_compare_means(comparisons = comparisons, method = "wilcox.test",
+                     label = "p.signif", hide.ns = TRUE) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Comparison of Cell Type Proportions: DH vs GTEx",
+       y = "Estimated Proportion (%)",
+       x = "Dataset") +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(size = 14),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+
+
+For obtaining more data from TCGA
 ```{r}
 library(TCGAbiolinks)
 
@@ -111,9 +349,18 @@ query.met <- GDCquery(
 files <- getResults(query.met)
 head(files$file_id)
 # Download the data
-GDCdownload(query.met)
+GDCdownload(query.met, files.per.chunk = 20)
 
 # Prepare data for analysis
 data.met <- GDCprepare(query.met)
+
+library(SummarizedExperiment)
+
+mat = assay(data.met)
+df = as.data.frame(mat)
+df$cpg <- rownames(df)
+df <- df[,c("cpg",setdiff(colnames(df),"cpg"))]
+
+
 ```
 

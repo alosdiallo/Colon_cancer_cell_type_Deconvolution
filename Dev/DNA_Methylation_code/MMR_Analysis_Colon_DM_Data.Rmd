@@ -268,10 +268,10 @@ Generating a Venn Diagram showing overplap of MMR gene mutations with Metastasis
 library(VennDiagram)
 
 # Step 1: Create logical vectors for each MMR gene mutation
-mlh1_mutated <- targets_expanded$MLH1 == 1
-msh2_mutated <- targets_expanded$MSH2 == 1
-pms2_mutated <- targets_expanded$PMS2 == 1
-msh6_mutated <- targets_expanded$MSH6 == 1
+mlh1_mutated <- targets_expanded$MLH1 == 0
+msh2_mutated <- targets_expanded$MSH2 == 0
+pms2_mutated <- targets_expanded$PMS2 == 0
+msh6_mutated <- targets_expanded$MSH6 == 0
 
 # Step 2: Generate a Venn diagram to visualize the overlap
 venn_plot <- venn.diagram(
