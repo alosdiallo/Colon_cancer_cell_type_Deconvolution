@@ -5,248 +5,270 @@ output: html_notebook
 
 ```{r}
 # -------------------------------------------------------------------
-#  Cell-type proportion pipeline
+#  Cell-type proportion pipeline  (HiTIMED + EpiSCORE)
 #  – Dartmouth EPIC v1/v2, TCGA COAD (450 K), GTEx colon normals –
-#    • QC (ENmix + Noob)          • ComBat batch correction
-#    • HiTIMED level-2 & level-6  • EpiSCORE (EpiDISH RPC)
-#    • Derive metastasis flags for TCGA from AJCC M & N codes
-#    • Wilcoxon tests + box-plots (PNG)
+#    • QC + Noob             • ComBat batch correction (disease anchor)
+#    • HiTIMED L2 & L6       • EpiSCORE (EpiDISH RPC)
+#    • Metastasis flags  +  MSI flags (MLH1 / MSI-PCR)
+#    • Wilcoxon tests:        ▸ disease-only  (met flags)
+#                             ▸ tumour vs normal
+#                             ▸ disease-only stratified by MSI
 # -------------------------------------------------------------------
-#  0.  Paths – edit these four only
+#  ⬇⬇  *** EDIT NOTHING BELOW EXCEPT THESE PATHS  ***  ⬇⬇
 # -------------------------------------------------------------------
-PATH_DH_32 <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"            # 32 EPIC v2
-PATH_DH_25 <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"      # 25 EPIC v1
-META_DH    <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"                                               # Dartmouth clinical
-FILE_TCGA  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/TCGA_data.rds"         # list(dnam, pheno)
-FILE_GTEX  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/GTEx/GTEx_samples.rds"     # β matrix
+PATH_DH_32 <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"          # 32 EPIC v2
+PATH_DH_25 <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"    # 25 EPIC v1
+META_DH    <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"                                             # Dartmouth clinical
+FILE_TCGA  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/TCGA_data.rds"       # list(dnam, pheno)
+FILE_MSI   <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/msi_tcga.rds"        # TCGA MSI calls
+FILE_GTEX  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/GTEx/GTEx_samples.rds"   # β matrix
 # -------------------------------------------------------------------
 
-# ---- 1.  Libraries -------------------------------------------------
 suppressPackageStartupMessages({
-  library(minfi)               # preprocessNoob
-  library(ENmix)               # QCinfo
-  library(sesame)              # betasCollapseToPfx
+  library(minfi);   library(ENmix);    library(sesame)
   library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-  library(sva)                 # ComBat
-  library(HiTIMED)
-  library(EpiDISH)             # EpiSCORE RPC
-  library(dplyr)
-  library(tidyr)
-  library(ggplot2)
-  library(ggpubr)              # stat_compare_means
-  library(tibble)
+  library(sva);     library(HiTIMED);  library(EpiDISH)
+  library(dplyr);   library(tidyr);    library(ggplot2); library(ggpubr)
+  library(tibble);  library(fs); library(purrr)
 })
 
-# ---- 2.  Helpers ---------------------------------------------------
-anno     <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-sex_cpgs <- rownames(anno)[anno$chr %in% c("chrX", "chrY")]
-rm_sex   <- function(beta) beta[!(rownames(beta) %in% sex_cpgs), ]
+dir_create("plots"); dir_create("statistics")
 
-orient   <- function(mat) if (grepl("^cg", rownames(mat)[1])) mat else t(mat)
+# ------------------------------  helpers ---------------------------
+anno      <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+sex_cpgs  <- rownames(anno)[anno$chr %in% c("chrX","chrY")]
+rm_sex    <- \(b) b[!(rownames(b) %in% sex_cpgs), ]
+orient    <- \(m) if (grepl("^cg", rownames(m)[1])) m else t(m)
 
-run_noob_qc <- function(idat_dir) {
-  message("▶ Reading IDATs: ", idat_dir)
-  rg   <- read.metharray.exp(idat_dir, recursive = TRUE)
-  bet  <- getBeta(preprocessNoob(rg))
-  rgx  <- read.metharray.exp(idat_dir, recursive = TRUE, extended = TRUE)
-  bad  <- ENmix::QCinfo(rgx)$badCpG
+run_noob_qc <- function(idat){
+  rg  <- read.metharray.exp(idat, recursive = TRUE)
+  bet <- getBeta(preprocessNoob(rg))
+  rgx <- read.metharray.exp(idat, recursive = TRUE, extended = TRUE)
+  bad <- ENmix::QCinfo(rgx)$badCpG
   rm_sex(bet[!(rownames(bet) %in% bad), ])
 }
 
-run_episcore <- function(beta) {
+run_episcore <- function(beta){
   common <- intersect(rownames(beta), rownames(centEpiFibIC.m))
-  out    <- epidish(beta.m = beta[common, ],
-                    ref.m  = centEpiFibIC.m[common, ],
+  est    <- epidish(beta.m = beta[common, ], ref.m = centEpiFibIC.m[common, ],
                     method = "RPC")$estF
-  as.data.frame(out) * 100       # samples × 3 (%)
+  as.data.frame(est) * 100
 }
 
-wilcox_flag <- function(df, flag, cols) {
-  bind_rows(lapply(cols, function(cn) {
+wilcox_flag <- function(df, flag, cols){
+  bind_rows(lapply(cols, \(cn){
     sub <- df %>% filter(!is.na(.data[[flag]]))
-    if (length(unique(sub[[flag]])) != 2 ||
-        any(table(sub[[flag]]) < 2))               # need ≥2 per group
-      return(data.frame(Cell = cn, Flag = flag,
-                        n0 = NA, n1 = NA, P = NA))
-    w <- wilcox.test(sub[[cn]] ~ sub[[flag]])
-    data.frame(Cell = cn, Flag = flag,
-               n0 = table(sub[[flag]])[1],
-               n1 = table(sub[[flag]])[2],
-               P  = w$p.value)
+    if(length(unique(sub[[flag]])) != 2)
+      return(data.frame(Cell = cn, Flag = flag, P = NA,
+                        n0 = NA, n1 = NA))
+    w  <- wilcox.test(sub[[cn]] ~ sub[[flag]])
+    data.frame(Cell = cn, Flag = flag, P = w$p.value,
+               n0 = sum(sub[[flag]] == unique(sub[[flag]])[1]),
+               n1 = sum(sub[[flag]] == unique(sub[[flag]])[2]))
   }))
 }
 
-plot_box <- function(df, y, flag, file, ylab = y) {
+plot_box <- function(df, y, x, file,
+                     ylab = y, xlab = x,
+                     title = paste(y, "vs", x),
+                     palette = c("#E64B35FF", "#4DBBD5FF")) {
 
-  d <- df %>% filter(!is.na(.data[[flag]]))
+  # keep only rows with non-NA x
+  df2 <- df %>% filter(!is.na(.data[[x]]))
 
-  # ---- make grouping variable discrete ----
-  d[[flag]] <- factor(d[[flag]])
+  # nothing to plot if fewer than 2 levels remain
+  if (n_distinct(df2[[x]]) < 2) return(invisible())
 
-  # need ≥2 levels *and* at least 2 obs per level for a Wilcoxon test
-  add_p <- (nlevels(d[[flag]]) == 2) &&
-           all(table(d[[flag]]) >= 2)
+  # convert x → factor so ggplot orders boxes nicely
+  df2[[x]] <- factor(df2[[x]])
 
-  p <- ggplot(d, aes_string(flag, y, fill = flag)) +
-         geom_boxplot(outlier.shape = NA, alpha = .4) +
-         geom_jitter(width = .25, height = 0, size = 1) +
-         scale_fill_brewer(palette = "Set2") +
-         theme_bw() +
-         theme(axis.text.x = element_text(angle = 45, hjust = 1),
-               legend.position = "none") +
-         labs(x = NULL, y = ylab,
-              title = paste(ylab, "vs", flag))
+  p <- ggplot(df2, aes(x = .data[[x]], y = pmax(.data[[y]], 0))) +   # clip <0 to 0
+    geom_boxplot(outlier.shape = NA, fill = palette[1]) +
+    geom_jitter(width = .20, size = 1, alpha = .7) +
+    stat_compare_means(method = "wilcox.test", label.y = max(df2[[y]], na.rm = TRUE) * 1.05) +
+    theme_bw(base_size = 12) +
+    labs(x = xlab, y = ylab, title = title)
 
-  if (add_p)
-    p <- p + stat_compare_means(method = "wilcox.test",
-                                label = "p.format", hide.ns = TRUE)
-
-  ggsave(file, p, width = 5, height = 4.5, dpi = 300)
+  ggsave(file, p, width = 4, height = 4, dpi = 300)   # ggsave has no `useDingbats` for .png
 }
 
-# ---- 3.  Dartmouth EPIC v2 / v1 -----------------------------------
-beta_32 <- run_noob_qc(PATH_DH_32)                   # EPIC v2
-beta_25 <- run_noob_qc(PATH_DH_25)                   # EPIC v1
-beta_32 <- betasCollapseToPfx(beta_32)
-beta_25 <- betasCollapseToPfx(beta_25)
+# ------------------------------ 1 . Dartmouth ----------------------
+beta_32 <- run_noob_qc(PATH_DH_32)
+beta_25 <- run_noob_qc(PATH_DH_25)
+beta_32 <- betasCollapseToPfx(beta_32); beta_25 <- betasCollapseToPfx(beta_25)
 common_DH <- intersect(rownames(beta_32), rownames(beta_25))
 beta_DH   <- cbind(beta_32[common_DH, ], beta_25[common_DH, ])
-platform_DH <- rep(c("EPIC_v2", "EPIC_v1"),
-                   c(ncol(beta_32), ncol(beta_25)))
+platform_DH <- rep(c("EPIC_v2","EPIC_v1"), c(ncol(beta_32), ncol(beta_25)))
 
-# ---- 4.  TCGA COAD 450K  + flags ----------------------------------
+# ------------------------------ 2 . TCGA ---------------------------
 TCGA     <- readRDS(FILE_TCGA)
-ph       <- TCGA$pheno
-ph <- ph %>%
-  mutate(Distant_Mets = case_when(
-           ajcc_pathologic_m == "M0"                        ~ 0,
-           grepl("^M1", ajcc_pathologic_m)                  ~ 1,
-           TRUE                                             ~ NA_real_),
-         LN_pos = case_when(
-           ajcc_pathologic_n == "N0"                        ~ 0,
-           grepl("^N", ajcc_pathologic_n) & ajcc_pathologic_n != "N0" ~ 1,
-           TRUE                                             ~ NA_real_),
-         ln_only  = ifelse(LN_pos == 1 & Distant_Mets == 0, 1,
-                           ifelse(LN_pos == 0 & Distant_Mets == 0, 0, NA_real_)),
-         any_mets = ifelse(Distant_Mets == 1 | LN_pos == 1, 1,
-                           ifelse(Distant_Mets == 0 & LN_pos == 0, 0, NA_real_)),
-         SampleID = bcr_patient_barcode) %>%
-  select(SampleID, any_mets, ln_only, Distant_Mets)
-
-beta_TCGA    <- orient(rm_sex(TCGA$dnam))
+beta_TCGA <- orient(rm_sex(TCGA$dnam))
 platform_TCGA <- rep("HM450", ncol(beta_TCGA))
 
-# ---- 5.  GTEx normals --------------------------------------------
-beta_GTEx    <- orient(rm_sex(readRDS(FILE_GTEX)))
+# metastasis flags (any_mets, ln_only, Distant_Mets)
+ph <- TCGA$pheno %>%
+  mutate(Distant_Mets = ifelse(ajcc_pathologic_m == "M0", 0,
+                         ifelse(grepl("^M1", ajcc_pathologic_m), 1, NA_real_)),
+         LN_pos       = ifelse(ajcc_pathologic_n == "N0", 0,
+                         ifelse(grepl("^N", ajcc_pathologic_n), 1, NA_real_)),
+         ln_only      = ifelse(LN_pos==1 & Distant_Mets==0, 1,
+                         ifelse(LN_pos==0 & Distant_Mets==0, 0, NA_real_)),
+         any_mets     = ifelse(LN_pos==1 | Distant_Mets==1, 1,
+                         ifelse(LN_pos==0 & Distant_Mets==0, 0, NA_real_)),
+         SampleID     = substr(bcr_patient_barcode,1,12)) %>%
+  select(SampleID, any_mets, ln_only, Distant_Mets)
+
+## --- 3 . TCGA MSI -------------------------------------------------
+msi_raw <- readRDS(FILE_MSI)
+
+candidates <- c("bcr_patient_barcode",        # most GDC JSON/TSV
+                "case_submitter_id",          # alternate GDC download
+                "sample_id", "SampleID")
+
+bc_col <- intersect(candidates, colnames(msi_raw))[1]
+
+if (length(bc_col) == 0)
+  stop("❌ Couldn’t find a TCGA barcode column in the MSI RDS file.")
+
+status_col <- "mononucleotide_and_dinucleotide_marker_panel_analysis_status"
+
+msi_tbl <- msi_raw %>% 
+  ## copy the chosen barcode column into a standard name
+  mutate(SampleID_raw = .data[[bc_col]]) %>%     
+  transmute(
+    SampleID = substr(SampleID_raw, 1, 12),       # 12-char tumour barcode
+    MSI_bin  = case_when(
+      .data[[status_col]] %in% c("MSI-H", "MSI-L") ~ 1,
+      .data[[status_col]] == "MSS"                 ~ 0,
+      TRUE                                         ~ NA_real_
+    )
+  )
+# ------------------------------ 4 . GTEx ---------------------------
+beta_GTEx <- orient(rm_sex(readRDS(FILE_GTEX)))
 platform_GTEx <- rep("GTEx", ncol(beta_GTEx))
 
-# ---- 6.  Combine and ComBat  ------------------------------------
-
-### 6A ─ ComBat on the tumour datasets only (Dartmouth + TCGA) ----
-common_dis <- Reduce(intersect,
-                     list(rownames(beta_DH), rownames(beta_TCGA)))
-
-beta_dis   <- cbind(beta_DH [common_dis, ],
-                    beta_TCGA[common_dis, ])
-
-## drop CpGs that still contain an NA in *either* cohort
-beta_dis   <- beta_dis[rowSums(is.na(beta_dis)) == 0, ]
-
-## rebuild the intersection so it reflects the NA-filtered rows
-common_dis <- rownames(beta_dis)
-
-batch_dis  <- factor(c(platform_DH, platform_TCGA))   # EPIC vs HM450
+# ------------------------------ 5 . ComBat -------------------------
+#
+# 5A. First stage – harmonise the two tumour cohorts (DH EPIC + TCGA 450K)
+# ----------------------------------------------------------------------------
+common12   <- intersect(rownames(beta_DH), rownames(beta_TCGA))        # CpGs in BOTH tumour sets
+beta_dis   <- cbind(beta_DH[common12, ], beta_TCGA[common12, ])       # DH | TCGA matrix
+beta_dis   <- beta_dis[rowSums(is.na(beta_dis)) == 0, ]               # drop any CpG with NA
+batch_dis  <- factor(c(platform_DH, platform_TCGA))                   # EPIC_v1/2 vs HM450
 
 beta_bc_dis <- ComBat(beta_dis,
                       batch       = batch_dis,
                       par.prior   = TRUE,
-                      prior.plots = FALSE)
+                      prior.plots = FALSE)                            # tumour-only batch-corrected matrix
 
-### 6B ─ bring in GTEx as its own batch; keep disease as reference --
-common_all <- intersect(common_dis, rownames(beta_GTEx))
+# 5B. Second stage – add GTEx normals as a separate batch
+# ----------------------------------------------------------------------------
+# 1. Row set that is present in BOTH (after QC + 1st ComBat)
+commonAll  <- intersect(rownames(beta_bc_dis), rownames(beta_GTEx))
 
-beta_all   <- cbind(beta_bc_dis      [common_all, ],
-                    beta_GTEx        [common_all, ])
+# 2. Conform both matrices to that row set
+beta_bc_dis <- beta_bc_dis[commonAll, ]
+beta_GTEx   <- beta_GTEx  [commonAll, ]
 
-batch_all  <- factor(c(rep("Disease", ncol(beta_bc_dis)),
-                       rep("GTEx",    ncol(beta_GTEx))))
+# 3. Combine & run ComBat again, anchoring on the disease (tumour) distribution
+beta_all  <- cbind(beta_bc_dis, beta_GTEx)                            # tumour | normals
+batch_all <- factor(c(rep("Disease", ncol(beta_bc_dis)),
+                      rep("GTEx",   ncol(beta_GTEx))),
+                    levels = c("Disease", "GTEx"))
 
 beta_bc <- ComBat(beta_all,
                   batch       = batch_all,
-                  ref.batch   = "Disease",   # anchor mean/var to tumour data
+                  ref.batch   = "Disease",     # keep tumour mean/SD as anchor
                   par.prior   = TRUE,
                   prior.plots = FALSE)
 
-# ---- 7.  HiTIMED level-2 & 6  ------------------------------------
+# ------------------------------ 6 . HiTIMED ------------------------
 h2 <- as.data.frame(HiTIMED_deconvolution(beta_bc, tumor_type = "COAD", 2))
 h6 <- as.data.frame(HiTIMED_deconvolution(beta_bc, tumor_type = "COAD", 6))
 h6$SampleID <- rownames(h6)
-h6$Platform <- platform
+h6$Platform <- factor(c(platform_DH, platform_TCGA, platform_GTEx))
 
-subpops  <- c("Bas","Eos","Neu","Mono","DC","Bnv","Bmem",
-              "CD4nv","CD4mem","Treg","CD8nv","CD8mem","NK")
+subpops   <- c("Bas","Eos","Neu","Mono","DC","Bnv","Bmem",
+               "CD4nv","CD4mem","Treg","CD8nv","CD8mem","NK")
 h6_norm <- h6 %>%
-  mutate(across(all_of(subpops),
-                ~ .x / h2$Immune, .names = "{.col}_norm"))
+  mutate(across(all_of(subpops), ~ .x / h2$Immune, .names = "{.col}_norm"))
 
-# ---- 8.  EpiSCORE (Tumour / Immune / Angiogenic) ------------------
-epi <- run_episcore(beta_bc)          # samples × 3
-epi$SampleID <- rownames(epi)
-epi$Platform <- platform
-write.csv(epi, "EpiSCORE_proportions.csv", row.names = FALSE)
+# ------------------------------ 7 . EpiSCORE -----------------------
+epi <- run_episcore(beta_bc)
 
-# ---- 9.  Merge Dartmouth + TCGA flags, label cohorts --------------
+# ------------------------------ 8 . Clinical meta + MSI ------------
 meta_DH <- read.csv(META_DH) %>%
-  mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_")) %>%
-  select(SampleID, any_mets, ln_only, Distant_Mets)
+  mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+         MSI_bin  = ifelse(MLH1 == 0, 1,
+                     ifelse(MLH1 == 1, 0, NA_real_))) %>%
+  select(SampleID, any_mets, ln_only, Distant_Mets, MSI_bin)
 
-all_flags <- bind_rows(meta_DH, ph)
+all_flags <- bind_rows(meta_DH, ph) %>%        # metastasis
+             left_join(msi_tbl, by = "SampleID", suffix = c("",".msi")) %>%
+             mutate(MSI_bin = coalesce(MSI_bin, MSI_bin.msi)) %>%
+             select(-MSI_bin.msi)
 
 h6_all <- h6_norm %>%
-  left_join(all_flags, by = "SampleID") %>%
   mutate(dataset = case_when(
-           Platform %in% c("EPIC_v1", "EPIC_v2") ~ "DH",
-           Platform == "HM450"                   ~ "TCGA",
-           Platform == "GTEx"                    ~ "GTEx",
-           TRUE                                  ~ "Unknown"))
+           grepl("^20", SampleID)   ~ "GTEx",
+           grepl("^TCGA", SampleID) ~ "TCGA",
+           TRUE                     ~ "DH")) %>%
+  left_join(all_flags, by = "SampleID")
 
 norm_cols <- paste0(subpops, "_norm")
+flags     <- c("any_mets","ln_only","Distant_Mets")
 
-# ---- 10A.  Disease-only Wilcoxon tests ----------------------------
-disease_df <- h6_all %>% filter(dataset %in% c("DH", "TCGA"))
+# ------------------------------ 9 A. disease-only tests ------------
+disease_df <- h6_all %>% filter(dataset %in% c("DH","TCGA"))
 
-tests_dis <- bind_rows(
-  wilcox_flag(disease_df, "any_mets",     norm_cols),
-  wilcox_flag(disease_df, "ln_only",      norm_cols),
-  wilcox_flag(disease_df, "Distant_Mets", norm_cols)
-)
-write.csv(tests_dis, "wilcox_disease_only_rawP.csv", row.names = FALSE)
+## (i)  non-stratified (as before) ----------------------------------
+wd <- bind_rows(lapply(flags, \(fl) wilcox_flag(disease_df, fl, norm_cols)))
+write.csv(wd, "statistics/wilcox_disease_only_rawP.csv", row.names = FALSE)
 
-# ---- 10B.  Tumour (DH+TCGA) vs Normal (GTEx) ----------------------
-tvn_df <- h6_all %>% mutate(Group = ifelse(dataset == "GTEx", "Normal", "Tumour"))
-tests_tvn <- wilcox_flag(tvn_df, "Group", norm_cols)
-write.csv(tests_tvn, "wilcox_tumour_vs_normal_rawP.csv", row.names = FALSE)
+## (ii) stable vs unstable -----------------------------------------
+wt <- wilcox_flag(disease_df, "MSI_bin", norm_cols)
+write.csv(wt, "statistics/wilcox_MSI_strata_rawP.csv", row.names = FALSE)
 
-# ---- 11.  Plot all comparisons  -----------------------------------
+## (iii) each metastasis flag *within* MSI strata -------------------
+tests_MSI0 <- bind_rows(lapply(flags, \(fl)
+                    wilcox_flag(disease_df %>% filter(MSI_bin == 0), fl, norm_cols))) %>%
+              mutate(MSI = "stable")
+tests_MSI1 <- bind_rows(lapply(flags, \(fl)
+                    wilcox_flag(disease_df %>% filter(MSI_bin == 1), fl, norm_cols))) %>%
+              mutate(MSI = "unstable")
+
+write.csv(tests_MSI0, "statistics/wilcox_MSI0_rawP.csv", row.names = FALSE)
+write.csv(tests_MSI1, "statistics/wilcox_MSI1_rawP.csv", row.names = FALSE)
+
+# ------------------------------ 9 B. tumour vs normal --------------
+tvn_df <- h6_all %>% mutate(Group = ifelse(dataset == "GTEx","Normal","Tumour"))
+tvn_res <- wilcox_flag(tvn_df, "Group", norm_cols)
+write.csv(tvn_res, "statistics/wilcox_tumour_vs_normal_rawP.csv", row.names = FALSE)
+
+# ------------------------------ 10 . plots --------------------------
 dir.create("plots", showWarnings = FALSE)
 
-for (cell in norm_cols)
-  plot_box(tvn_df,  cell, "Group",
-           file = file.path("plots",
-                            paste0(cell, "_Tumour_vs_Normal.png")))
+## 11A: tumour vs normal
+walk(norm_cols, ~plot_box(tvn_df, .x, "Group",
+                          file = file.path("plots", paste0(.x, "_Tumour_vs_Normal.png"))))
 
-
-## disease-only flags
+## 11B: disease-only flags (DH + TCGA)
 flags <- c("any_mets", "ln_only", "Distant_Mets")
-for (flag in flags)
-  for (cell in norm_cols)
-    plot_box(disease_df, cell, flag,
-             file = file.path("plots",
-                              paste0(cell, "_", flag, ".png")))
+walk(flags, \(fl)
+  walk(norm_cols, \(cell)
+    plot_box(disease_df, cell, fl,
+             file = file.path("plots", paste0(cell, "_", fl, ".png")))))
 
-# ---- 12.  Save HiTIMED level-6 (norm-by-Immune) -------------------
-write.csv(h6_norm, "HiTIMED_level6_norm.csv", row.names = FALSE)
+## 11C: MSI status within disease cohort
+walk(norm_cols, ~plot_box(disease_df, .x, "MSI_bin",
+                          file = file.path("plots", paste0(.x, "_MSI_bin.png"))))
 
-message("✅  Pipeline complete – CSVs and box-plots written.")
+# ------------------------------ 11 . export proportion tables -------
+write.csv(h6_norm,                       "HiTIMED_level6_norm.csv", row.names = FALSE)
+write.csv(epi %>% t() %>% as.data.frame() %>% rownames_to_column("SampleID") %>%
+           mutate(Platform = c(platform_DH, platform_TCGA, platform_GTEx)[match(SampleID, rownames(epi))]),
+          "EpiSCORE_proportions.csv", row.names = FALSE)
+
+message("✅  Pipeline finished – statistics & plots saved to 'statistics/' and 'plots/'")
 ```
 
