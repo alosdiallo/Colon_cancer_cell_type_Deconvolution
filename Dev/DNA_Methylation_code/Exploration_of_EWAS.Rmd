@@ -422,6 +422,7 @@ p_values  <- top_100_cpg$P.Value        # Get corresponding p-values
 cpg_pval <- setNames(p_values, cpg_sites)
 
 library(dplyr)
+library(msigdbr)
 
 h_gene_sets_df = msigdbr(species = "human", category = "H")
 
@@ -481,6 +482,7 @@ ggplot(top_terms, aes(x = ID, y = Size, fill = pvalue)) +
 head(hallmark_results_methylGSA, n =20)
 ```
 
+Don't use as this is not Hallmark
 ```{r}
 
 # -----------------------------
@@ -530,6 +532,8 @@ kegg_results_methylGSA <- methylglm(
   maxsize = 500,
   parallel = FALSE
 )
+
+library(kableExtra)
 
 kegg_results_methylGSA %>%
   arrange(pvalue) %>%

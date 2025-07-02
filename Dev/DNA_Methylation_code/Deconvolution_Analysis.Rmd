@@ -133,6 +133,14 @@ HiTIMED_result$SampleID <- rownames(HiTIMED_result)
 HiTIMED_result_immune<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",2,"tumor")
 
 HiTIMED_result_immune$SampleID <- rownames(HiTIMED_result)
+
+HiTIMED_result_immune_sub<-HiTIMED_deconvolution(DH_CRC_Betas,"COAD",3,"tumor")
+
+HiTIMED_result_immune_sub$SampleID <- rownames(HiTIMED_result)
+
+write.csv(HiTIMED_result,"/Users/adiallo/Desktop/HiTIMED_result.csv")
+write.csv(HiTIMED_result_immune,"/Users/adiallo/Desktop/HiTIMED_Level_2.csv")
+
 ```
 
 
@@ -274,13 +282,13 @@ print(summary_stats)
 
 	
 ```{r}
-CD4T_Norm = combined_data$CD4T/HiTIMED_result_immune$Immune
-combined_data$CD4T_Norm = CD4T_Norm
+Bmem = combined_data$Bmem/HiTIMED_result_immune_sub$Lymphocyte
+combined_data$Bmem_Norm = Bmem
 
 
 # ----- 2. Reshape your data for plotting -----
 # Define my relevant cell-type columns based on the HiTIMED paper:
-cell_types <- c("CD4T_Norm"
+cell_types <- c("Bmem_Norm"
 )
 
 long_data <- combined_data %>%

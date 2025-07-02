@@ -137,7 +137,7 @@ targets_GTEx$SampleID<- targets_GTEx$patient
 common_cpgs_GTEx <- intersect(rownames(Betas_GTEx), rownames(centEpiFibIC.m))
 betas_GTEx_filtered <- Betas_GTEx[common_cpgs_GTEx, ]
 ref_filtered_GTEx <- centEpiFibIC.m[common_cpgs_GTEx, ]
-
+  
 # --- Run EpiDISH ---
 epidish_GTEx <- epidish(beta.m = betas_GTEx_filtered, ref.m = ref_filtered_GTEx, method = "RPC")
 cell_props_GTEx <- as.data.frame(epidish_GTEx$estF) * 100
@@ -362,5 +362,28 @@ df$cpg <- rownames(df)
 df <- df[,c("cpg",setdiff(colnames(df),"cpg"))]
 
 
+#How to get the clinical data
+query_clinical <- GDCquery(
+    project = "TCGA-COAD", 
+    data.category = "Clinical",
+    data.type = "Clinical Supplement", 
+    data.format = "BCR Biotab"
+)
+
+GDCdownload(query_clinical)
+
+clinical.BCRtab.all <- GDCprepare(query_clinical)
+names(clinical.BCRtab.all)
+
+dplyr::glimpse(clinical.BCRtab.all$clinical_patient_coad)
+
+query_meth <- GDCquery(
+    project = "TCGA-COAD",
+    data.category = "DNA Methylation",
+    platform = "Illumina Human Methylation 450"
+)
+GDCdownload(query_meth)
+meth_data <- GDCprepare(query_meth)
+meth_barcodes <- substr(colnames(meth_data), 1, 12)
 ```
 
