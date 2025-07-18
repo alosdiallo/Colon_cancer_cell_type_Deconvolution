@@ -4,381 +4,517 @@ output: html_notebook
 ---
 
 ```{r}
-# ============================================================
-#  ewas_metastasis_analysis.R  (v0.8 — 2025‑06‑29)
-#  End‑to‑end pipeline for metastasis‑focused EWAS in colorectal cancer
-# ============================================================
-
-# ------------------------------------------------------------
-# 0.  Package setup ------------------------------------------
-# ------------------------------------------------------------
-
-pkgs_core <- c("minfi","sesame","ENmix","BSgenome.Hsapiens.UCSC.hg19","limma","sva","IlluminaHumanMethylationEPICanno.ilm10b4.hg19","IlluminaHumanMethylationEPICmanifest","IlluminaHumanMethylationEPICanno.ilm10b2.hg19")
-pkgs_stats <- c("qvalue","methylGSA","car","msigdbr")
-pkgs_misc  <- c("tidyverse","ggrepel","ggplot2","purrr","REMP")
-
-for (p in unique(c(pkgs_core, pkgs_stats, pkgs_misc))) {
-  if (!requireNamespace(p, quietly = TRUE)) {
-    if (p %in% pkgs_core) {
-      if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-      BiocManager::install(p, ask = FALSE, update = FALSE)
-    } else {
-      install.packages(p, quiet = TRUE)
-    }
-  }
-  suppressPackageStartupMessages(library(p, character.only = TRUE))
-}
-
-# ------------------------------------------------------------
-# 1.  Paths ---------------------------------------------------
-# ------------------------------------------------------------
-
-path_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
-path_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+###############################################################################
+#  ewas_metastasis_multi-deconv.R   ·   2025-07-17  (3 phenotypes, no Myeloid)
+#  EWAS with HiTIMED h = 2 / 3 / 5     •     phenotypes: any_mets / ln_only /
+#  distant   •   significant probes (|logFC| > 0.25 & P < 1e-3) highlighted
+###############################################################################
+##  USER SETTINGS  ────────────────────────────────────────────────────────────
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
 meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
 
-# ------------------------------------------------------------
-# 2.  Annotation ---------------------------------------------
-# ------------------------------------------------------------
+phenotypes            <- c(any = "any_mets", ln = "ln_only", dist = "distant")
+variance_percentile   <- 0.90          # 0 ⇒ keep all CpGs
+p_cut_global          <- 1e-3          # volcano cut-off
+logfc_cut             <- 0.25
+###############################################################################
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
 
-data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", package =
-       "IlluminaHumanMethylationEPICanno.ilm10b4.hg19", envir = environment())
-anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+suppressPackageStartupMessages({
+  library(minfi);  library(sesame);  library(ENmix)
+  library(matrixStats);  library(limma);  library(sva)
+  library(HiTIMED)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(tidyverse);    library(glue)
+})
 
-# ------------------------------------------------------------
-# 3.  Pre‑processing per platform ----------------------------
-# ------------------------------------------------------------
+###############################################################################
+##  1)  β-matrix  (cached)  ---------------------------------------------------
+###############################################################################
+out_cache <- "results_ewas_cache"
+dir.create(out_cache, showWarnings = FALSE)
 
-read_preprocess <- function(path, platform_label) {
-  rg <- minfi::read.metharray.exp(
-    base      = path,
-    recursive = TRUE,
-    extended  = TRUE,
-    force     = TRUE
-  )
+beta_rds <- file.path(out_cache, "beta_comb_qc.rds")
 
-  mset <- minfi::preprocessNoob(rg, dyeMethod = "single")
-
-  ## collapse EPIC-v2 duplicate CpGs
-  beta <- if (platform_label == "v2") {
-            sesame::betasCollapseToPfx(minfi::getBeta(mset))
-          } else {
-            minfi::getBeta(mset)
-          }
-
-  ## M-values
-  M <- log2(beta / (1 - beta))
-
-  ## QC filters
-  bad  <- ENmix::QCinfo(rg)$badCpG
-  keep <- setdiff(rownames(beta), bad)
-
-  anno_sub <- anno[match(keep, anno$Name), ]
-  keep     <- keep[!(anno_sub$chr %in% c("chrX", "chrY"))]
-
-  list(
-    beta     = beta[keep, ],
-    M        = M[keep, ],
-    platform = platform_label
-  )
+read_preprocess <- function(path, tag){
+  rg  <- read.metharray.exp(path, recursive = TRUE, extended = TRUE, force = TRUE)
+  bet <- getBeta(preprocessNoob(rg, dyeMethod = "single"))
+  if (tag == "v2") bet <- betasCollapseToPfx(bet)
+  bad <- ENmix::QCinfo(rg)$badCpG
+  bet[setdiff(rownames(bet), bad), ]
 }
 
-# ------------------------------------------------------------
-# 4.  Deconvolution helpers ----------------------------------
-# ------------------------------------------------------------
-
-run_hitimed <- function(beta, tumor = "COAD", k = 6) {
-  as.data.frame(HiTIMED_deconvolution(beta, tumor, k))
+if (!file.exists(beta_rds)){
+  msg("Reading & NOOB-normalising v1 + v2 …")
+  beta1 <- read_preprocess(idat_v1, "v1")
+  beta2 <- read_preprocess(idat_v2, "v2")
+  common     <- intersect(rownames(beta1), rownames(beta2))
+  beta_comb  <- cbind(beta1[common, ], beta2[common, ])
+  saveRDS(beta_comb, beta_rds);  msg("β-matrix saved → ", beta_rds)
+} else {
+  msg("β-matrix cache found – loading ", beta_rds)
+  beta_comb <- readRDS(beta_rds)
 }
 
-# ------------------------------------------------------------
-# 5.  Metadata helpers & design ------------------------------
-# ------------------------------------------------------------
+## variance filter -----------------------------------------------------------
+M.mat <- log2(beta_comb / (1 - beta_comb) + 1e-6)
+if (variance_percentile > 0){
+  var_vec <- rowVars(M.mat, na.rm = TRUE)
+  var_cut <- quantile(var_vec, variance_percentile, na.rm = TRUE)
+  keep_id <- names(var_vec)[var_vec > var_cut]
+  beta_comb <- beta_comb[keep_id, ];   M.mat <- M.mat[keep_id, ]
+  msg(length(keep_id), " CpGs retained (top ", 100*(1-variance_percentile),
+      "% variance)")
+} else msg("Variance filter skipped.")
 
-make_mets_vars <- function(df) {
-  df %>% mutate(
-    mets_cat = case_when(
-      any_mets == FALSE                         ~ "NoMetastasis",
-      ln_only  == TRUE & Distant_Mets == FALSE  ~ "LNMetastasis",
-      Distant_Mets == TRUE                      ~ "DistantMetastasis",
-      TRUE ~ NA_character_
+##############################################################################
+##  2)  Helper:   collapse HiTIMED fractions  (NO Myeloid)                   ##
+##############################################################################
+collapse_frac <- function(df){
+  n <- nrow(df);  zero <- numeric(n)
+  get <- \(c) if (c %in% names(df)) as.numeric(df[[c]]) else zero
+  
+  tibble(
+    SampleID    = df$SampleID,
+    Tumor       = get("Tumor"),
+    Fibroblast  = get("Fib"),
+    Endothelial = get("Endothelial"),
+    Epithelial  = get("Epithelial"),
+    Stromal     = get("Stromal"),
+    CD8_T       = get("CD8mem") + get("CD8nv"),
+    CD4_Treg    = get("CD4mem") + get("CD4nv") + get("Treg"),
+    B_total     = get("Bmem")   + get("Bnv")
+  ) %>% mutate(across(-SampleID, as.numeric))
+}
+
+tier_template <- list(
+  Tier1 = c("age","sex_num","MLH1_num"),
+  Tier2 = c("age","sex_num","MLH1_num","Tumor"),
+  Tier3 = c("age","sex_num","MLH1_num","Tumor","Fibroblast",
+            "Endothelial","Epithelial","Stromal",
+            "CD8_T","CD4_Treg","B_total")
+)
+trim_tiers <- \(tiers, avail) lapply(tiers, \(v) intersect(v, avail))
+
+##############################################################################
+##  3)  De-convolution functions  -------------------------------------------
+##############################################################################
+run_hitimed <- function(h){
+  msg("→ HiTIMED h = ", h)
+  HiTIMED_deconvolution(beta_comb, "COAD", h = h) %>%
+    as.data.frame() %>% rownames_to_column("SampleID")
+}
+
+##############################################################################
+##  4)  Volcano helper  (significant points in red)                          ##
+##############################################################################
+make_volc <- function(tt, ttl, pcut = p_cut_global, vcut = logfc_cut){
+  tt2 <- tt %>%
+           mutate(sig = P.Value < pcut & abs(logFC) > vcut,
+                  negP = -log10(P.Value))
+  
+  ggplot(tt2, aes(logFC, negP)) +
+    geom_point(aes(color = sig), alpha = .65, size = 1) +
+    scale_color_manual(values = c(`TRUE` = "#d73027", `FALSE` = "grey60"),
+                       guide = "none") +
+    geom_vline(xintercept = c(-vcut, vcut), lty = 2) +
+    geom_hline(yintercept = -log10(pcut),  lty = 2) +
+    labs(title = ttl, x = "log2 FC", y = "−log10 P") +
+    theme_classic(base_size = 11)
+}
+
+##############################################################################
+##  5)  Main loop over phenotypes                                            ##
+##############################################################################
+for (pheno_tag in names(phenotypes)){         # "any" / "ln" / "dist"
+  
+  phenotype_to_use <- phenotypes[[pheno_tag]]
+  msg("\n================  Phenotype: ", phenotype_to_use, "  ================")
+  
+  ## ---------------- metadata (re-created per phenotype) -------------------
+  meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+            mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+                   any_mets = ifelse(any_mets ,1L,0L),
+                   distant  = ifelse(Distant_Mets,1L,0L),
+                   ln_only  = ifelse(ln_only ,1L,0L),
+                   sex_num  = ifelse(sex=="M",1,0),
+                   MLH1_num = ifelse(MLH1==1,1,0),
+                   Array_Version = ifelse(SampleID %in% colnames(beta_comb),
+                                          "v1","v2"),
+                   pheno_bin = .data[[phenotype_to_use]])
+  stopifnot(length(unique(meta$pheno_bin)) == 2)
+  
+  ## ---------------- run HiTIMED once per h level --------------------------
+  deconv_list <- list(
+    H2 = run_hitimed(2),
+    H3 = run_hitimed(3),
+    H5 = run_hitimed(5)
+  )
+  
+  ## ---------------- EWAS worker ------------------------------------------
+  fit_one_tag <- function(tag, frac_df){
+    
+    msg("----  ", tag, "  ----")
+    out_dir <- file.path(paste0("results_ewas_", pheno_tag), tag)
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    
+    ## merge & QC
+    frac_w <- collapse_frac(frac_df)
+    meta2  <- meta %>% left_join(frac_w, by = "SampleID")
+    
+    fmat <- frac_w %>% column_to_rownames("SampleID") %>% as.matrix()
+    ok   <- rowSums(is.na(fmat)) == 0 & rowSums(fmat) > 0
+    keep <- rownames(fmat)[ok]
+    
+    M_samp <- M.mat[, keep]
+    meta_f <- meta2 %>% filter(SampleID %in% keep)
+    
+    ## ComBat
+    M_cb <- if (length(unique(meta_f$Array_Version)) > 1){
+              mod_cb <- model.matrix(~ age + sex_num + MLH1_num + pheno_bin,
+                                     meta_f)
+              ComBat(M_samp, batch = factor(meta_f$Array_Version),
+                     mod = mod_cb, par.prior = TRUE, prior.plots = FALSE)
+            } else M_samp
+    
+    ## tier fits
+    tier_list <- trim_tiers(tier_template, names(meta_f))
+    fits <- list()
+    for (tn in names(tier_list)){
+      covs <- tier_list[[tn]]
+      nz   <- covs[sapply(meta_f[covs], sd, na.rm = TRUE) > 0]
+      form <- if (length(nz)==0) ~ pheno_bin
+              else as.formula(paste("~ pheno_bin +", paste(nz, collapse = " + ")))
+      des  <- model.matrix(form, meta_f)
+      fits[[tn]] <- list(design = des,
+                         fit    = eBayes(lmFit(M_cb, des),
+                                         trend = TRUE, robust = TRUE))
+    }
+    saveRDS(fits, file = file.path(out_dir, "ewas_fits.rds"))
+    
+    ## volcano
+    for (tn in names(fits)){
+      tt <- topTable(fits[[tn]]$fit, coef = "pheno_bin", number = Inf)
+      ttl <- glue("{tn} — {tag} — {pheno_tag}")
+      ggsave(file.path(out_dir,
+             glue("{tag}_{tn}_{pheno_tag}_volcano.png")),
+             make_volc(tt, ttl), width = 5, height = 4)
+    }
+  }
+  
+  walk2(names(deconv_list), deconv_list, fit_one_tag)
+}
+
+msg("\n✅  EWAS finished for ALL phenotypes (any / ln / dist) and H2-H5")
+```
+
+
+Hallmark Pathway Analysis:
+```{r}
+###############################################################################
+#  Hallmark pathway analysis (fixed) ─ runs on *existing* EWAS results
+#  • Uses robust methylgometh function
+#  • Mode A:  CpGs with raw-P < 1e-3
+#  • Mode B:  top-N (= 2000) CpGs by raw-P
+###############################################################################
+suppressPackageStartupMessages({
+  library(limma)
+  library(methylGSA)
+  library(msigdbr)
+  library(dplyr)
+  library(purrr)
+  library(readr)
+  library(ggplot2)
+  library(glue)
+  library(tibble)
+})
+
+# ---------------------------------------------------------------------------
+# 0)  where your EWAS folders live (keep as-is if you followed the template)
+# ---------------------------------------------------------------------------
+phen_dirs <- c("results_ewas_any",
+               "results_ewas_ln",
+               "results_ewas_dist")      # add/remove if you renamed
+
+# ---------------------------------------------------------------------------
+# 1)  one-time Hallmark gene-set list
+# ---------------------------------------------------------------------------
+hallmark_list <- msigdbr("Homo sapiens", category = "H") %>%
+  distinct(gs_name, entrez_gene) %>%
+  group_by(gs_name) %>%
+  summarise(genes = list(entrez_gene), .groups = "drop") %>%
+  tibble::deframe()
+
+# ---------------------------------------------------------------------------
+# 2)  helpers
+# ---------------------------------------------------------------------------
+safe_methylgometh <- function(tt, idx,
+                              minsize = 10,      # Hallmark sets can be small
+                              maxsize = 500) {
+  if (length(idx) < 2) return(NULL)            # need ≥2 probes
+
+  # Correctly create named vector of p-values
+  cpg_pval <- setNames(tt$P.Value[idx], tt$CpG_ID[idx])
+
+  tryCatch(
+    # Switched to the more robust methylgometh function
+    methylGSA::methylgometh(
+      cpg.pval   = cpg_pval,
+      array.type = "EPIC",
+      GS.list    = hallmark_list,
+      GS.idtype  = "ENTREZID",
+      minsize    = minsize,
+      maxsize    = maxsize
     ),
-    mets_cat     = factor(mets_cat, levels = c("NoMetastasis","LNMetastasis","DistantMetastasis")),
-    any_mets_bin = factor(ifelse(any_mets, "Met", "NoMet"), levels = c("NoMet","Met")),
-    mets_stage   = as.numeric(mets_cat) - 1L)
-}
-
-build_design <- function(df,
-                         covars,
-                         outcome_type = "categorical",   # "categorical" | "trend"
-                         outcome_var  = "mets_cat")      # column name in df
-{
-  if (outcome_type == "trend") {
-    keep <- df %>% select(all_of(c("mets_stage", covars)))
-    return(model.matrix(~ mets_stage + ., data = keep))
-  }
-
-  ## categorical
-  keep <- df %>% select(all_of(c(outcome_var, covars)))
-  form <- as.formula(paste("~ 0 +", outcome_var, "+ ."))
-  model.matrix(form, data = keep)
-}
-
-fit_limma <- function(M, design, contrasts = NULL) {
-  fit <- limma::lmFit(M, design)
-  if (!is.null(contrasts)) {
-    cm  <- limma::makeContrasts(contrasts = contrasts, levels = colnames(design))
-    fit <- limma::contrasts.fit(fit, cm)
-  }
-  limma::eBayes(fit, trend = TRUE, robust = TRUE)
-}
-
-get_cpg_table <- function(fit, coef_name, alpha = 1, n_max = Inf) {
-  limma::topTable(fit, coef = coef_name, number = n_max, p.value = alpha, adjust.method = "none")
-}
-
-# ------------------------------------------------------------
-# 6.  Tier lists (3-level vs binary) ------------------------
-# ------------------------------------------------------------
-# ── 1.  Put the tier template up here (unchanged) ──────────────
-model_tiers_cat <- list(
-  Tier1 = c("age","sex","MLH1"),
-  Tier2 = c("age","sex","MLH1","Tumor"),
-  Tier3 = c("age","sex","MLH1","Tumor","Endothelial","Epithelial",
-            "Fib","Treg","CD4mem","CD8mem","Bmem","DC")
-)
-
-# ── 2.  Robust helper for Met vs NoMet ─────────────────────────
-run_ewas_tiers <- function(M, meta,
-                           tiers,
-                           outcome_type = "categorical",
-                           outcome_var  = "mets_cat",
-                           contrasts    = NULL)
-{
-  meta2 <- make_mets_vars(meta)
-
-  purrr::imap(tiers, function(covs, nm) {
-
-    message("\n—— Running ", nm, " —")
-    des <- build_design(meta2, covars = covs,
-                        outcome_type = outcome_type,
-                        outcome_var  = outcome_var)
-
-    fit <- tryCatch(
-      fit_limma(M, des, contrasts),
-      error = function(e){message("‼️ limma error: ", e$message); NULL}
-    )
-
-    list(fit = fit, design = des, covars = covs)
-  })
-}
-
-run_anymets_tiers <- function(M, meta,
-                              tiers     = model_tiers_cat,
-                              bin_var   = "any_mets_bin",
-                              contrast  = "Met_v_No = any_mets_binMet - any_mets_binNoMet")
-{
-  fits <- run_ewas_tiers(
-    M, meta,
-    tiers        = tiers,              # just covariates
-    outcome_type = "categorical",
-    outcome_var  = bin_var,            # <- key line
-    contrasts    = contrast
+    warning = function(w) invokeRestart("muffleWarning"),
+    error   = function(e) { message("       · methylgometh failed"); NULL }
   )
-
-  names(fits) <- paste0(names(fits), "_Met_vs_No")
-  fits
 }
 
-## ---------- 3-level models (mets_cat) ----------
-fits_cat <- run_ewas_tiers(
-  M_cb, meta,
-  tiers         = model_tiers_cat,
-  outcome_type  = "categorical",   # <- new name
-  outcome_var   = "mets_cat",      # default, could be omitted
-  contrasts     = contrasts_cat
-)
-
-## ---------- Met vs NoMet (any_mets_bin) ----------
-fits_met <- run_anymets_tiers(M_cb, meta)   # helper already passes the right args
-
-# combined list for plotting
-all_fits <- c(fits_cat, fits_met)
-# ------------------------------------------------------------
-# 7b.  Contrast sets -----------------------------------------
-# ------------------------------------------------------------
-
-contrasts_cat <- c(                          # uses mets_cat
-  "LN_v_No   = mets_catLNMetastasis      - mets_catNoMetastasis",
-  "Dist_v_No = mets_catDistantMetastasis - mets_catNoMetastasis",
-  "Dist_v_LN = mets_catDistantMetastasis - mets_catLNMetastasis"
-)
-
-contrasts_bin <- "Met_v_No = any_mets_binMet - any_mets_binNoMet"
-
-# ------------------------------------------------------------
-# 8.  Run the two EWAS batches -------------------------------
-# ------------------------------------------------------------
-## 3-level models (mets_cat)
-fits_cat <- run_ewas_tiers(
-  M_cb, meta,
-  tiers         = model_tiers_cat,
-  outcome_type  = "categorical",   # <- correct name (can be omitted)
-  outcome_var   = "mets_cat",      # default, can be omitted too
-  contrasts     = contrasts_cat
-)
-
-## Met vs NoMet
-fits_met <- run_anymets_tiers(M_cb, meta)   # already uses the new signature
-
-## master list
-all_fits <- c(fits_cat, fits_met)
-
-# ------------------------------------------------------------
-# 9.  Plotting helpers ---------------------------------------
-# ------------------------------------------------------------
-
-global_hallmark_entrez <- function() {
-  msigdbr::msigdbr("human","H") %>%
-    group_by(gs_name) %>%
-    summarise(genes=list(unique(as.character(entrez_gene))),.groups="drop") %>%
-    pull(genes) %>% setNames(unique(msigdbr::msigdbr("human","H")$gs_name))
-}
-
-run_hallmark_methylglm <- function(tt, top_n=2000, minsize=100, maxsize=500) {
-  sel      <- tt %>% arrange(P.Value) %>% head(top_n)
-  cpg_pval <- setNames(sel$P.Value, rownames(sel))
-  methylGSA::methylglm(cpg.pval=cpg_pval, array.type="EPIC", group="all",
-                       GS.list=global_hallmark_entrez(), GS.idtype="ENTREZID",
-                       minsize=minsize, maxsize=maxsize)
-}
-
-plot_hallmark_bar <- function(res, top_k=15, title_txt="Hallmark enrichment") {
-  res %>% arrange(pvalue) %>% head(top_k) %>%
-    mutate(ID=factor(ID, levels=rev(ID))) %>%
-    ggplot(aes(ID, Size, fill=pvalue)) + geom_col() + coord_flip() +
-    scale_fill_gradient(low="blue", high="red") +
-    labs(x=NULL,y="Gene set size",title=title_txt) +
-    theme_minimal(base_size=12)
-}
-
-plot_volcano <- function(tt,
-                         logFC_cut = 0.25,
-                         p_cut     = 1e-4,
-                         top_n     = 10,
-                         coef_name = "contrast") {
-
-  tt2  <- tt %>%
-          mutate(log10P = -log10(P.Value),
-                 sig    = ifelse(P.Value < p_cut &
-                                 abs(logFC) > logFC_cut, "Hit", "NS"))
-
-  labs <- tt2 %>% arrange(P.Value) %>% head(top_n)
-
-  ggplot(tt2, aes(logFC, log10P)) +
-    geom_point(aes(color = sig), alpha = 0.6, size = 1) +
-    geom_vline(xintercept = c(-logFC_cut, logFC_cut), linetype = "dashed") +
-    geom_hline(yintercept = -log10(p_cut), linetype = "dashed") +
-    ggrepel::geom_text_repel(data = labs,
-                             aes(label = rownames(labs)),
-                             size = 3) +
-    scale_color_manual(values = c(NS = "grey70", Hit = "red"),
-                       guide  = "none") +
-    labs(title = paste("Volcano —", coef_name),
-         x = "log2 FC", y = "-log10 p") +
-    theme_minimal(base_size = 12)
-}
-
-plot_hallmark_bar <- function(res, top_k = 15, title_txt = "Hallmark enrichment") {
-  res %>%
-    arrange(pvalue) %>% head(top_k) %>%
+plot_hallmark_bar <- function(res, ttl, top_k = 15) {
+  res %>% arrange(pvalue) %>% slice_head(n = top_k) %>%
     mutate(ID = factor(ID, levels = rev(ID))) %>%
     ggplot(aes(ID, Size, fill = pvalue)) +
-    geom_col() + coord_flip() +
-    scale_fill_gradient(low = "blue", high = "red") +
-    labs(x = NULL, y = "Gene set size", title = title_txt) +
-    theme_minimal(base_size = 12)
+      geom_col() + coord_flip() +
+      scale_fill_gradient(low = "#4575b4", high = "#d73027") +
+      labs(title = ttl, x = NULL, y = "Gene-set size") +
+      theme_minimal(base_size = 11)
 }
 
-# ── Volcano helper ──────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 3)  parameters & output folders (inside each phenotype dir)
+# ---------------------------------------------------------------------------
+alpha_cut <- 1e-3
+topN      <- 2000
 
-plot_volcano <- function(tt,
-                         logFC_cut = 0.25,
-                         p_cut     = 1e-4,
-                         top_n     = 10,
-                         coef_name = "contrast") {
+for (phen_dir in phen_dirs) {
 
-  tt2  <- tt %>%
-          mutate(log10P = -log10(P.Value),
-                 sig    = ifelse(P.Value < p_cut &
-                                 abs(logFC) > logFC_cut, "Hit", "NS"))
+  cat("\n==========  Phenotype:", phen_dir, " ==========\n")
 
-  labs <- tt2 %>% arrange(P.Value) %>% head(top_n)
+  tag_dirs <- dir(phen_dir, full.names = TRUE, pattern = "^H[235]$")  # H2/H3/H5
 
-  ggplot(tt2, aes(logFC, log10P)) +
-    geom_point(aes(color = sig), alpha = 0.6, size = 1) +
-    geom_vline(xintercept = c(-logFC_cut, logFC_cut),
-               linetype   = "dashed") +
-    geom_hline(yintercept = -log10(p_cut),
-               linetype   = "dashed") +
-    ggrepel::geom_text_repel(
-      data  = labs,
-      aes(label = rownames(labs)),
-      size  = 3
-    ) +
-    scale_color_manual(values = c(NS = "grey70", Hit = "red"),
-                       guide  = "none") +
-    labs(title = paste("Volcano —", coef_name),
-         x = "log2 FC", y = "-log10 p") +
-    theme_minimal(base_size = 12)
-}
+  p_out   <- file.path(phen_dir, "pathway_results")
+  p_plots <- file.path(p_out,      "plots")
+  dir.create(p_out,   recursive = TRUE, showWarnings = FALSE)
+  dir.create(p_plots, recursive = TRUE, showWarnings = FALSE)
 
-# ── Batch volcano + Hallmark plots for ALL tiers / contrasts ─────────────
+  for (tag_dir in tag_dirs) {
 
-out_dir <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/ewas_plots"
-dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+    tag <- basename(tag_dir)            # H2 / H3 / H5
 
-top_n_cpg   <- 2000      # CpGs fed to methylglm
-top_n_label <- 10        # annotated labels on volcano
-logFC_cut   <- 0.25
-p_cut       <- 1e-4
+    fit_path <- file.path(tag_dir, "ewas_fits.rds")
+    if (!file.exists(fit_path)) next
 
-for (tier_name in names(all_fits)) {
+    fits_tag <- readRDS(fit_path)       # list(Tier1/2/3)
 
-  fit_obj <- all_fits[[tier_name]]$fit
-  if (is.null(fit_obj)) next            # skip failed fits
+    for (tier_nm in names(fits_tag)) {
 
-  for (cn in colnames(fit_obj)) {
-    message("▶ ", tier_name, " — ", cn)
+      fit_obj <- fits_tag[[tier_nm]]$fit
+      if (is.null(fit_obj) || !"pheno_bin" %in% colnames(fit_obj)) next
 
-    tt <- get_cpg_table(fit_obj, cn)
+      cat(glue("► {tag} | {tier_nm} | pheno_bin\n"))
 
-    vplot <- plot_volcano(
-      tt,
-      logFC_cut = logFC_cut,
-      p_cut     = p_cut,
-      top_n     = top_n_label,
-      coef_name = paste(cn, "—", tier_name)
-    )
+      # full CpG table, keep IDs explicitly
+      tt <- limma::topTable(fit_obj, coef = "pheno_bin",
+                            number = Inf, p.value = 1, adjust.method = "none") %>%
+        rownames_to_column("CpG_ID")
 
-    hplot <- plot_hallmark_bar(
-      run_hallmark_methylglm(tt, top_n_cpg),
-      title_txt = paste("Hallmark —", cn, "—", tier_name)
-    )
+      ## ----------  mode A : P < 1e-3  --------------------------------------
+      idx_A <- which(tt$P.Value < alpha_cut)
+      res_A <- safe_methylgometh(tt, idx_A) # <-- Updated function call
 
-    print(vplot); print(hplot)
+      if (!is.null(res_A)) {
+        stem <- glue("{tag}_{tier_nm}_P1e3")
+        write_csv(res_A, file.path(p_out,  glue("{stem}.csv")))
+        ggsave(file.path(p_plots, glue("{stem}_bar.png")),
+               plot_hallmark_bar(res_A, stem), width = 6, height = 4)
+        cat("       · mode A:", length(idx_A), "CpGs → saved\n")
+      } else {
+        cat("       · mode A: skipped (", length(idx_A), " CpGs)\n")
+      }
 
-    safe_cn <- gsub("[^A-Za-z0-9_]+", "_", cn)
-    ggsave(file.path(out_dir,
-           paste0(tier_name, "_", safe_cn, "_volcano.png")),
-           vplot, width = 6, height = 5, dpi = 300)
+      ## ----------  mode B : top-N CpGs  -----------------------------------
+      idx_B <- seq_len(min(topN, nrow(tt)))
+      res_B <- safe_methylgometh(tt, idx_B) # <-- Updated function call
 
-    ggsave(file.path(out_dir,
-           paste0(tier_name, "_", safe_cn, "_hallmark.png")),
-           hplot, width = 6, height = 4.5, dpi = 300)
+      if (!is.null(res_B)) {
+        stem <- glue("{tag}_{tier_nm}_Top{topN}")
+        write_csv(res_B, file.path(p_out,  glue("{stem}.csv")))
+        ggsave(file.path(p_plots, glue("{stem}_bar.png")),
+               plot_hallmark_bar(res_B, stem), width = 6, height = 4)
+        cat("       · mode B:", length(idx_B), "CpGs → saved\n")
+      } else {
+        cat("       · mode B: analysis failed or no significant pathways found\n")
+      }
+    }
   }
 }
 
+cat("\n✔  Hallmark pathway analysis complete — check each <phenotype>/pathway_results folder\n")
+```
+
+
+
+
+Reactome 
+```{r}
+###############################################################################
+#  Reactome pathway analysis – existing EWAS fits only
+#  • Mode A : CpGs with P < 1e-3
+#  • Mode B : top-2000 CpGs by raw P
+###############################################################################
+suppressPackageStartupMessages({
+  library(limma)
+  library(methylGSA)
+  library(msigdbr)
+  library(dplyr)
+  library(purrr)
+  library(readr)
+  library(ggplot2)
+  library(glue)
+  library(tibble)
+})
+
+## ────────────────────────────────────────────────────────────────────────────
+##  0)  EWAS result folders (three phenotypes)
+## ────────────────────────────────────────────────────────────────────────────
+phen_dirs <- c("results_ewas_any",
+               "results_ewas_ln",
+               "results_ewas_dist")       # change only if you renamed them
+
+## ────────────────────────────────────────────────────────────────────────────
+##  1)  Reactome gene-set list (ENTREZ IDs)
+## ────────────────────────────────────────────────────────────────────────────
+gs_reactome <- msigdbr(species     = "Homo sapiens",
+                       category    = "C2",
+                       subcategory = "CP:REACTOME") %>%
+               distinct(gs_name, entrez_gene)        %>%
+               group_by(gs_name)                     %>%
+               summarise(genes = list(entrez_gene), .groups = "drop") %>%
+               tibble::deframe()                     # named list
+
+## ────────────────────────────────────────────────────────────────────────────
+##  2)  helpers
+## ────────────────────────────────────────────────────────────────────────────
+safe_methylgometh <- function(tt, idx,
+                              minsize = 2,      # Reactome sets can be tiny
+                              maxsize = 500) {
+
+  if (length(idx) < 2) return(NULL)             # need ≥2 probes
+
+  cpg_pval <- setNames(tt$P.Value[idx], tt$CpG_ID[idx])
+
+  tryCatch(
+    methylgometh(cpg.pval   = cpg_pval,
+                 array.type = "EPIC",
+                 GS.list    = gs_reactome,
+                 GS.idtype  = "ENTREZID",
+                 minsize    = minsize,
+                 maxsize    = maxsize),
+    warning = function(w) invokeRestart("muffleWarning"),  # hide glm spam
+    error   = function(e){ message("       · methylgometh failed");
+                           NULL }
+  )
+}
+
+plot_reactome_bar <- function(res, title_txt, top_k = 15) {
+  res %>%
+    arrange(pvalue) %>% slice_head(n = top_k) %>%
+    mutate(ID = factor(gsub("^REACTOME_", "", ID)       |>
+                       gsub("_", " ", .)                |>
+                       stringr::str_wrap(35),
+                       levels = rev(
+                         gsub("^REACTOME_", "", ID) |>
+                         gsub("_", " ", .)          |>
+                         stringr::str_wrap(35))))   %>%
+    ggplot(aes(ID, Size, fill = pvalue)) +
+      geom_col(width = .8) +
+      coord_flip() +
+      scale_fill_gradient(low = "#377eb8", high = "#e41a1c",
+                          trans = "log10", name = "P-value") +
+      labs(title = title_txt, y = "Gene-set size", x = NULL) +
+      theme_minimal(base_size = 10) +
+      theme(plot.title = element_text(hjust = .5, face = "bold"))
+}
+
+## ────────────────────────────────────────────────────────────────────────────
+##  3)  parameters
+## ────────────────────────────────────────────────────────────────────────────
+alpha_cut <- 1e-3
+topN      <- 2000
+
+## ────────────────────────────────────────────────────────────────────────────
+##  4)  main loop: phenotype → H2/3/5 → tier → pheno_bin
+## ────────────────────────────────────────────────────────────────────────────
+for (phen_dir in phen_dirs) {
+
+  cat("\n==========  Phenotype:", phen_dir, " ==========\n")
+
+  tag_dirs <- dir(phen_dir, full.names = TRUE, pattern = "^H[235]$")
+
+  path_out   <- file.path(phen_dir, "pathway_results_reactome")
+  plot_out   <- file.path(path_out,  "plots")
+  dir.create(path_out, recursive = TRUE, showWarnings = FALSE)
+  dir.create(plot_out, recursive = TRUE, showWarnings = FALSE)
+
+  for (tag_dir in tag_dirs) {
+
+    tag <- basename(tag_dir)                     # H2 / H3 / H5
+    fits_path <- file.path(tag_dir, "ewas_fits.rds")
+    if (!file.exists(fits_path)) next
+
+    fits_tag <- readRDS(fits_path)               # list(Tier1/2/3)
+
+    for (tier_nm in names(fits_tag)) {
+
+      fit_obj <- fits_tag[[tier_nm]]$fit
+      if (is.null(fit_obj) || !"pheno_bin" %in% colnames(fit_obj)) next
+
+      cat(glue("► {tag} | {tier_nm} | pheno_bin "))
+
+      ## full CpG table (keep IDs)
+      tt <- topTable(fit_obj, coef = "pheno_bin",
+                     number = Inf, p.value = 1, adjust.method = "none") %>%
+            rownames_to_column("CpG_ID")
+
+      ## ── A)  P < 1e-3  ────────────────────────────────────────────────
+      idx_A <- which(tt$P.Value < alpha_cut)
+      res_A <- safe_methylgometh(tt, idx_A)
+
+      if (!is.null(res_A)) {
+        stem <- glue("{tag}_{tier_nm}_P1e3")
+        write_csv(res_A, file.path(path_out, glue("{stem}.csv")))
+        ggsave(file.path(plot_out, glue("{stem}_bar.png")),
+               plot_reactome_bar(res_A, glue("{tag} — {tier_nm} — P<1e-3")),
+               width = 7, height = 4)
+        cat("   · mode A:", length(idx_A), "CpGs\n")
+      } else cat("   · mode A: skipped (", length(idx_A), " CpGs)\n")
+
+      ## ── B)  top-2000 ────────────────────────────────────────────────
+      idx_B <- seq_len(min(topN, nrow(tt)))
+      res_B <- safe_methylgometh(tt, idx_B)
+
+      if (!is.null(res_B)) {
+        stem <- glue("{tag}_{tier_nm}_Top{topN}")
+        write_csv(res_B, file.path(path_out, glue("{stem}.csv")))
+        ggsave(file.path(plot_out, glue("{stem}_bar.png")),
+               plot_reactome_bar(res_B, glue("{tag} — {tier_nm} — Top{topN}")),
+               width = 7, height = 4)
+        cat("           · mode B:", length(idx_B), "CpGs\n")
+      } else cat("           · mode B: analysis failed\n")
+    }
+  }
+}
+
+cat("\n✔  Reactome pathway analysis complete — check every "
+    ,"<phenotype>/pathway_results_reactome folder\n")
+```
+
+
+
+Genomic Region analysis
+```{r}
 # ------------------------------------------------------------------
 # 10 A.  LINE-1 and Alu predictions via REMP (family-wise initialisation)
 # ------------------------------------------------------------------
@@ -415,84 +551,401 @@ pred_L1  <- remp(
   verbose  = TRUE
 )
 
-## --------------------------- 1) pull out the β-matrices
-beta_L1  <- as.matrix(rempB(pred_L1))   # LINE-1   (n loci × n samples)
-beta_Alu <- as.matrix(rempB(pred_Alu))  # Alu
+## -- after you have finished building/merging metadata ----------
+meta2 <- make_mets_vars(meta)        # adds mets_cat, any_mets_bin, etc.
 
-## --------------------------- 2) sample-wise means
+## make the SampleID field syntactically valid like the matrix colnames
+meta2$SampleID_clean <- make.names(meta2$SampleID)
+
+## ----------------------------------------------------------------
+##  pull repeat-element β-matrices
+beta_L1  <- as.matrix(rempB(pred_L1))
+beta_Alu <- as.matrix(rempB(pred_Alu))
+
+## sample order in the matrices
+sample_order <- colnames(beta_L1)          # 57 names that start with “X…”
+
+## grouping vector that lines up with that order
+group_factor <- meta2$any_mets_bin[ match(sample_order,
+                                          meta2$SampleID_clean) ]
+
+## sanity check
+stopifnot(!anyNA(group_factor))
+
+## ----------------------------------------------------------------
+##  build the plotting data.frame
 line1_means <- colMeans(beta_L1,  na.rm = TRUE)
 alu_means   <- colMeans(beta_Alu, na.rm = TRUE)
 
-## make sure the sample order matches your metadata
-sample_order <- colnames(beta_L1)                       # the 57 sample IDs
-group_factor <- meta$any_mets_bin[ match(sample_order,meta$SampleID) ]
-
-## --------------------------- 3) tidy frame for ggpubr
 box_df <- data.frame(
   value   = c(line1_means, alu_means),
   element = rep(c("LINE1", "Alu"), each = length(sample_order)),
-  group   = rep(group_factor,         2)
+  group   = rep(group_factor,        2)
 )
 
-ggboxplot(box_df,
-          x     = "element",
-          y     = "value",
-          color = "group",
-          add   = "jitter",
-          ylab  = "Predicted β",
+library(ggpubr)
+ggboxplot(box_df, x = "element", y = "value",
+          color = "group", add = "jitter",
+          ylab = "Predicted β",
           title = "Global repeat-element methylation")
 # ------------------------------------------------------------------
 #10 B.  Enrichment of CpG Island / Shore / Shelf / OpenSea
 # ------------------------------------------------------------------
+## ======================================================================
+##  CpG-Island / Shore / Shelf / OpenSea enrichment
+##  – run for *every* Tier × Contrast and save a tidy result table
+##  – auto-plot a bar chart for each combo (optional)
+## ======================================================================
 
-# 1) build lookup table (EPIC manifest already loaded via the package)
-man <- getManifest(IlluminaHumanMethylationEPICmanifest)
-man_df <- data.frame(Name = man@data$Name,
-                     Context = man@data$Relation_to_UCSC_CpG_Island,
-                     stringsAsFactors = FALSE)
-man_df$Context[man_df$Context == ""] <- "OpenSea"
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(purrr)
+  library(ggplot2)
+  library(minfi)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
 
-# 2) helper: do Fisher’s test for one contrast
-context_enrich <- function(tt, alpha = 1e-4) {
-  sig_cpg <- rownames(tt)[tt$P.Value < alpha]
-  bg      <- man_df$Context[match(rownames(tt), man_df$Name)]
-  fg      <- man_df$Context[match(sig_cpg   , man_df$Name)]
+#───────────────────────────────────────────────────────────────────────
+# 1️⃣  Build a probe-to-context lookup  (works for either column name)
+#───────────────────────────────────────────────────────────────────────
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) |>
+          as.data.frame()
 
-  out <- purrr::map_dfr(unique(bg), function(ct) {
-    mat <- matrix(c(sum(fg == ct),
-                    sum(fg != ct),
-                    sum(bg == ct) - sum(fg == ct),
-                    sum(bg != ct) - sum(fg != ct)),
-                  nrow = 2)
-    ft <- fisher.test(mat)
-    data.frame(Context = ct,
-               OR      = ft$estimate,
-               p       = ft$p.value)
+ctx_col <- intersect(
+  c("Relation_to_Island", "Relation_to_UCSC_CpG_Island"),
+  colnames(anno)
+)
+
+if (length(ctx_col) == 0)
+  stop("❌  Couldn’t find a *Relation_to_…Island* column in the annotation!")
+
+message("✔  Using context column: ", ctx_col)
+
+man_df <- anno |>
+  select(Name, Context = all_of(ctx_col)) |>
+  mutate(Context = if_else(Context == "" | is.na(Context),
+                           "OpenSea", Context))
+
+# quick sanity-check
+stopifnot(!anyNA(man_df$Context), nrow(man_df) > 800e3)
+
+#───────────────────────────────────────────────────────────────────────
+# 2️⃣  Enrichment helper  (Fisher’s exact test per context)
+#───────────────────────────────────────────────────────────────────────
+context_enrich <- function(tt, alpha = 1e-4, verbose = FALSE) {
+
+  fg_ids <- rownames(tt)[tt$P.Value < alpha]   # foreground = significant CpGs
+  bg_ids <- rownames(tt)                       # background  = all CpGs tested
+
+  idx_bg <- match(bg_ids, man_df$Name)         # ❶ map to manifest once
+  keep   <- !is.na(idx_bg)
+  if (!any(keep))
+    stop("No background CpGs left after matching to manifest!")
+
+  bg_ctx <- man_df$Context[idx_bg[keep]]
+  fg_ctx <- bg_ctx[bg_ids[keep] %in% fg_ids]
+
+  # Fisher test for each context
+  map_dfr(unique(bg_ctx), function(ct) {
+    a <- sum(fg_ctx == ct)                      # sig ∩ context
+    c <- sum(bg_ctx == ct) - a                  # non-sig ∩ context
+    b <- length(fg_ctx) - a                     # sig ∩ other
+    d <- length(bg_ctx) - a - b - c             # non-sig ∩ other
+
+    if (any(c(a,b,c,d) < 0) || (a+c==0) || (b+d==0)) {
+      if (verbose)
+        message("⚠︎ skipped ", ct, " – bad contingency: ",
+                paste(c(a,b,c,d), collapse = ","))
+      return(NULL)
+    }
+
+    ft <- fisher.test(matrix(c(a,b,c,d), nrow = 2))
+    tibble(Context = ct,
+           OR      = unname(ft$estimate),
+           p       = ft$p.value,
+           log2OR  = log2(unname(ft$estimate)))
   })
-  out$log2OR <- log2(out$OR)
-  out
 }
 
-# 3) run for every tier × contrast
-enrich_out <- list()
-for (tier_name in names(fits)) {
-  fit <- fits[[tier_name]]$fit
-  for (cn in colnames(fit)) {
-    tt   <- get_cpg_table(fit, cn)
-    tab  <- context_enrich(tt)
-    tab$Tier <- tier_name; tab$Contrast <- cn
-    enrich_out[[paste(tier_name, cn)]] <- tab
+#───────────────────────────────────────────────────────────────────────
+# 3️⃣  Loop over *all* Tier × Contrast combinations
+#───────────────────────────────────────────────────────────────────────
+alpha_FG <- 1e-4                    # significance threshold for CpGs
+save_dir <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/ewas_plots"
+
+enrich_df <- imap_dfr(cpg_fits, function(tier_obj, tier_nm) {
+
+  fit <- tier_obj$fit
+  if (is.null(fit)) return(NULL)
+
+  map_dfr(colnames(fit), function(coef_nm) {
+    tt  <- get_cpg_table(fit, coef_nm)       # limma topTable
+    tab <- context_enrich(tt, alpha = alpha_FG, verbose = FALSE)
+
+    if (nrow(tab) == 0) return(NULL)
+
+    mutate(tab,
+           Tier     = tier_nm,
+           Contrast = str_squish(coef_nm))   # normalise spaces
+  })
+})
+message("✔  Enrichment table built: ", nrow(enrich_df), " rows")
+
+# save the master table (optional)
+# write.csv(enrich_df, file = file.path(save_dir, "context_enrich_all.csv"),
+#           row.names = FALSE)
+
+#───────────────────────────────────────────────────────────────────────
+# 4️⃣  Bar-plot helper  (handles Inf rows & auto-title)
+#───────────────────────────────────────────────────────────────────────
+plot_ctx_bar <- function(df, tier, contrast, out_dir = NULL) {
+
+  plt_dat <- df %>%
+               filter(Tier == tier,
+                      str_squish(Contrast) == str_squish(contrast)) %>%
+               filter(is.finite(log2OR))
+
+  if (nrow(plt_dat) == 0) {
+    message("¯\\_(ツ)_/¯  nothing to plot for ", tier, " / ", contrast)
+    return(invisible(NULL))
   }
-}
-enrich_df <- dplyr::bind_rows(enrich_out)
 
-# 4) quick bar plot (example Tier1 / LN_v_No)
-eg <- enrich_df %>% filter(Tier=="Tier1", Contrast=="LN_v_No")
-ggplot(eg, aes(Context, log2OR)) +
-  geom_col(fill = "steelblue") +
-  geom_hline(yintercept = 0, linetype = "dashed") +
-  labs(title="CpG-context enrichment (Tier1 — LN_v_No)",
-       y="log2(Odds Ratio)", x = NULL) +
-  theme_minimal(base_size = 12)
+  p <- ggplot(plt_dat, aes(Context, log2OR,
+                           fill = factor(sign(log2OR)))) +
+         geom_col(show.legend = FALSE) +
+         geom_hline(yintercept = 0, linetype = "dashed") +
+         scale_fill_manual(values = c(`-1` = "#e41a1c", `1` = "#377eb8")) +
+         labs(title = paste0("CpG-context enrichment (",
+                             tier, " — ", contrast, ")"),
+              y = "log2(Odds Ratio)", x = NULL) +
+         theme_minimal(base_size = 12)
+
+  if (!is.null(out_dir)) {
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    fn <- paste0(gsub("[^A-Za-z0-9]+", "_",
+                      paste(tier, contrast, sep = "_")),
+                 "_ctx_bar.png")
+    ggsave(file.path(out_dir, fn), p, width = 6, height = 4, dpi = 300)
+  }
+  p
+}
+
+#───────────────────────────────────────────────────────────────────────
+# 5️⃣  Produce plots for *every* Tier × Contrast
+#───────────────────────────────────────────────────────────────────────
+pwalk(enrich_df %>%
+        distinct(Tier, Contrast) %>%          # unique combos
+        as.list(),
+      \(Tier, Contrast)
+        plot_ctx_bar(enrich_df, Tier, Contrast, out_dir = save_dir)
+)
 # ── End of script ───────────────────────────────────────────                         
 ```
+
+
+```{r}
+## ─────────────────────────────────────────────────────────────
+##  Stacked bar-plot of differential CpGs (Tier 1–3)
+##  Contrasts:  LN v No   &   Dist v LN
+## ─────────────────────────────────────────────────────────────
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+
+## ----------- parameters you care about -----------------------
+contrast_LN <- "LN_v_No   = mets_catLNMetastasis      - mets_catNoMetastasis"
+contrast_DL <- "Dist_v_LN = mets_catDistantMetastasis - mets_catLNMetastasis"
+p_cut       <- 1e-3
+out_dir     <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/ewas_plots"
+
+## ----------- helper: significant CpGs from ONE fit -----------
+sig_cpgs <- function(fit, coef, p_thr = 1e-3) {
+  get_cpg_table(fit, coef) |>                  # your existing utility
+    filter(P.Value < p_thr) |>
+    rownames()
+}
+
+## ----------- build counts for Tier 1, 2, 3 -------------------
+bar_df <- imap_dfr(                            # loop over three tiers
+  all_fits[c("Tier1", "Tier2", "Tier3")],
+  function(tier_obj, tier_nm) {
+
+    fit <- tier_obj$fit
+    stopifnot(inherits(fit, "MArrayLM"))
+
+    s_LN <- sig_cpgs(fit, contrast_LN, p_cut)
+    s_DL <- sig_cpgs(fit, contrast_DL, p_cut)
+
+    tibble(
+      Tier       = tier_nm,
+      LN_only    = length(setdiff(s_LN, s_DL)),
+      Dist_only  = length(setdiff(s_DL, s_LN)),
+      Overlap    = length(intersect(s_LN, s_DL))
+    )
+  }
+) |>
+  pivot_longer(cols = LN_only:Overlap,
+               names_to  = "Category",
+               values_to = "Count")
+
+## ----------- palette to echo the paper -----------------------
+cat_pal <- c(
+  LN_only   = "#3182bd",   # blue   • LN v No  only
+  Overlap   = "#b15928",   # brown  • common
+  Dist_only = "#ffdd57"    # yellow • Dist v LN only
+)
+
+## ----------- make & save the plot ----------------------------
+bp <- ggplot(bar_df,
+             aes(x = Tier, y = Count, fill = Category)) +
+        geom_col(width = .7) +
+        scale_fill_manual(values = cat_pal,
+                          name   = NULL,
+                          breaks = c("LN_only", "Overlap", "Dist_only"),
+                          labels = c("LN v No only",
+                                     "Shared",
+                                     "Dist v LN only")) +
+        labs(title = "Differential CpGs by Tier (P < 1e-4)",
+             subtitle = "Blue = LN v No,  Brown = Shared,  Yellow = Dist v LN",
+             y = "Number of significant CpGs",
+             x = NULL) +
+        theme_minimal(base_size = 13) +
+        theme(legend.position = "top",
+              panel.grid.major.x = element_blank())
+
+print(bp)
+
+ggsave(file.path(out_dir, "Tier1-3_barplot_LN-Dist.png"),
+       bp, width = 6, height = 4, dpi = 300)
+```
+Odds ratio code
+```{r}
+## ------------------------------------------------------------------
+## 0.  packages ------------------------------------------------------
+library(minfi)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(tibble)
+
+## ------------------------------------------------------------------
+## 1.  Probe-to-context lookup (robust spelling) --------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) |>
+          as.data.frame()
+
+ctx_col <- intersect(
+  c("Relation_to_Island", "Relation_to_UCSC_CpG_Island"),
+  colnames(anno)
+)
+if (length(ctx_col) == 0)
+  stop("Could not find a *Relation_to_*Island* column in the annotation.")
+
+man_df <- anno |>
+  select(Name, Context = all_of(ctx_col)) |>
+  mutate(Context = if_else(Context == "" | is.na(Context),
+                           "OpenSea", Context))
+
+## ------------------------------------------------------------------
+## 2.  helper: Fisher test *with* 95 % CI ---------------------------
+context_enrich <- function(tt,
+                           alpha   = 1e-1,
+                           min_fg  = 1,
+                           verbose = FALSE)
+{
+  fg_ids <- rownames(tt)[tt$P.Value < alpha]                 # significant
+  if (length(fg_ids) < min_fg)
+    return(tibble())                                         # empty → skip
+
+  bg_ids <- rownames(tt)
+
+  idx_bg <- match(bg_ids, man_df$Name)
+  keep   <- !is.na(idx_bg)
+  bg_ctx <- man_df$Context[idx_bg[keep]]
+  fg_ctx <- bg_ctx[ bg_ids[keep] %in% fg_ids ]
+
+  map_dfr(unique(bg_ctx), function(ct) {
+
+    a <- sum(fg_ctx == ct)                 # foreground in context
+    c <- sum(bg_ctx == ct) - a             # background in context
+    b <- length(fg_ctx) - a                # foreground outside
+    d <- length(bg_ctx) - a - b - c        # background outside
+
+    if (a + b == 0 || c + d == 0)          # no foreground → skip
+      return(NULL)
+
+    ft <- fisher.test(matrix(c(a, b, c, d), 2, 2))
+
+    tibble(Context = ct,
+           OR       = unname(ft$estimate),
+           CI_lo    = ft$conf.int[1],
+           CI_hi    = ft$conf.int[2],
+           p        = ft$p.value,
+           log2OR   = log2(OR),
+           log2lo   = log2(CI_lo),
+           log2hi   = log2(CI_hi))
+  })
+}
+
+## ------------------------------------------------------------------
+## 3.  run *all* Tier × Contrast combinations ----------------------
+enrich_out <- list()
+
+for (tier_name in names(cpg_fits)) {
+
+  fit_obj <- cpg_fits[[tier_name]]$fit
+  if (is.null(fit_obj)) next                       # failed tier
+
+  for (cn in colnames(fit_obj)) {
+
+    tt   <- get_cpg_table(fit_obj, cn)
+    tab  <- context_enrich(tt, alpha = 1e-1)
+
+    if (nrow(tab) == 0) next                       # nothing significant
+
+    enrich_out[[paste(tier_name, cn, sep = "|")]] <-
+      mutate(tab, Tier = tier_name, Contrast = cn)
+  }
+}
+
+enrich_df <- bind_rows(enrich_out)
+
+## ------------------------------------------------------------------
+## 4.  Odds-ratio plot ⇢ error bars (panel D style) -----------------
+plot_context_or <- function(df, title_txt) {
+  ggplot(df,
+         aes(x = Context,
+             y = OR,
+             ymin = CI_lo,
+             ymax = CI_hi)) +
+    geom_hline(yintercept = 1, linetype = "dotted") +
+    geom_errorbar(width = 0.25, linewidth = 0.6) +
+    geom_point(size = 3) +
+    scale_y_continuous(trans = "log10",
+                       breaks = c(0.25,0.5,1,2,4),
+                       minor_breaks = NULL) +
+    labs(title = title_txt,
+         y = "Odds ratio (log-10 scale)",
+         x = NULL) +
+    theme_minimal(base_size = 12)
+}
+
+## ------------------------------------------------------------------
+## 5.  EXAMPLE  – Tier 3  Dist v No  -------------------------------
+tier   <- "Tier3"
+contr  <- "Dist_v_No = mets_catDistantMetastasis - mets_catNoMetastasis"
+
+ex_df <- enrich_df |>
+           filter(Tier == tier, Contrast == contr)
+
+if (nrow(ex_df) == 0) {
+  message("No significant CpGs at p < 1e-4 for this tier/contrast.")
+} else {
+  plot_context_or(ex_df,
+                  title_txt = paste0("CpG-context enrichment (",
+                                     tier, " — Dist v No)"))
+}
+```
+

@@ -1,0 +1,535 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+###############################################################################
+#  run_CellDMC_level3.R     ·     2025-07-13  (covariates: age + sex + MLH1)
+#  IDATs  →  β-matrix  →  HiTIMED  (h = 3)  →  CellDMC
+###############################################################################
+##  0)  USER SETTINGS  ────────────────────────────────────────────────────────
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+out_dir  <- "/Users/adiallo/Desktop/CellDMC_level3"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+beta_rds <- "/Users/adiallo/Desktop/HiTIMED_stats/beta_comb.rds"  # reuse if exists
+redo_preprocess <- !file.exists(beta_rds)
+
+##  choose the binary phenotype tested by CellDMC  (0 / 1 vector)
+##    "any_mets"  – any metastasis vs none
+##    "distant"   – distant mets vs none
+##    "ln_only"   – LN-only (node_stage > 0) vs none
+phenotype_to_use <- "any_mets"
+###############################################################################
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(minfi);  library(sesame);  library(ENmix)
+  library(HiTIMED); library(EpiDISH)        # CellDMC lives here
+  library(tidyverse)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+###############################################################################
+##  1)  β-matrix  -------------------------------------------------------------
+###############################################################################
+if (redo_preprocess) {
+  msg("Reading IDATs …")
+  rg1 <- read.metharray.exp(idat_v1, recursive = TRUE, extended = TRUE, force = TRUE)
+  rg2 <- read.metharray.exp(idat_v2, recursive = TRUE, extended = TRUE, force = TRUE)
+
+  msg("NOOB normalisation …")
+  beta1 <- getBeta(preprocessNoob(rg1, dyeMethod = "single"))
+  beta2 <- sesame::betasCollapseToPfx(getBeta(preprocessNoob(rg2, dyeMethod = "single")))
+
+  common     <- intersect(rownames(beta1), rownames(beta2))
+  beta_comb  <- cbind(beta1[common, ], beta2[common, ])
+
+  bad  <- union(ENmix::QCinfo(rg1)$badCpG, ENmix::QCinfo(rg2)$badCpG)
+  anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  keep <- setdiff(common, bad)
+  keep <- keep[ !anno$chr[match(keep, anno$Name)] %in% c("chrX","chrY") ]
+  beta_comb <- beta_comb[keep, ]
+
+  saveRDS(beta_comb, beta_rds);  msg("β-matrix saved → ", beta_rds)
+} else {
+  msg("Reading β-matrix from cache: ", beta_rds)
+  beta_comb <- readRDS(beta_rds)
+}
+
+###############################################################################
+##  1·5)  Variance filter – keep top-10 % most variable CpGs  🔍
+##        (place after beta_comb is ready, before HiTIMED)
+###############################################################################
+# -- 1)  create an M-value matrix (needed for variance) -----------------------
+M.mat <- log2(beta_comb / (1 - beta_comb) + 1e-6)   # + small offset for zeros
+
+# -- 2)  per-probe variance & percentile threshold ---------------------------
+library(matrixStats)        # rowVars()
+var_vec   <- rowVars(M.mat, na.rm = TRUE)
+perc_thr  <- 0.97           # keep upper 10 %; adjust to taste
+var_cut   <- quantile(var_vec, perc_thr, na.rm = TRUE)
+
+highVar_idx <- names(var_vec)[var_vec > var_cut]     # CpG IDs to keep
+message("Keeping ", length(highVar_idx), " CpGs (",
+        round(100 * length(highVar_idx) / length(var_vec), 1),
+        "%) with variance > ", signif(var_cut, 3))
+
+# -- 3)  subset both β- and M-matrices ---------------------------------------
+beta_comb <- beta_comb[highVar_idx, ]
+M.mat     <- M.mat    [highVar_idx, ]
+
+# (optional) save the reduced matrices
+# saveRDS(beta_comb, file = file.path(out_dir, "beta_highVar.rds"))
+# saveRDS(M.mat    , file = file.path(out_dir, "M_highVar.rds"))
+
+
+###############################################################################
+##  2)  HiTIMED  (h = 3)  -----------------------------------------------------
+###############################################################################
+msg("Running HiTIMED  (h = 3) …")
+frac_h3 <- HiTIMED_deconvolution(beta_comb, "COAD", h = 3) |>
+             as.data.frame() |>
+             rownames_to_column("SampleID")              # samples × cells
+
+###############################################################################
+##  3)  Clinical metadata  &  phenotype / covariates --------------------------
+###############################################################################
+meta_raw <- read_csv(meta_csv, show_col_types = FALSE)
+
+has_node <- "node_stage" %in% names(meta_raw)            # robust LN flag
+
+meta <- meta_raw |>
+          mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+                 ##  binary phenotypes used below
+                 any_mets = ifelse(any_mets        , 1L, 0L),
+                 distant  = ifelse(Distant_Mets    , 1L, 0L),
+                 ln_only  = ifelse(
+                              (has_node  & node_stage > 0 & !Distant_Mets) |
+                              (!has_node & ln_only     == TRUE           ), 1L, 0L),
+                 ##  numeric covariates
+                 sex_num  = ifelse(sex  == "M", 1, 0),
+                 MLH1_num = ifelse(MLH1 == 1 , 1, 0)) |>
+          # keep variables we need
+          select(SampleID, age, sex_num, MLH1_num,
+                 any_mets, distant, ln_only)
+
+if (!phenotype_to_use %in% c("any_mets","distant","ln_only"))
+  stop("phenotype_to_use must be one of 'any_mets', 'distant', 'ln_only'.")
+
+pheno_vec <- meta[[phenotype_to_use]]; names(pheno_vec) <- meta$SampleID
+
+##  ---  covariate matrix (age + sex + MLH1)  ---------------------------------
+cov_mat <- meta |>
+             select(SampleID, age, sex_num, MLH1_num) |>
+             column_to_rownames("SampleID") |>
+             as.matrix()
+colnames(cov_mat) <- c("age","sex","MLH1")              # tidy names
+
+###############################################################################
+##  4)  Align samples  ---------------------------------------------------------
+###############################################################################
+common_samples <- Reduce(intersect,
+                         list(colnames(beta_comb),
+                              frac_h3$SampleID,
+                              rownames(cov_mat)))
+
+beta_mat <- beta_comb[, common_samples]
+frac_mat <- frac_h3 |>
+             filter(SampleID %in% common_samples) |>
+             column_to_rownames("SampleID") |>
+             as.matrix()
+
+pheno_vec <- pheno_vec[common_samples]
+cov_mat   <- cov_mat  [common_samples, ]
+
+stopifnot(length(unique(pheno_vec)) == 2)      # must be binary
+
+###############################################################################
+##  5)  CellDMC  --------------------------------------------------------------
+###############################################################################
+msg("Building covariate design matrix  (age + sex + MLH1) …")
+
+cov_df <- meta |>
+            filter(SampleID %in% common_samples) |>
+            mutate(sex    = factor(sex_num),          # make categorical
+                   MLH1   = factor(MLH1_num)) |>
+            arrange(match(SampleID, common_samples))  # exact same order
+
+cov_mat <- model.matrix(~ age + sex + MLH1, data = cov_df)
+rownames(cov_mat) <- cov_df$SampleID                # keep sample IDs
+
+stopifnot(all(rownames(cov_mat) == rownames(frac_mat)),
+          all(colnames(beta_mat) == rownames(frac_mat)))
+
+msg("Running CellDMC with covariates …")
+cell_res <- CellDMC(beta.m   = beta_mat,      # CpG × sample
+                    pheno.v  = pheno_vec,     # named 0 / 1 vector
+                    frac.m   = frac_mat,      # samples × cell-types  (no t())
+                    cov.mod  = cov_mat,       # design matrix
+                    mc.cores = 2)             # parallel threads
+
+saveRDS(cell_res, file = file.path(out_dir, "CellDMC_h3_results.rds"))
+
+###############################################################################
+##  6)  Export DMCTs  (FDR < 0.05 if available, else rank by raw-P)  -----------
+###############################################################################
+library(rlang)         # for the `%||%` infix helper
+
+cell_names <- colnames(cell_res$dmct)
+
+iwalk(cell_names, function(cell_nm, idx) {
+
+  d_vec  <- cell_res$dmct[,  cell_nm]           # −1 / 0 / +1
+  sig_id <- names(d_vec)[d_vec != 0]            # significant CpGs only
+  if (length(sig_id) == 0) return(invisible())
+
+  ##──── try adjP first; fall back to raw-P ────────────────────────────────────
+  have_adj <- !is.null(cell_res$adjp) &&
+              ncol(cell_res$adjp) >= idx        # defensive check
+
+  adj_vec <- if (have_adj) {
+               cell_res$adjp[sig_id, cell_nm, drop = TRUE]
+             } else NA_real_
+
+  coe_tbl  <- cell_res$coe[[cell_nm]]
+
+  # robust P-value extraction (works with either old or new EpiDISH)
+  raw_vec <- (coe_tbl$pval  %||% coe_tbl$p %||% NA_real_)[sig_id]
+
+  # effect / logFC column names vary across EpiDISH versions
+  logfc_vec <- (coe_tbl$coef       %||%
+                coe_tbl$Estimate   %||%
+                coe_tbl$effect     %||%
+                coe_tbl$delta_beta %||%
+                NA_real_)[sig_id]
+
+  out_tbl <- tibble(
+    CpG       = sig_id,
+    Direction = ifelse(d_vec[sig_id] == 1, "Hyper", "Hypo"),
+    adj_P     = adj_vec,
+    raw_P     = raw_vec,
+    logFC     = logfc_vec
+  )
+
+  out_tbl <- if (have_adj) {
+               dplyr::arrange(out_tbl, adj_P)     # sort by FDR
+             } else {
+               dplyr::arrange(out_tbl, raw_P)     # sort by raw P
+             }
+
+  tag <- if (have_adj) "FDR0.05" else "raw"
+  write_csv(out_tbl,
+            file.path(out_dir, glue::glue("DMCT_{cell_nm}_{tag}.csv")))
+})
+###############################################################################
+#  7)  Volcano plots — significance at P < 1e-3  +  |Δβ| > 0.10
+#      (edit x_thr if you prefer a different effect-size cut-off)
+###############################################################################
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ggrepel)
+})
+
+cells_to_plot <- c("Stromal", "Lymphocyte", "Tumor")     # plots you want
+p_thr  <- 1e-3                                           # raw-P threshold
+x_thr  <- 0.10                                           # |Δβ| (≈ absolute effect)
+top_n  <- 10
+vol_dims <- c(6, 5)                                      # inches (w × h)
+out_dir <- "/Users/adiallo/Desktop/CellDMC_level3"       # same dir as results
+
+if (!exists("cell_res"))
+  cell_res <- readRDS(file.path(out_dir, "CellDMC_h3_results.rds"))
+
+## ── helper to grab the “best” matching column name ─────────────────────────
+pick_col <- function(df, patterns, what){
+  hits <- patterns |>
+            map(~ grep(.x, names(df), ignore.case = TRUE, value = TRUE)) |>
+            unlist() |> unique()
+  if (!length(hits))
+    stop("No ‘", what, "’ column found. Names present: ",
+         paste(names(df), collapse = ", "))
+  if (length(hits) > 1)
+    message("› Using \"", hits[1], "\" as ", what,
+            " (candidates: ", paste(hits, collapse = ", "), ")")
+  hits[1]
+}
+
+## ── volcano for one cell-type ───────────────────────────────────────────────
+plot_volcano <- function(cell_nm){
+
+  if (!cell_nm %in% names(cell_res$coe)) {
+    message("⚠  ", cell_nm, " not found – skipped"); return()
+  }
+
+  coe_tbl <- as_tibble(cell_res$coe[[cell_nm]], rownames = "CpG")
+
+  logfc_col <- pick_col(coe_tbl,
+                        c("^estimate$", "^log?2?f?c$", "delta", "diff", "coef",
+                          "effect", "mean"),
+                        "effect / logFC")
+  p_col     <- pick_col(coe_tbl,
+                        c("^p$", "^p(\\.?(val(ue)?)?)?$", "p\\.value", "pvalue"),
+                        "raw-P")
+
+  df <- coe_tbl %>%
+          transmute(CpG,
+                    logFC = .data[[logfc_col]],
+                    p     = .data[[p_col]],
+                    sig   = (p < p_thr & abs(logFC) > x_thr),
+                    negLog10P = -log10(p)) 
+
+  ## thresholds
+  hline <- -log10(p_thr)
+
+  p <- ggplot(df, aes(logFC, negLog10P)) +
+         geom_point(aes(color = sig), alpha = .75, size = 1.1) +
+         scale_color_manual(values = c(`TRUE` = "red", `FALSE` = "grey70"),
+                            guide = "none") +
+         geom_vline(xintercept = c(-x_thr, x_thr),
+                    linetype = "dashed", linewidth = .35) +
+         geom_hline(yintercept = hline,
+                    linetype = "dashed", linewidth = .35) +
+         ggrepel::geom_text_repel(
+           data = df %>% filter(sig) %>% arrange(p) %>% slice_head(n = top_n),
+           aes(label = CpG), size = 3, max.overlaps = Inf
+         ) +
+         labs(title = paste0("Volcano – ", cell_nm, " (HiTIMED h = 3)"),
+              subtitle = paste0("|Δβ| > ", x_thr, "  &  P < ", p_thr),
+              x = "Effect size (Δβ or log₂FC)", y = "−log₁₀ P") +
+         theme_classic(base_size = 13)
+
+  ggsave(
+    file.path(out_dir,
+              paste0("VOLC_", gsub("[^A-Za-z0-9]+", "_", cell_nm), ".png")),
+    p, width = vol_dims[1], height = vol_dims[2], dpi = 300
+  )
+  message("✓  Volcano saved for ", cell_nm)
+}
+
+walk(cells_to_plot, plot_volcano)
+```
+
+
+```{r}
+###############################################################################
+#  run_CellDMC_all_levels.R   ·   2025-07-14
+#  IDATs → β-matrix → HiTIMED (h = 1-6) → CellDMC  |  covars: age + sex + MLH1
+###############################################################################
+##  0)  USER SETTINGS  ────────────────────────────────────────────────────────
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+out_root <- "/Users/adiallo/Desktop/CellDMC_all"
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+beta_rds <- "/Users/adiallo/Desktop/HiTIMED_stats/beta_comb.rds"
+redo_preprocess <- !file.exists(beta_rds)
+
+phenotype_to_use <- "any_mets"   # "any_mets", "distant", "ln_only"
+###############################################################################
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(minfi);   library(sesame);   library(ENmix)
+  library(HiTIMED); library(EpiDISH)
+  library(tidyverse); library(matrixStats); library(glue)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(ggrepel);  library(rlang)      # %||%
+})
+
+###############################################################################
+##  1)  β-matrix (load or build) & variance filter  ---------------------------
+###############################################################################
+if (redo_preprocess) {
+  msg("Reading IDATs …")
+  rg1 <- read.metharray.exp(idat_v1, recursive = TRUE, extended = TRUE, force = TRUE)
+  rg2 <- read.metharray.exp(idat_v2, recursive = TRUE, extended = TRUE, force = TRUE)
+
+  msg("NOOB normalisation …")
+  beta1 <- getBeta(preprocessNoob(rg1, dyeMethod = "single"))
+  beta2 <- sesame::betasCollapseToPfx(getBeta(preprocessNoob(rg2, dyeMethod = "single")))
+
+  common     <- intersect(rownames(beta1), rownames(beta2))
+  beta_comb  <- cbind(beta1[common, ], beta2[common, ])
+
+  bad  <- union(ENmix::QCinfo(rg1)$badCpG, ENmix::QCinfo(rg2)$badCpG)
+  anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  keep <- setdiff(common, bad)
+  keep <- keep[ !(anno$chr[match(keep, anno$Name)] %in% c("chrX","chrY")) ]
+  beta_comb <- beta_comb[keep, ]
+
+  saveRDS(beta_comb, beta_rds); msg("β-matrix saved → ", beta_rds)
+} else {
+  msg("Reading β-matrix from cache: ", beta_rds)
+  beta_comb <- readRDS(beta_rds)
+}
+
+## top-10 % most-variable probes ------------------------------------------------
+M.mat   <- log2(beta_comb / (1 - beta_comb) + 1e-6)
+var_vec <- rowVars(M.mat, na.rm = TRUE)
+var_cut <- quantile(var_vec, 0.6, na.rm = TRUE)
+beta_comb <- beta_comb[var_vec > var_cut, ]
+msg("After variance filter: ", nrow(beta_comb), " CpGs")
+
+###############################################################################
+##  2)  metadata  -------------------------------------------------------------
+###############################################################################
+meta_raw <- read_csv(meta_csv, show_col_types = FALSE)
+has_node <- "node_stage" %in% names(meta_raw)
+
+meta <- meta_raw %>%
+  mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+         any_mets = ifelse(any_mets, 1L, 0L),
+         distant  = ifelse(Distant_Mets, 1L, 0L),
+         ln_only  = ifelse(
+                      (has_node  & node_stage > 0 & !Distant_Mets) |
+                      (!has_node & ln_only == TRUE), 1L, 0L),
+         sex_num  = ifelse(sex == "M", 1, 0),
+         MLH1_num = ifelse(MLH1 == 1 , 1, 0)) %>%
+  select(SampleID, age, sex_num, MLH1_num,
+         any_mets, distant, ln_only)
+
+###############################################################################
+##  3)  iterate over HiTIMED depths  ------------------------------------------
+###############################################################################
+pick_col <- function(df, patt)
+  grep(patt, names(df), ignore.case = TRUE, value = TRUE)[1]
+
+for (h in 1:6) {
+
+  msg("\n=====================  HiTIMED h = ", h, "  =====================")
+
+  out_dir <- file.path(out_root, glue("CellDMC_h{h}"))
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  ## 3·1  HiTIMED -------------------------------------------------------------
+  msg("Running HiTIMED (h = ", h, ") …")
+  frac_df <- HiTIMED_deconvolution(beta_comb, "COAD", h = h) %>%
+               as.data.frame() %>% rownames_to_column("SampleID")
+
+  ## 3·2  matrices ------------------------------------------------------------
+  common_samples <- Reduce(intersect,
+                           list(colnames(beta_comb),
+                                frac_df$SampleID,
+                                meta$SampleID))
+
+  beta_mat <- beta_comb[, common_samples]
+
+  frac_mat <- frac_df %>%
+                filter(SampleID %in% common_samples) %>%
+                column_to_rownames("SampleID") %>% as.matrix()
+
+  ok <- rowSums(is.na(frac_mat)) == 0 & rowSums(frac_mat) > 0
+  if (sum(!ok))
+    msg("   • removing ", sum(!ok), " sample(s) w/ missing or zero fractions")
+
+  frac_mat  <- frac_mat[ok, , drop = FALSE]
+  keep_samp <- rownames(frac_mat)
+
+  beta_mat  <- beta_mat[, keep_samp]
+  pheno_vec <- meta[[phenotype_to_use]][match(keep_samp, meta$SampleID)]
+  names(pheno_vec) <- keep_samp
+
+  cov_df <- meta %>%
+              filter(SampleID %in% keep_samp) %>%
+              mutate(sex = factor(sex_num),
+                     MLH1 = factor(MLH1_num)) %>%
+              arrange(match(SampleID, keep_samp))
+  cov_mat <- model.matrix(~ age + sex + MLH1, data = cov_df)
+  rownames(cov_mat) <- cov_df$SampleID
+
+  ## 3·3  CellDMC -------------------------------------------------------------
+  msg("Running CellDMC  (samples = ", ncol(beta_mat),
+      ", CpGs = ", nrow(beta_mat), ") …")
+
+  cell_res <- CellDMC(beta.m  = beta_mat,
+                      pheno.v = pheno_vec,
+                      frac.m  = frac_mat,
+                      cov.mod = cov_mat,
+                      mc.cores = 2)
+
+  saveRDS(cell_res, file = file.path(out_dir, glue("CellDMC_h{h}_results.rds")))
+
+  ## 3·4  export DMCT tables --------------------------------------------------
+  iwalk(colnames(cell_res$dmct), function(cell_nm, idx){
+
+    sig_id <- names(which(cell_res$dmct[, cell_nm] != 0))
+    if (!length(sig_id)) return(invisible())
+
+    ## raw-P & logFC columns (robust lookup) ----------------------------------
+    coe_tbl <- cell_res$coe[[cell_nm]]
+    p_col   <- pick_col(coe_tbl, "^p$|pval|p\\.value")
+    raw_vec <- if (!is.na(p_col)) coe_tbl[[p_col]][sig_id] else
+               rep(NA_real_, length(sig_id))
+
+    logfc_col <- pick_col(coe_tbl, "estimate|log2?f?c|delta|diff|coef|effect")
+    logfc_vec <- if (!is.na(logfc_col)) coe_tbl[[logfc_col]][sig_id] else
+                 rep(NA_real_, length(sig_id))
+
+    have_adj <- !is.null(cell_res$adjp) && ncol(cell_res$adjp) >= idx
+    adj_vec  <- if (have_adj) cell_res$adjp[sig_id, cell_nm, drop = TRUE] else NA_real_
+
+    out_tbl <- tibble(
+      CpG       = sig_id,
+      Direction = ifelse(cell_res$dmct[sig_id, cell_nm] == 1, "Hyper", "Hypo"),
+      adj_P     = adj_vec,
+      raw_P     = raw_vec,
+      logFC     = logfc_vec
+    ) %>% arrange(if (have_adj) adj_P else raw_P)
+
+    tag <- if (have_adj) "FDR0.05" else "raw"
+    write_csv(out_tbl,
+              file.path(out_dir, glue("DMCT_{cell_nm}_{tag}.csv")))
+  })
+
+  ## 3·5  volcano plots -------------------------------------------------------
+  cells_to_plot <- intersect(c("Stromal","Lymphocyte","Tumor"),
+                             names(cell_res$coe))
+  if (!length(cells_to_plot)) {
+    msg("No Stromal/Lymphocyte/Tumor compartments at h=", h,
+        " – skipping volcanoes"); next
+  }
+
+  p_thr <- 1e-3;  x_thr <- 0.10;  top_n <- 10
+
+  walk(cells_to_plot, function(cell_nm){
+
+    coe_tbl  <- as_tibble(cell_res$coe[[cell_nm]], rownames = "CpG")
+    logfc_col<- pick_col(coe_tbl, "estimate|log2?f?c|delta|diff|coef|effect|mean")
+    p_col    <- pick_col(coe_tbl, "^p$|pval|p\\.value")
+
+    df <- coe_tbl %>%
+            transmute(CpG,
+                      logFC = .data[[logfc_col]],
+                      p     = .data[[p_col]],
+                      sig   = (p < p_thr & abs(logFC) > x_thr),
+                      negLog10P = -log10(p))
+
+    p <- ggplot(df, aes(logFC, negLog10P)) +
+           geom_point(aes(color=sig), alpha=.75, size=1.1) +
+           scale_color_manual(values=c(`TRUE`="red",`FALSE`="grey70"), guide="none") +
+           geom_vline(xintercept=c(-x_thr, x_thr), linetype="dashed", linewidth=.35) +
+           geom_hline(yintercept=-log10(p_thr),     linetype="dashed", linewidth=.35) +
+           ggrepel::geom_text_repel(
+             data = df %>% filter(sig) %>% arrange(p) %>% slice_head(n=top_n),
+             aes(label=CpG), size=3, max.overlaps=Inf) +
+           labs(title     = glue("Volcano – {cell_nm} (h={h})"),
+                subtitle  = glue("|Δβ| > {x_thr}  &  P < {p_thr}"),
+                x = "Effect size (Δβ / log₂FC)", y = "−log₁₀ P") +
+           theme_classic(base_size = 13)
+
+    ggsave(file.path(out_dir, glue("VOLC_{cell_nm}_h{h}.png")),
+           p, width = 6, height = 5, dpi = 300)
+    msg("✓  Volcano saved for ", cell_nm, " (h=", h, ")")
+  })
+}
+
+msg("\n✅  All HiTIMED depths finished – results in ", out_root)
+```
+

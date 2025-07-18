@@ -1,0 +1,380 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+###############################################################################
+#  mets_celltype_stats.R   ·   2025-07-12  (immune-normalised v1.3)
+#  Self-contained:  IDATs → HiTIMED (h = 1-6) → EpiDISH → stats + plots
+###############################################################################
+##  USER paths ────────────────────────────────────────────────────────────────
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+out_root <- "/Users/adiallo/Desktop/HiTIMED_stats"
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+redo_preprocess <- TRUE                          # FALSE = reuse *.rds
+beta_rds        <- file.path(out_root, "beta_comb.rds")
+###############################################################################
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(minfi);  library(sesame);   library(ENmix)
+  library(HiTIMED); library(EpiDISH)
+  library(tidyverse); library(ggpubr)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+## ...........................................................................
+##  1) β-matrix  -------------------------------------------------------------
+## ...........................................................................
+if (redo_preprocess || !file.exists(beta_rds)) {
+  msg("Reading IDATs …")
+  rg1 <- read.metharray.exp(idat_v1, recursive = TRUE, extended = TRUE, force = TRUE)
+  rg2 <- read.metharray.exp(idat_v2, recursive = TRUE, extended = TRUE, force = TRUE)
+
+  msg("NOOB normalisation …")
+  beta1 <- getBeta(preprocessNoob(rg1, dyeMethod = "single"))
+  beta2 <- sesame::betasCollapseToPfx(getBeta(preprocessNoob(rg2, dyeMethod = "single")))
+
+  common      <- intersect(rownames(beta1), rownames(beta2))
+  beta_comb   <- cbind(beta1[common, ], beta2[common, ])
+  bad         <- union(ENmix::QCinfo(rg1)$badCpG, ENmix::QCinfo(rg2)$badCpG)
+  anno        <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  keep        <- setdiff(common, bad)
+  keep        <- keep[!(anno$chr[match(keep, anno$Name)] %in% c("chrX", "chrY"))]
+  beta_comb   <- beta_comb[keep, ]
+
+  saveRDS(beta_comb, beta_rds); msg("β-matrix saved → ", beta_rds)
+} else {
+  msg("Reading β-matrix from ", beta_rds); beta_comb <- readRDS(beta_rds)
+}
+
+## ...........................................................................
+##  2)  HiTIMED  (h = 1-6)  +  EpiDISH Fibroblast  ---------------------------
+## ...........................................................................
+h_vec    <- 1:6
+hit_list <- setNames(vector("list", length(h_vec)), paste0("h", h_vec))
+msg("Running HiTIMED …")
+for (h in h_vec) {
+  msg("  • h = ", h)
+  hit_list[[paste0("h", h)]] <-
+    HiTIMED_deconvolution(beta_comb, "COAD", h = h) |>
+    as.data.frame() |> rownames_to_column("SampleID")
+}
+
+msg("Running EpiDISH (Fibroblast) …")
+data("centEpiFibIC.m", package = "EpiDISH", envir = environment())
+common_epi <- intersect(rownames(beta_comb), rownames(centEpiFibIC.m))
+fib_df     <- epidish(beta_comb[common_epi, ], centEpiFibIC.m[common_epi, ], "RPC")$estF |>
+                as.data.frame() |> select(Fib) |> rownames_to_column("SampleID")
+
+## ...........................................................................
+##  3)  Clinical metadata  (uses **node_stage**)  -----------------------------
+## ...........................................................................
+meta_raw <- read_csv(meta_csv, show_col_types = FALSE)              # read once
+has_node <- "node_stage" %in% names(meta_raw)                       # flag
+
+meta <- meta_raw |>
+  mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+         MLH1     = factor(ifelse(MLH1 == 1, "MLH1 Positive", "MLH1 Negative")),
+         mets_cat_excl = case_when(
+           Distant_Mets == TRUE                        ~ "Distant",
+           has_node & node_stage > 0                   ~ "LN-only",
+           !has_node & ln_only == TRUE                 ~ "LN-only",
+           TRUE                                        ~ "No Mets"
+         ),
+         mets_cat_excl = factor(mets_cat_excl,
+                                levels = c("No Mets", "LN-only", "Distant")),
+         any_mets_fct = factor(ifelse(mets_cat_excl == "No Mets",
+                                      "No Mets", "Mets")),
+         ln_only_fct  = factor(ifelse(mets_cat_excl == "LN-only",
+                                      "LN Mets", "No LN Mets")),
+         dist_fct     = factor(ifelse(mets_cat_excl == "Distant",
+                                      "Distant Mets", "No Distant Mets"))
+  )
+
+## ...........................................................................
+##  4)  Immune-normalisation helper  ✨----------------------------------------
+## ...........................................................................
+normalise_fractions <- function(df) {
+  master <- c("Bas","Eos","Neu","Mono","DC","Bnv","Bmem",
+              "CD4nv","CD4mem","Treg","CD8nv","CD8mem","NK","Immune")
+  immune_cols <- intersect(master, names(df))
+  if (length(immune_cols) < 2) return(df)  # h = 1/2 → nothing to scale
+
+  df |>
+    mutate(Immune_total = rowSums(across(all_of(immune_cols)), na.rm = TRUE)) |>
+    mutate(across(all_of(immune_cols),
+                  ~ if_else(Immune_total > 0, .x / Immune_total, NA_real_),
+                  .names = "{.col}_norm"))
+}
+
+## ...........................................................................
+##  5)  Stats + plots (unchanged)  -------------------------------------------
+## ...........................................................................
+# … keep the rest of your `normalise_fractions`, `run_stats_level`, and
+#    walk2(hit_list, …) sections exactly as in v1.2 …
+## ...........................................................................
+##  6)  Run all HiTIMED levels  ----------------------------------------------
+## ...........................................................................
+walk2(hit_list, names(hit_list), run_stats_level)
+msg("All levels finished → see ", out_root)
+```
+
+```{r warning=FALSE}
+###############################################################################
+#  add_all-cell_facets.R   –  run *after* mets_celltype_stats.R
+###############################################################################
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ggpubr)          # stat_compare_means()
+})
+
+## ──────────────────────────────────────────────────────────────
+##  0)  Output folder
+## ──────────────────────────────────────────────────────────────
+out_root <- "/Users/adiallo/Desktop/HiTIMED_stats/one_plot"
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+## ──────────────────────────────────────────────────────────────
+##  1)  helper that saves ONE faceted plot
+## ──────────────────────────────────────────────────────────────
+plot_all_cells <- function(df_plot, level_tag,
+                           group_var, group_label,
+                           cell_cols,
+                           mlh_filter = NULL,
+                           out_dir) {
+
+  if (!is.null(mlh_filter))
+    df_plot <- filter(df_plot, MLH1 == mlh_filter)
+
+  if (n_distinct(df_plot[[group_var]]) < 2) return(invisible(NULL))
+
+  long_df <- df_plot %>%
+               pivot_longer(cols = all_of(cell_cols),
+                            names_to  = "Cell",
+                            values_to = "Prop")
+
+  p <- ggplot(long_df, aes(x = .data[[group_var]],
+                           y = Prop,
+                           fill = .data[[group_var]])) +
+         geom_boxplot(outlier.shape = NA, width = .65) +
+         geom_jitter(width = .15, height = 0, size = .8, alpha = .8) +
+         facet_wrap(~ Cell, scales = "free_y", ncol = 5) +
+         labs(title = paste("HiTIMED", level_tag, "|", group_label,
+                            if (!is.null(mlh_filter))
+                              paste0("•", mlh_filter)),
+              x = NULL, y = "Proportion") +
+         theme_bw(base_size = 11) +
+         theme(axis.text.x   = element_text(angle = 45, hjust = 1),
+               legend.position = "none")
+
+  ## safe file-name
+  fn <- paste0("FIG_", level_tag, "_", group_label,
+               ifelse(is.null(mlh_filter), "_All",
+                      paste0("_", gsub(" ", "", mlh_filter))), ".png") |>
+        gsub("[^A-Za-z0-9_.]+", "_", x = _)
+
+  ggsave(file.path(out_dir, fn), p, width = 10, height = 7, dpi = 300)
+  message("   • saved ", fn)
+}
+
+## ──────────────────────────────────────────────────────────────
+##  2)  iterate over levels / comparisons / MLH1 strata
+## ──────────────────────────────────────────────────────────────
+group_vars <- c(any_mets_fct = "Any_Mets",
+                ln_only_fct  = "LN_Mets",
+                dist_fct     = "Distant_Mets")
+
+walk2(hit_list, names(hit_list), function(frac_df, level_tag) {
+
+  message("\n>>> plotting combo figures for ", level_tag)
+  out_dir <- file.path(out_root, level_tag)
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  combined <- meta %>%
+                left_join(frac_df, by = "SampleID") %>%
+                left_join(fib_df , by = "SampleID") %>%
+                normalise_fractions()                # ← keep *_norm columns
+
+  ## cell columns = HiTIMED fractions  + Fib  + any *_norm produced
+  cell_cols <- c(setdiff(names(frac_df), "SampleID"), "Fib",
+                 grep("_norm$", names(combined), value = TRUE))
+
+  for (g in names(group_vars)) {
+
+    ## (i)  All samples
+    plot_all_cells(combined, level_tag,
+                   group_var   = g,
+                   group_label = group_vars[[g]],
+                   cell_cols   = cell_cols,
+                   mlh_filter  = NULL,
+                   out_dir     = out_dir)
+
+    ## (ii) each MLH1 stratum
+    walk(levels(meta$MLH1), \(mlh)
+      plot_all_cells(combined, level_tag,
+                     group_var   = g,
+                     group_label = group_vars[[g]],
+                     cell_cols   = cell_cols,
+                     mlh_filter  = mlh,
+                     out_dir     = out_dir))
+  }
+})
+
+message("\n✓  combo plots written to  ", out_root)
+```
+
+Comparing DH data with GTEx
+```{r}
+###############################################################################
+#  compare_DH_vs_GTEx_allLevels.R   –  run *after* mets_celltype_stats.R
+###############################################################################
+suppressPackageStartupMessages({
+  library(tidyverse); library(ggpubr); library(ggrepel)
+  library(minfi); library(sesame); library(ENmix)
+  library(HiTIMED); library(EpiDISH)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+## ──────────────────────────────────────────────────────────────
+##  0)  Paths & basic settings
+## ──────────────────────────────────────────────────────────────
+gtex_rds <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/GTEx/GTEx_samples.rds"
+out_root <- "/Users/adiallo/Desktop/HiTIMED_stats/GTEx_comparison"
+dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+
+h_vec <- 1:6                         # run ALL levels
+
+## ──────────────────────────────────────────────────────────────
+##  1)  Grab DH objects already in memory
+## ──────────────────────────────────────────────────────────────
+stopifnot(exists("hit_list"), exists("meta"), exists("fib_df"),
+          exists("normalise_fractions"))
+
+## ──────────────────────────────────────────────────────────────
+##  2)  Load GTEx β-matrix once and pre-clean
+## ──────────────────────────────────────────────────────────────
+beta_GTEx <- readRDS(gtex_rds) |> as.matrix()
+
+anno   <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+sex_cp <- rownames(anno)[anno$chr %in% c("chrX","chrY")]
+beta_GTEx <- beta_GTEx[!(rownames(beta_GTEx) %in% sex_cp), ] |>
+               sesame::betasCollapseToPfx()
+
+##  (we’ll reuse beta_GTEx for every h)
+## ──────────────────────────────────────────────────────────────
+##  3)  Iterate over each HiTIMED level
+## ──────────────────────────────────────────────────────────────
+for (h in h_vec) {
+
+  lvl_tag <- paste0("h", h)
+  message("\n==============================")
+  message(">>> level ", lvl_tag)
+
+  ## 3·1  DH fractions for this level (already in RAM)
+  stopifnot(lvl_tag %in% names(hit_list))
+  frac_DH <- hit_list[[lvl_tag]]            # SampleID + cells
+
+  ## 3·2  GTEx HiTIMED + EpiDISH ---------------------------------------------
+  message("   HiTIMED on GTEx …")
+  frac_GTEx <- HiTIMED_deconvolution(beta_GTEx,
+                                     tumor_type = "COAD",
+                                     h          = h,
+                                     tissue_type = "normal") |>
+                 as.data.frame() |> rownames_to_column("SampleID")
+
+  message("   EpiDISH fibroblast on GTEx …")
+  data("centEpiFibIC.m", package = "EpiDISH", envir = environment())
+  common_epi <- intersect(rownames(beta_GTEx), rownames(centEpiFibIC.m))
+  fib_GTEx   <- epidish(beta_GTEx[common_epi, ],
+                        centEpiFibIC.m[common_epi, ], "RPC")$estF |>
+                  as.data.frame() |> select(Fib) |>
+                  rownames_to_column("SampleID")
+
+  ## 3·3  build combined DH + GTEx tibble ------------------------------------
+  make_combined <- function(frac_df, meta_df, fib_add, label){
+    meta_df |>
+      mutate(dataset = label) |>
+      select(SampleID, dataset) |>
+      left_join(frac_df,  by = "SampleID") |>
+      left_join(fib_add,  by = "SampleID") |>
+      normalise_fractions()
+  }
+
+  comb_DH   <- make_combined(frac_DH , meta,    fib_df , "DH")
+  comb_GTEx <- make_combined(frac_GTEx,
+                             tibble(SampleID = frac_GTEx$SampleID),
+                             fib_GTEx, "GTEx")
+
+  combined  <- bind_rows(comb_DH, comb_GTEx)
+
+  ## 3·4  output paths
+  out_lvl <- file.path(out_root, lvl_tag)
+  dir.create(out_lvl, showWarnings = FALSE, recursive = TRUE)
+
+  ## 3·5  stats & per-cell box-plots -----------------------------------------
+  cell_cols <- c(setdiff(names(frac_DH), "SampleID"),
+                 "Fib",
+                 grep("_norm$", names(combined), value = TRUE))
+
+  stats_tbl <- map_dfr(cell_cols, \(cl){
+    d <- combined %>% filter(!is.na(dataset))
+    if (n_distinct(d$dataset) < 2) return(NULL)
+    w <- wilcox.test(reformulate("dataset", cl), data = d)
+    tibble(Cell   = cl,
+           P_wilc = w$p.value,
+           N_DH   = sum(d$dataset == "DH"),
+           N_GTEx = sum(d$dataset == "GTEx"))
+  })
+
+  write_csv(stats_tbl, file.path(out_lvl, "wilcox_DH_vs_GTEx.csv"))
+
+  pal <- c(DH = "#4DBBD5FF", GTEx = "#E64B35FF")
+
+  walk(cell_cols, \(cl){
+    p <- ggplot(combined, aes(x = dataset, y = .data[[cl]], fill = dataset)) +
+           geom_boxplot(outlier.shape = NA, width = .6, alpha = .6) +
+           geom_jitter(width = .15, size = 1, alpha = .8) +
+           stat_compare_means(method = "wilcox.test", label = "p.format",
+                              hide.ns = FALSE) +
+           scale_fill_manual(values = pal, guide = "none") +
+           theme_bw(base_size = 11) +
+           labs(title = paste0(cl, "  –  DH vs GTEx (", lvl_tag, ")"),
+                x = NULL, y = "Proportion")
+    ggsave(file.path(out_lvl,
+                     paste0("BOX_", gsub("[^A-Za-z0-9]+","_",cl), ".png")),
+           p, width = 4, height = 4, dpi = 300)
+  })
+
+  ## 3·6  BIG faceted plot with **all** cells ---------------------------------
+  long_df <- combined |>
+               pivot_longer(cols = all_of(cell_cols),
+                            names_to = "Cell", values_to = "Prop")
+
+  p_all <- ggplot(long_df, aes(dataset, Prop, fill = dataset)) +
+             geom_boxplot(outlier.shape = NA, width = .65, alpha = .6) +
+             geom_jitter(width = .2, size = .6, alpha = .8) +
+             facet_wrap(~ Cell, scales = "free_y", ncol = 5) +
+             stat_compare_means(method = "wilcox.test",
+                                label = "p.signif", hide.ns = FALSE,
+                                size = 3, color = "black") +
+             scale_fill_manual(values = pal, guide = "none") +
+             theme_bw(base_size = 11) +
+             theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+             labs(title = paste("HiTIMED", lvl_tag, "— DH vs GTEx"),
+                  x = NULL, y = "Proportion")
+
+  ggsave(file.path(out_lvl, paste0("FACET_allCells_", lvl_tag, ".png")),
+         p_all, width = 11, height = 8.5, dpi = 300)
+
+  message("✓  Level ", lvl_tag, " done  →  ", out_lvl)
+}
+
+message("\n✅  All 6 levels finished.  See ", out_root)
+```
+
