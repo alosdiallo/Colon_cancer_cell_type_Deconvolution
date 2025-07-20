@@ -1,0 +1,98 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+# 1. LOAD LIBRARIES
+# -----------------
+library(tidyverse)
+library(janitor)
+
+# 2. DEFINE FILE PATH
+# -------------------
+# ❗️ IMPORTANT: Update this path to your file's location.
+series_file <- "/Users/adiallo/Desktop/The_Big_Project/Data/TCGA/idats/GSE68838_series_matrix.txt"
+
+# 3. READ METADATA HEADER ONLY (MEMORY-SAFE) 🧠
+# ---------------------------------------------
+# Read all lines from the file
+all_lines <- readLines(series_file)
+
+# Find where the data table begins
+matrix_start_line <- grep("!series_matrix_table_begin", all_lines, fixed = TRUE)
+
+# Extract only the header lines
+header_lines <- all_lines[1:(matrix_start_line - 1)]
+
+# Filter for just the sample-related metadata lines and remove the "!Sample_" prefix
+sample_lines <- header_lines[grep("!Sample_", header_lines)]
+cleaned_sample_lines <- sub("!Sample_", "", sample_lines)
+
+# Read the cleaned text lines into a data frame
+raw_meta_transposed <- read.delim(text = paste(cleaned_sample_lines, collapse = "\n"), sep = "\t", header = FALSE)
+
+# Make the metadata keys in the first column (V1) unique to prevent errors
+raw_meta_transposed$V1 <- make.unique(as.character(raw_meta_transposed$V1))
+
+# Transpose the data so that samples are rows and metadata are columns
+rownames(raw_meta_transposed) <- raw_meta_transposed$V1
+raw_meta_transposed$V1 <- NULL
+raw_meta <- as.data.frame(t(raw_meta_transposed))
+
+
+# 4. TIDY THE METADATA 🪄
+# ----------------------
+# This process now uses the correct column name 'source_name_ch1'.
+
+clean_meta <- raw_meta %>%
+  # Clean column names first (e.g., "geo_accession" -> "geo_accession")
+  clean_names() %>%
+  
+  # ❗️ CORRECTED STEP: Select the correct column name 'source_name_ch1'.
+  select(geo_accession, title, source_name_ch1, starts_with("characteristics_ch1")) %>%
+  
+  # Pivot only the 'characteristics' columns to tidy them
+  pivot_longer(
+    cols = starts_with("characteristics_ch1"),
+    names_to = "temp_col",
+    values_to = "key_value_pair"
+  ) %>%
+  select(-temp_col) %>%
+  filter(key_value_pair != "" & !is.na(key_value_pair)) %>%
+
+  # Separate the "key: value" pairs
+  separate_wider_delim(
+    key_value_pair,
+    delim = ": ",
+    names = c("key", "value"),
+    too_many = "merge"
+  ) %>%
+  mutate(across(c(key, value), str_trim)) %>%
+  filter(key != "" & !is.na(key)) %>%
+  
+  # Pivot the characteristic keys back to a wide format
+  pivot_wider(
+    names_from = key,
+    values_from = value,
+    values_fn = list(value = ~paste(unique(.), collapse = "; "))
+  ) %>%
+
+  # Clean up the final column names again
+  clean_names()
+
+# 5. INSPECT & SAVE THE FINAL METADATA ✅
+# ----------------------------------------
+cat("✅ Metadata extracted and tidied successfully!\n")
+cat("The 'source_name_ch1' column with tissue types is now included.\n\n")
+
+glimpse(clean_meta)
+
+write_csv(clean_meta, "/Users/adiallo/Desktop/The_Big_Project/Data/TCGA/idats/GSE68838_tidy_metadata.csv")
+
+cat("\n✅ Final metadata file saved as: GSE68838_tidy_metadata.csv\n")
+```
+
+
+

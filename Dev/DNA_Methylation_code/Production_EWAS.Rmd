@@ -4,7 +4,7 @@ output: html_notebook
 ---
 
 Main EWAS
-```{r}
+```{r ewas_metastasis_h6_normImmune, echo=TRUE, message=FALSE, warning=FALSE}
 ###############################################################################
 #  ewas_metastasis_h6_normImmune.R     ·  2025-07-18
 #  Single HiTIMED h = 6   →   immune-fraction normalisation
@@ -23,9 +23,9 @@ variance_percentile <- 0.90              # 0 ⇒ keep all CpGs
 msg <- \(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
 
 suppressPackageStartupMessages({
-  library(minfi);  library(sesame);  library(ENmix)
-  library(matrixStats);  library(limma);  library(sva)
-  library(HiTIMED);      library(tidyverse)
+  library(minfi);     library(sesame);  library(ENmix)
+  library(matrixStats); library(limma); library(sva)
+  library(HiTIMED);   library(tidyverse); library(glue)
 })
 
 ###############################################################################
@@ -35,9 +35,9 @@ cache_dir <- "results_ewas_cache" ; dir.create(cache_dir, FALSE)
 beta_rds  <- file.path(cache_dir, "beta_comb_qc.rds")
 
 read_pp <- function(path, tag){
-  rg  <- read.metharray.exp(path, recursive = TRUE, extended = TRUE, force = TRUE)
-  bet <- getBeta(preprocessNoob(rg, dyeMethod = "single"))
-  if (tag == "v2") bet <- betasCollapseToPfx(bet)
+  rg  <- read.metharray.exp(path, recursive=TRUE, extended=TRUE, force=TRUE)
+  bet <- getBeta(preprocessNoob(rg, dyeMethod="single"))
+  if (tag=="v2") bet <- betasCollapseToPfx(bet)
   bad <- ENmix::QCinfo(rg)$badCpG
   bet[setdiff(rownames(bet), bad), ]
 }
@@ -47,10 +47,10 @@ if (!file.exists(beta_rds)){
   beta1 <- read_pp(idat_v1, "v1")
   beta2 <- read_pp(idat_v2, "v2")
   common     <- intersect(rownames(beta1), rownames(beta2))
-  beta_comb  <- cbind(beta1[common, ], beta2[common, ])
+  beta_comb  <- cbind(beta1[common,], beta2[common,])
   saveRDS(beta_comb, beta_rds);  msg("β-matrix cached.")
 } else {
-  beta_comb <- readRDS(beta_rds);  msg("β-matrix loaded from cache.")
+  beta_comb <- readRDS(beta_rds);   msg("β-matrix loaded from cache.")
 }
 
 ## ─ variance filter ─────────────────────────────────────────────────────────
@@ -58,7 +58,7 @@ M.mat <- log2(beta_comb/(1-beta_comb) + 1e-6)
 if (variance_percentile > 0){
   var_thr <- quantile(rowVars(M.mat, TRUE), variance_percentile)
   keep    <- rowVars(M.mat, TRUE) > var_thr
-  beta_comb <- beta_comb[keep, ];   M.mat <- M.mat[keep, ]
+  beta_comb <- beta_comb[keep,];   M.mat <- M.mat[keep,]
   msg(sum(keep), " CpGs kept (top ", 100*(1-variance_percentile), "% var).")
 }
 
@@ -66,7 +66,7 @@ if (variance_percentile > 0){
 ##  2)  HiTIMED  h = 6   ------------------------------------------------------
 ###############################################################################
 msg("Running HiTIMED  h = 6 …")
-frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) %>%
+frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h=6) %>%
              as.data.frame() %>% rownames_to_column("SampleID")
 
 ###############################################################################
@@ -77,25 +77,17 @@ collapse_frac <- function(df){
   imm_cols <- c("CD8mem","CD8nv","CD4mem","CD4nv",
                 "Treg","Bmem","Bnv","DC","Mono","NK")
   totalImm <- rowSums(df[imm_cols])
-  totalImm[totalImm == 0] <- NA        # avoid division by zero
+  totalImm[totalImm==0] <- NA        # avoid div‐by‐zero
   
   tibble(
     SampleID     = df$SampleID,
     Tumor        = get("Tumor"),
     Fibroblast   = get("Fib"),
-    Endothelial  = get("Endothelial"),
-    Epithelial   = get("Epithelial"),
-    Stromal      = get("Stromal"),
-    ## immune, normalised ----------------------------------------------------
-    CD8_T        = (get("CD8mem") + get("CD8nv")) /
-                     totalImm,
-    LymphOther   = (get("CD4mem") + get("CD4nv") +
-                    get("Treg")   + get("Bmem")  + get("Bnv")) /
-                     totalImm,
-    Myeloid      = (get("DC") + get("Mono") + get("NK")) /
-                     totalImm,
-    ## helper
-    StromalOther = get("Endothelial") + get("Epithelial")
+    StromalOther = get("Endothelial") + get("Epithelial"),
+    ## immune, normalised (only two out of three to avoid collinearity) -----
+    CD8_T        = (get("CD8mem")+get("CD8nv"))/totalImm,
+    LymphOther   = (get("CD4mem")+get("CD4nv")+
+                    get("Treg")+get("Bmem")+get("Bnv"))/totalImm
   ) %>% mutate(across(where(is.numeric), as.numeric))
 }
 
@@ -107,71 +99,67 @@ tier_template <- list(
   Tier2 = c("age","sex_num","MLH1_num","Tumor"),
   Tier3 = c("age","sex_num","MLH1_num","Tumor",
             "Fibroblast","StromalOther",
-            "CD8_T","LymphOther","Myeloid")
+            "CD8_T","LymphOther")   # dropped Myeloid
 )
 trim_tiers <- \(tiers, avail) lapply(tiers, \(v) intersect(v, avail))
 
 ###############################################################################
 ##  5)  Loop over phenotypes  -------------------------------------------------
 ###############################################################################
-for (pheno_tag in names(phenotypes)){     # any / ln / dist
+for (pheno_tag in names(phenotypes)){
   
   pheno_var <- phenotypes[[pheno_tag]]
   msg("\n================  ", pheno_var, "  ================")
   
-  ## ---- metadata ----------------------------------------------------------
-  meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+  ## metadata --------------------------------------------------------------
+  meta <- read_csv(meta_csv, show_col_types=FALSE) %>%
     mutate(
-      SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
-      any_mets = ifelse(any_mets     , 1L, 0L),          # ← keep if already there
-      distant  = ifelse(Distant_Mets , 1L, 0L),          # ← bring back
-      ln_only  = ifelse(ln_only      , 1L, 0L),          # ← bring back
-      sex_num  = ifelse(sex == "M"   , 1 , 0),
-      MLH1_num = ifelse(MLH1 == 1    , 1 , 0),
-      Array_Version = ifelse(SampleID %in% colnames(beta_comb), "v1", "v2")
+      SampleID   = paste(Sentrix_ID,Sentrix_Position,sep="_"),
+      any_mets   = as.integer(any_mets),
+      distant    = as.integer(Distant_Mets),
+      ln_only    = as.integer(ln_only),
+      sex_num    = as.integer(sex=="M"),
+      MLH1_num   = as.integer(MLH1==1),
+      Array_Version = ifelse(SampleID %in% colnames(beta_comb),"v1","v2")
     )
   
-  ## derive binary outcome --------------------------------------------------
+  ## binary outcome --------------------------------------------------------
   meta$pheno_bin <- case_when(
-    pheno_var == "any_mets"         ~ as.integer(meta$any_mets  == 1),
-    pheno_var == "distant"          ~ as.integer(meta$distant   == 1),
-    pheno_var == "ln_only"          ~ as.integer(meta$ln_only   == 1 &
-                                                 meta$distant   == 0),
+    pheno_var=="any_mets" ~ meta$any_mets,
+    pheno_var=="distant"  ~ meta$distant,
+    pheno_var=="ln_only"  ~ (meta$ln_only & !meta$distant),
     TRUE ~ NA_integer_
   )
-  stopifnot(setequal(unique(meta$pheno_bin), c(0L,1L)))
+  stopifnot(all(meta$pheno_bin %in% 0:1))
   
-  ## fractions & covars -----------------------------------------------------
+  ## join fractions & drop incomplete -------------------------------------
   frac_df  <- collapse_frac(frac_h6)
-  meta_all <- left_join(meta, frac_df, by = "SampleID")
+  meta_all <- left_join(meta, frac_df, by="SampleID")
+  ok       <- complete.cases(meta_all[, tier_template$Tier3])
+  meta_f   <- meta_all[ok, ]
+  M_f      <- M.mat[, meta_f$SampleID]
   
-  ## drop rows with any NA in Tier-3 covariates -----------------------------
-  ok <- complete.cases(meta_all[, tier_template$Tier3])
-  meta_f <- meta_all[ok, ]
-  M_f    <- M.mat[, meta_f$SampleID]
-  
-  ## ComBat platform adjustment --------------------------------------------
-  if (length(unique(meta_f$Array_Version)) > 1){
+  ## ComBat adjustment -----------------------------------------------------
+  if (length(unique(meta_f$Array_Version))>1){
     mod_cb <- model.matrix(~ age + sex_num + MLH1_num + pheno_bin, meta_f)
-    M_cb   <- ComBat(M_f, batch = factor(meta_f$Array_Version),
-                     mod = mod_cb, par.prior = TRUE, prior.plots = FALSE)
+    M_cb   <- ComBat(M_f, batch=factor(meta_f$Array_Version),
+                     mod=mod_cb, par.prior=TRUE, prior.plots=FALSE)
   } else M_cb <- M_f
   
-  ## tier fits --------------------------------------------------------------
+  ## fit tiers -------------------------------------------------------------
   tier_list <- trim_tiers(tier_template, names(meta_f))
   fits <- map(tier_list, \(covs){
-    nz   <- covs[sapply(meta_f[covs], sd, TRUE) > 0]
-    form <- if (length(nz)==0) ~ pheno_bin
-            else as.formula(paste("~ pheno_bin +",
-                                  paste(nz, collapse = " + ")))
-    des  <- model.matrix(form, meta_f)
-    eBayes(lmFit(M_cb, des), trend = TRUE, robust = TRUE)
+    nz  <- covs[sapply(meta_f[covs], sd, TRUE) > 0]
+    form<- if (length(nz)==0) ~ pheno_bin
+           else as.formula(paste("~ pheno_bin +", paste(nz, collapse=" + ")))
+    des <- model.matrix(form, meta_f)
+    eBayes(lmFit(M_cb, des), trend=TRUE, robust=TRUE)
   })
   
-  ## save -------------------------------------------------------------------
+  ## save results ----------------------------------------------------------
   out_dir <- file.path(glue("results_ewas_{pheno_tag}"), "H6")
-  dir.create(out_dir, TRUE, FALSE)
-  saveRDS(fits, file = file.path(out_dir, "ewas_fits.rds"))
+  dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+  saveRDS(fits, file.path(out_dir, "ewas_fits.rds"))
   msg("✓  fits saved → ", out_dir)
 }
 
@@ -179,130 +167,359 @@ msg("\n✅  Finished: Any, LN-only, Distant  (HiTIMED-h6, immune-normalised)")
 ```
 
 Volcano plots
-```{r volcano_plots, echo=TRUE, message=FALSE, warning=FALSE}
+```{r}
 ###############################################################################
-#  volcano_plots.R  –  publication-ready volcano plots (one per phenotype × tier)
+#  volcano_plots_gg_all_tiers.R  –  publication-ready volcano plots (Tiers 1–3)
+#  for Any mets, Lymph node mets, and Distant mets
 ###############################################################################
 suppressPackageStartupMessages({
   library(limma)
-  library(EnhancedVolcano)
-  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
   library(dplyr)
   library(glue)
-  library(ggplot2)
-  library(rlang)               # Needed for %||%
+  library(tibble)
+  library(rlang)      # for coalesce()
   library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 })
 
-## -------- directories containing your EWAS fits ----------------------------
-phen_dirs <- c(any  = "results_ewas_any",
-               ln   = "results_ewas_ln",
-               dist = "results_ewas_dist")
+## -------- phenotypes & directories ----------------------------------------
+phen_dirs <- c(
+  any  = "results_ewas_any",
+  ln   = "results_ewas_ln",
+  dist = "results_ewas_dist"
+)
+phen_labels <- c(
+  any  = "Any metastasis",
+  ln   = "Lymph node metastasis",
+  dist = "Distant metastasis"
+)
 
-## -------- probe → HGNC symbol map ------------------------------------------
-data("IlluminaHumanMethylationEPICanno.ilm10b4.hg19",
-     package = "IlluminaHumanMethylationEPICanno.ilm10b4.hg19",
-     envir   = environment())
-anno_df    <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-probe2gene <- ifelse(anno_df$UCSC_RefGene_Name == "",
-                     NA_character_,
-                     sub(";.*$", "", anno_df$UCSC_RefGene_Name))
-names(probe2gene) <- anno_df$Name  # cg-ID → first gene symbol
+## -------- probe → primary gene symbol map --------------------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 
-## -------- helper: single volcano (returns ggplot object) -------------------
-make_volcano <- function(tt, title_txt,
-                         lfc_cut = 0.2, p_cut = 1e-3, top_n = 10,
-                         gene_map) {
-  tt_plot <- tt %>%
-    mutate(Gene   = gene_map[rownames(tt)] %||% rownames(tt),
-           colour = case_when(
-             logFC >=  lfc_cut & P.Value < p_cut ~ "Hyper",
-             logFC <= -lfc_cut & P.Value < p_cut ~ "Hypo",
-             TRUE                                ~ "NS"))
-  
-  hit_genes <- tt_plot %>%
-    filter(colour != "NS") %>%
+# 1) UCSC: first symbol before any “;”
+ucsc_raw <- anno$UCSC_RefGene_Name
+ucsc_map <- ifelse(!is.na(ucsc_raw) & ucsc_raw != "",
+                   sub(";.*$", "", ucsc_raw),
+                   NA_character_)
+
+# 2) GencodeBasic: safe extraction of last entry (or NA)
+gencode_raw <- anno$GencodeBasicV12_NAME
+gencode_map <- vapply(
+  gencode_raw,
+  function(raw) {
+    if (is.na(raw) || raw == "") {
+      NA_character_
+    } else {
+      parts <- strsplit(raw, ";")[[1]]
+      tail(parts, 1)
+    }
+  },
+  FUN.VALUE = character(1)
+)
+
+# 3) coalesce: UCSC first, then Gencode, else NA
+probe2gene <- ifelse(
+  !is.na(ucsc_map), ucsc_map,
+  ifelse(!is.na(gencode_map), gencode_map, NA_character_)
+)
+names(probe2gene) <- anno$Name  # cgID → gene
+
+## -------- custom ggplot2 volcano function -------------------------------
+make_volcano_gg <- function(tt, title_txt,
+                            lfc_cut = 0.2, p_cut = 1e-3, top_n = 10,
+                            gene_map) {
+
+  df <- tt %>%
+    rownames_to_column("CpG") %>%                 # make CpG a column
+    mutate(
+      Gene = coalesce( na_if(gene_map[CpG], ""),  # turn "" → NA
+                       CpG ),                     # fallback
+      negLogP = -log10(P.Value),
+      Signif  = case_when(
+        logFC >=  lfc_cut & P.Value < p_cut ~ "Hyper",
+        logFC <= -lfc_cut & P.Value < p_cut ~ "Hypo",
+        TRUE                                ~ "NS"
+      )
+    )
+
+  top_hits <- df %>%
+    filter(Signif != "NS") %>%
     arrange(P.Value) %>%
-    slice_head(n = top_n) %>%
-    pull(Gene)
-  
-  lab_vec <- ifelse(tt_plot$Gene %in% hit_genes, tt_plot$Gene, "")
-  names(lab_vec) <- rownames(tt_plot)
-  
-  row_cols <- recode(tt_plot$colour,
-                     Hyper = "firebrick",
-                     Hypo  = "dodgerblue",
-                     NS    = "grey65")
-  names(row_cols) <- rownames(tt_plot)
-  
-  # Capture but don’t auto-print
-  p <- EnhancedVolcano(
-    tt_plot,
-    lab             = lab_vec,
-    x               = "logFC",
-    y               = "P.Value",
-    FCcutoff        = lfc_cut,
-    pCutoff         = p_cut,
-    selectLab       = hit_genes,
-    colCustom       = row_cols,
-    colAlpha        = .8,
-    pointSize       = 1.6,
-    labSize         = 3.5,
-    title           = title_txt,
-    subtitle        = "HiTIMED h = 6",
-    xlab            = bquote(Log[2]~fold~change),
-    ylab            = bquote(-Log[10]~italic(P)),
-    legendPosition  = 'right',
-    cutoffLineType  = 'dashed',
-    cutoffLineWidth = .6,
-    borderWidth     = .3
-  )
-  invisible(p)
+    slice_head(n = top_n)
+
+  ggplot(df, aes(x = logFC, y = negLogP, color = Signif)) +
+    geom_point(size = 1.6, alpha = 0.8) +
+    scale_color_manual(values = c(Hyper="firebrick",
+                                  Hypo="dodgerblue",
+                                  NS="grey65")) +
+    geom_vline(xintercept = c(-lfc_cut, lfc_cut),
+               linetype = "dashed", size = 0.5) +
+    geom_hline(yintercept = -log10(p_cut),
+               linetype = "dashed", size = 0.5) +
+    geom_text_repel(data = top_hits,
+                  aes(label = Gene),
+                  size          = 3,
+                  max.overlaps  = Inf,     # allow unlimited overlaps
+                  box.padding   = 0.5,     # give labels a bit more breathing room
+                  point.padding = 0.3,
+                  segment.size  = 0.2,
+                  force         = 1,       # increase repulsion force
+                  nudge_y       = 0.1) +   # nudge labels up slightly
+    labs(title    = title_txt,
+         subtitle = "HiTIMED h = 6",
+         x        = bquote(Log[2]~fold~change),
+         y        = bquote(-Log[10]~italic(P))) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "right")
 }
 
-## -------- main loop ---------------------------------------------------------
+## -------- main loop: phenotypes × tiers ----------------------------------
 for (ph_tag in names(phen_dirs)) {
-  
   ph_dir   <- phen_dirs[[ph_tag]]
   fit_file <- file.path(ph_dir, "H6", "ewas_fits.rds")
-  if (!file.exists(fit_file)) {
-    message("⚠️  Missing fits for ", ph_tag, " – skipped")
-    next
-  }
-  
-  fits     <- readRDS(fit_file)         # Tier1/2/3
-  plot_dir <- file.path(ph_dir, "H6", "plots_volcano")
+  if (!file.exists(fit_file)) next
+
+  fits     <- readRDS(fit_file)   # list: Tier1, Tier2, Tier3
+  plot_dir <- file.path(ph_dir, "H6", "plots_volcano_gg")
   dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
-  
+
   for (tier_nm in names(fits)) {
     fit_obj <- if (inherits(fits[[tier_nm]], "MArrayLM"))
                  fits[[tier_nm]]
                else
                  fits[[tier_nm]]$fit
-    
-    tt <- limma::topTable(fit_obj, coef = "pheno_bin",
-                          number = Inf, p.value = 1, adjust.method = "none")
-    
-    # Build plot object without auto‐drawing
-    volcano <- make_volcano(tt,
-                            title_txt = glue("{tier_nm} — {ph_tag}"),
-                            gene_map  = probe2gene)
-    
-    # Clear any previous plot, then draw the new one
-    grid::grid.newpage()
+
+    tt <- limma::topTable(fit_obj,
+                          coef          = "pheno_bin",
+                          number        = Inf,
+                          p.value       = 1,
+                          adjust.method = "none")
+
+    title_txt <- glue("{tier_nm} — {phen_labels[[ph_tag]]}")
+
+    volcano <- make_volcano_gg(
+      tt,
+      title_txt = title_txt,
+      gene_map  = probe2gene
+    )
+
     print(volcano)
-    
-    # Save to file
+
     ggsave(
       filename = file.path(plot_dir,
                            glue("{ph_tag}_{tier_nm}_volcano.png")),
       plot     = volcano,
-      width    = 6, height = 5, dpi = 300
+      width    = 6,
+      height   = 5,
+      dpi      = 300
     )
-    
-    message("✓ saved ", ph_tag, " / ", tier_nm)
   }
 }
 
-message("\n✅  Volcano PNGs are in each <phenotype>/H6/plots_volcano directory")
+message("✅  All tiers (1–3) for Any, Lymph node, and Distant mets saved in each H6/plots_volcano_gg directory")
 ```
+
+```{r}
+###############################################################################
+#  heatmap_integrated_analysis_final.R · 2025-07-19
+#  – Integrate EPIC-v1, EPIC-v2 and 450 k (TCGA) methylation arrays
+#  – Batch-correct, run limma, draw heat-maps of top hyper / hypo CpGs
+###############################################################################
+
+## ---------------- USER SETTINGS ------------------------------------------ ##
+path_my_epic_v1       <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+path_my_epic_v2       <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+path_my_meta          <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+path_tcga_normal_idats <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/normal_idats"
+path_tcga_normal_meta  <- file.path(path_tcga_normal_idats, "tcga_normal_metadata.csv")
+
+ewas_phenotype <- "any"                                 # any / ln / dist
+phenotype_map  <- c(any = "any_mets", ln = "ln_only", dist = "distant")
+
+output_dir <- "results_heatmap_integrated_analysis"
+dir.create(output_dir, showWarnings = FALSE)
+
+## ---------------- SET-UP -------------------------------------------------- ##
+msg <- \(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(minfi); library(limma); library(sva); library(pheatmap)
+  library(dplyr); library(readr); library(glue); library(tibble)
+})
+
+###############################################################################
+## 1. LOAD  →  PREPROCESS (Noob)  →  MERGE β-MATRICES                       ##
+###############################################################################
+msg("Loading IDATs…")
+
+## EPIC-v1 --------------------------------------------------------------------
+rg_epic_v1 <- read.metharray(
+  basenames = unique(sub("_Grn.idat|_Red.idat", "",
+                         list.files(path_my_epic_v1, full.names = TRUE,
+                                    pattern = "idat$"))),
+  force = TRUE)
+
+## EPIC-v2  → tag as v1 so .isEPIC() passes ----------------------------------
+rg_epic_v2 <- read.metharray(
+  basenames = unique(sub("_Grn.idat|_Red.idat", "",
+                         list.files(path_my_epic_v2, full.names = TRUE,
+                                    pattern = "idat$"))),
+  force = TRUE)
+annotation(rg_epic_v2)[["array"]]      <- "IlluminaHumanMethylationEPIC"
+annotation(rg_epic_v2)[["annotation"]] <- "ilm10b4.hg38"
+msg("EPIC-v2 object re-tagged as EPIC-v1 (v2-specific probes will drop).")
+
+## Merge the two EPIC batches -------------------------------------------------
+rg_my_study <- combineArrays(rg_epic_v1, rg_epic_v2,
+                             outType = "IlluminaHumanMethylationEPIC")
+msg("EPIC v1+v2 merged.")
+
+## TCGA 450 k -----------------------------------------------------------------
+rg_tcga <- read.metharray(
+  basenames = unique(sub("_Grn.idat|_Red.idat", "",
+                         list.files(path_tcga_normal_idats, full.names = TRUE,
+                                    pattern = "idat$"))),
+  force = TRUE)
+colnames(rg_tcga) <- sub("_.*", "", colnames(rg_tcga))
+
+## Preprocess with Noob -------------------------------------------------------
+msg("Running preprocessNoob()…")
+beta_my   <- getBeta(preprocessNoob(rg_my_study))
+beta_tcga <- getBeta(preprocessNoob(rg_tcga))
+
+## Intersect probes & bind columns -------------------------------------------
+common_probes <- intersect(rownames(beta_my), rownames(beta_tcga))
+beta_combined <- cbind(beta_my  [common_probes, ],
+                       beta_tcga[common_probes, ])
+msg(glue("β-matrix: {length(common_probes)} probes × {ncol(beta_combined)} samples."))
+
+###############################################################################
+## 2. BUILD METADATA  &  COMBAT                                              ##
+###############################################################################
+phenotype_col <- phenotype_map[[ewas_phenotype]]
+
+meta_my_study <- read_csv(path_my_meta, show_col_types = FALSE) %>%
+  mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+         Group    = if_else(.data[[phenotype_col]] == 1,
+                            "Metastasis", "No_Metastasis"),
+         Batch    = "My_Study") %>%
+  select(SampleID, Group, Batch)
+
+meta_tcga <- read_csv(path_tcga_normal_meta, show_col_types = FALSE) %>%
+  rename(SampleID = geo_accession) %>%
+  mutate(Group = "TCGA_Normal", Batch = "TCGA") %>%
+  select(SampleID, Group, Batch)
+
+meta_combined_full <- bind_rows(meta_my_study, meta_tcga)
+
+keep_samples <- intersect(colnames(beta_combined), meta_combined_full$SampleID)
+beta_final   <- beta_combined[, keep_samples]
+meta_final   <- meta_combined_full %>%
+                filter(SampleID %in% keep_samples) %>%
+                slice(match(colnames(beta_final), SampleID))
+
+## β → M-values ---------------------------------------------------------------
+epsilon        <- 1e-6
+beta_squeezed  <- pmax(pmin(beta_final, 1 - epsilon), epsilon)
+m_val_combined <- log2(beta_squeezed / (1 - beta_squeezed))
+
+## ComBat ---------------------------------------------------------------------
+batch_counts <- table(meta_final$Batch)
+if (length(batch_counts) > 1 && all(batch_counts > 1)) {
+  msg("Running ComBat()…")
+  m_val_corrected <- ComBat(m_val_combined,
+                            batch = meta_final$Batch,
+                            mod   = NULL)
+} else {
+  msg("Skipping ComBat (only one batch or singleton batch).")
+  m_val_corrected <- m_val_combined
+}
+
+###############################################################################
+## 3.  LIMMA DIFFERENTIAL METHYLATION                                       ##
+###############################################################################
+meta_final$Group <- factor(meta_final$Group,
+                           levels = c("No_Metastasis", "Metastasis", "TCGA_Normal"))
+
+design <- model.matrix(~ 0 + Group, meta_final)
+colnames(design) <- levels(meta_final$Group)
+
+fit <- lmFit(m_val_corrected, design)
+fit <- eBayes(contrasts.fit(fit,
+                            makeContrasts(Metastasis - No_Metastasis,
+                                          levels = design)))
+tt <- topTable(fit, coef = 1, number = Inf)
+
+###############################################################################
+## 3b.  VERIFY DIRECTION WITH GROUP-MEAN β VALUES                            ##
+###############################################################################
+beta_corrected <- 2^m_val_corrected / (1 + 2^m_val_corrected)
+
+mean_met  <- rowMeans(beta_corrected[ , meta_final$Group == "Metastasis"])
+mean_nom  <- rowMeans(beta_corrected[ , meta_final$Group == "No_Metastasis"])
+delta_beta <- mean_met - mean_nom                      # Met – NoMet
+
+tt$delta_beta <- delta_beta[rownames(tt)]              # add to table
+
+top_hyper <- tt %>%
+  filter(delta_beta > 0) %>%            # Metastasis genuinely HIGHER
+  arrange(adj.P.Val)  %>% head(100)
+
+top_hypo  <- tt %>%
+  filter(delta_beta < 0) %>%            # Metastasis genuinely LOWER
+  arrange(adj.P.Val)  %>% head(100)
+
+msg(glue("Top hyper CpGs: {nrow(top_hyper)}  ·  Top hypo CpGs: {nrow(top_hypo)}"))
+
+###############################################################################
+## 4.  HEAT-MAPS  (raw β, no scaling)                                       ##
+###############################################################################
+group_order <- c("Metastasis", "No_Metastasis", "TCGA_Normal")
+ann_colors  <- list(Group = c(Metastasis     = "#d73027",
+                              No_Metastasis = "#4575b4",
+                              TCGA_Normal    = "#1a9850"))
+
+## palette: blue 0  →  white 0.5  →  red 1
+breaks <- seq(0, 1, length.out = 101)
+palette <- colorRampPalette(c("#313695", "white", "#a50026"))(100)
+
+draw_heatmap <- function(cpg_ids, title, file_tag) {
+
+  mat <- beta_corrected[cpg_ids, ]
+  ord <- order(match(meta_final$Group, group_order))
+  mat <- mat[ , ord]
+
+  ann <- data.frame(Group = meta_final$Group,
+                    row.names = meta_final$SampleID)[ord, , drop = FALSE]
+
+  pheatmap(mat,
+           # color and breaks are removed to let pheatmap use its default for scaled data
+           annotation_col    = ann,
+           annotation_colors = ann_colors,
+           main              = title,
+           show_colnames     = FALSE,
+           cluster_rows      = TRUE,
+           cluster_cols      = FALSE,    # keep chosen order
+           scale             = "row",    # <-- THE KEY CHANGE
+           fontsize_row      = 6,
+           filename          = file.path(output_dir, file_tag),
+           width             = 12,
+           height            = 8)
+
+  msg(glue("✓ Heat-map saved → {file_tag}"))
+}
+
+draw_heatmap(rownames(top_hyper),
+             "Top Hyper-methylated CpGs  (Metastasis > No-Met)",
+             "heatmap_top_hyper_rawbeta.png")
+
+draw_heatmap(rownames(top_hypo),
+             "Top Hypo-methylated CpGs  (Metastasis < No-Met)",
+             "heatmap_top_hypo_rawbeta.png")
+
+msg("✅ Raw-β hyper & hypo heat-maps created successfully.")
+```
+
