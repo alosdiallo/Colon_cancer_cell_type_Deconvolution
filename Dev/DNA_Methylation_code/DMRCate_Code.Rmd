@@ -1,0 +1,379 @@
+---
+title: "DMRCate code"
+author: "Alos Diallo"
+date: "2025-10-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# dmr_analysis_tier3_only.R
+# Run DMRcate (Tier 3) on preprocessed methylation data
+# Goal: region-level multiple-testing correction complementing CpG-level EWAS
+
+suppressPackageStartupMessages({
+  library(minfi)
+  library(sesame)
+  library(ENmix)
+  library(matrixStats)
+  library(HiTIMED)
+  library(EpiDISH)
+  library(tidyverse)
+  library(glue)
+  library(DMRcate)
+  library(GenomicRanges)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+## ── USER SETTINGS ───────────────────────────────────────────────────────────
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+phenotypes <- c(any="any_mets", ln="ln_only", dist="distant")
+variance_percentile <- 0.90
+
+dir.create(results_root, showWarnings=FALSE, recursive=TRUE)
+cache_dir <- file.path(results_root, "ewas_cache")
+dir.create(cache_dir, showWarnings=FALSE, recursive=TRUE)
+
+## ── 1) β-matrix loading / QC ────────────────────────────────────────────────
+read_pp <- function(path, tag) {
+  rg <- read.metharray.exp(path, recursive=TRUE, extended=TRUE, force=TRUE)
+  bet <- getBeta(preprocessNoob(rg, dyeMethod="single"))
+  if (tag=="v2") bet <- betasCollapseToPfx(bet)
+  bad <- ENmix::QCinfo(rg)$badCpG
+  bet[setdiff(rownames(bet), bad), , drop=FALSE]
+}
+
+beta_rds <- file.path(cache_dir,"beta_comb_qc.rds")
+if (!file.exists(beta_rds)) {
+  msg("Reading / normalising IDATs …")
+  beta1 <- read_pp(idat_v1,"v1"); beta2 <- read_pp(idat_v2,"v2")
+  common <- intersect(rownames(beta1),rownames(beta2))
+  beta_comb <- cbind(beta1[common,], beta2[common,])
+  saveRDS(list(beta=beta_comb,
+               sample_ids_v1=colnames(beta1),
+               sample_ids_v2=colnames(beta2)), beta_rds)
+  msg("β-matrix cached.")
+} else {
+  cache_obj <- readRDS(beta_rds)
+  beta_comb <- cache_obj$beta
+  sample_ids_v1 <- cache_obj$sample_ids_v1; sample_ids_v2 <- cache_obj$sample_ids_v2
+  msg("β-matrix loaded from cache.")
+}
+
+## ── Remove sex-linked probes ────────────────────────────────────────────────
+suppressPackageStartupMessages(library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+chr_vec <- anno$chr[match(rownames(beta_comb), rownames(anno))]
+is_sex_chr <- chr_vec %in% c("chrX","chrY","X","Y")
+beta_comb <- beta_comb[!is_sex_chr,,drop=FALSE]
+msg(sum(is_sex_chr)," chrX/chrY probes removed; ",nrow(beta_comb)," CpGs remain.")
+
+## ── Variance filter ─────────────────────────────────────────────────────────
+M.mat <- log2(beta_comb/pmax(1-beta_comb,1e-6)+1e-6)
+if (variance_percentile>0){
+  v <- rowVars(M.mat,na.rm=TRUE)
+  thr <- quantile(v,variance_percentile,na.rm=TRUE)
+  keep <- v>thr
+  beta_comb <- beta_comb[keep,,drop=FALSE]
+  M.mat <- M.mat[keep,,drop=FALSE]
+  msg(sum(keep)," CpGs kept (top ",100*(1-variance_percentile),"% var).")
+}
+
+## ── 2) Deconvolution (EpiScore + HiTIMED) ───────────────────────────────────
+data(centEpiFibIC.m)
+fib_scores <- {
+  common <- intersect(rownames(beta_comb),rownames(centEpiFibIC.m))
+  est <- epidish(beta_comb[common,],centEpiFibIC.m[common,],method="RPC")$estF
+  as.data.frame(est)*100
+} %>% rownames_to_column("SampleID")
+
+msg("Running HiTIMED  h = 6 …")
+frac_h6 <- HiTIMED_deconvolution(beta_comb,"COAD",h=6) %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(fib_scores,by="SampleID")
+
+collapse_frac <- function(df){
+  get_ <- function(x) if (x %in% names(df)) df[[x]] else 0
+  imm_cols <- c("CD8mem","CD8nv","CD4mem","CD4nv","Treg","Bmem","Bnv","DC","Mono","NK")
+  totalImm <- rowSums(df[imm_cols],na.rm=TRUE); totalImm[totalImm==0] <- NA
+  tibble(
+    SampleID=df$SampleID,
+    Tumor=get_("Tumor"),
+    Fibroblast=get_("Fib"),
+    StromalOther=get_("Endothelial")+get_("Epithelial"),
+    CD8_T=(get_("CD8mem")+get_("CD8nv"))/totalImm,
+    LymphOther=(get_("CD4mem")+get_("CD4nv")+get_("Treg")+get_("Bmem")+get_("Bnv"))/totalImm
+  ) %>% mutate(across(where(is.numeric),as.numeric))
+}
+
+tier3_covs <- c("age","sex_num","MLH1_num","Tumor",
+                "Fibroblast","StromalOther","CD8_T","LymphOther")
+
+## ── 3) DMRcate (Tier 3 only) ────────────────────────────────────────────────
+get_dmrc_results <- function(dmrc) {
+  # DMRcate 3.4.1 and newer (S4 object with slots)
+  if (methods::is(dmrc, "DMResults")) {
+    df <- data.frame(
+      coord            = slot(dmrc, "coord"),
+      no.cpgs          = slot(dmrc, "no.cpgs"),
+      min_smoothed_fdr = slot(dmrc, "min_smoothed_fdr"),
+      Stouffer         = slot(dmrc, "Stouffer"),
+      HMFDR            = slot(dmrc, "HMFDR"),
+      Fisher           = slot(dmrc, "Fisher"),
+      maxdiff          = slot(dmrc, "maxdiff"),
+      meanmeth.diff    = slot(dmrc, "meandiff"),
+      stringsAsFactors = FALSE
+    )
+    # Split coord into chr/start/end
+    chr_parts <- do.call(rbind, strsplit(df$coord, "[:-]"))
+    df$chr   <- chr_parts[,1]
+    df$start <- as.numeric(chr_parts[,2])
+    df$end   <- as.numeric(chr_parts[,3])
+    df$FDR   <- df$min_smoothed_fdr
+    return(df)
+  }
+
+  # Older versions (list or S4 with 'results' slot)
+  if ("results" %in% names(dmrc)) return(dmrc$results)
+  if ("results" %in% slotNames(dmrc)) return(slot(dmrc, "results"))
+
+  stop("Unsupported DMRcate object structure")
+}
+
+for (pheno_tag in names(phenotypes)) {
+  pheno_var <- phenotypes[[pheno_tag]]
+  msg("\n===== ", pheno_var, " (DMRcate Tier 3) =====")
+
+  meta <- readr::read_csv(meta_csv, show_col_types = FALSE) %>%
+    mutate(
+      SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+      any_mets = as.integer(any_mets),
+      distant  = as.integer(Distant_Mets),
+      ln_only  = as.integer(ln_only),
+      sex_num  = as.integer(sex == "M"),
+      MLH1_num = as.integer(MLH1 == 1)
+    )
+
+  meta$pheno_bin <- dplyr::case_when(
+    pheno_var == "any_mets" ~ meta$any_mets,
+    pheno_var == "distant"  ~ meta$distant,
+    pheno_var == "ln_only"  ~ (meta$ln_only & !meta$distant),
+    TRUE ~ NA_integer_
+  )
+
+  frac_df  <- collapse_frac(frac_h6)
+  meta_all <- dplyr::left_join(meta, frac_df, by = "SampleID")
+  ok       <- stats::complete.cases(meta_all[, tier3_covs])
+  meta_f   <- meta_all[ok, , drop = FALSE]
+  M_f      <- M.mat[, meta_f$SampleID, drop = FALSE]
+
+  # Tier 3 design
+  is_var <- vapply(meta_f[tier3_covs],
+                   function(x) is.numeric(x) && is.finite(sd(x, na.rm = TRUE)) && sd(x, na.rm = TRUE) > 0,
+                   logical(1))
+  nz   <- tier3_covs[is_var]
+  form <- as.formula(paste("~ pheno_bin +", paste(nz, collapse = " + ")))
+  des  <- model.matrix(form, meta_f)
+
+  # Annotate and call DMRs
+  myAnno <- DMRcate::cpg.annotate(
+    object        = M_f,
+    datatype      = "array",
+    what          = "M",
+    analysis.type = "differential",
+    design        = des,
+    coef          = which(colnames(des) == "pheno_bin"),
+    fdr           = 1,             # already variance-filtered
+    arraytype     = "EPICv1"
+  )
+
+  msg("Running DMRcate smoothing/aggregation …")
+  dmrc <- DMRcate::dmrcate(myAnno, lambda = 1000, C = 2)
+  dmr_tbl <- get_dmrc_results(dmrc)
+  if (nrow(dmr_tbl) == 0) {
+    msg("No DMRs detected for ", pheno_var); next
+  }
+  
+  # Safety check before ordering
+  if (all(c("FDR", "no.cpgs") %in% names(dmr_tbl))) {
+    dmr_tbl <- dmr_tbl[order(dmr_tbl$FDR, -dmr_tbl$no.cpgs), , drop=FALSE]
+  }
+  
+  # Keep only those with at least 3 CpGs
+  dmr_tbl <- dmr_tbl[dmr_tbl$no.cpgs >= 3, , drop=FALSE]
+  dmr_tbl <- dmr_tbl[dmr_tbl$no.cpgs >= 3, , drop = FALSE]
+  dmr_tbl <- dmr_tbl[order(dmr_tbl$FDR, -dmr_tbl$no.cpgs), , drop = FALSE]
+
+  out_dir <- file.path(results_root, glue("results_ewas_{pheno_tag}"), "H6", "DMRcate_Tier3")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  readr::write_csv(dmr_tbl, file.path(out_dir, "dmrcate_lambda1000_C2_min3cpgs.csv"))
+
+  # Quick locus plots (top 3)
+  dmr_gr <- DMRcate::extractRanges(dmrc, genome = "hg19")
+  grp <- factor(meta_f$pheno_bin, labels = c("Non-mets","Mets"))
+  try({
+    for (i in seq_len(min(3, nrow(dmr_tbl)))) {
+      png(file.path(out_dir, sprintf("dmrplot_top%02d_%s_%d_%d.png",
+                                     i, dmr_tbl$chr[i], dmr_tbl$start[i], dmr_tbl$end[i])),
+          width=1400, height=900, res=140)
+      DMRcate::DMR.plot(ranges=dmr_gr[i], dmr=dmrc, CpGs=myAnno@ranges,
+                        what="Beta", arraytype="EPICv1",
+                        phen.col=grp, pch=20, toscale=TRUE,
+                        plotmedians=TRUE, samp.names=FALSE)
+      dev.off()
+    }
+  }, silent=TRUE)
+
+  msg("✓ DMRcate Tier 3 outputs saved → ", out_dir)
+}
+
+## ── 4) Summaries ────────────────────────────────────────────────────────────
+summarize_dmrs <- function(csv) {
+  x <- readr::read_csv(csv, show_col_types = FALSE)
+  if (!nrow(x)) return(tibble())
+  x %>%
+    mutate(width_bp = end - start + 1L,
+           direction = ifelse(meanmeth.diff > 0, "hyper", "hypo")) %>%
+    summarise(
+      n_DMRs = n(),
+      median_width_bp = median(width_bp),
+      median_n_cpgs = median(no.cpgs),
+      pct_hyper = mean(direction == "hyper") * 100
+    )
+}
+
+paths <- list(
+  any   = file.path(results_root,"results_ewas_any","H6","DMRcate_Tier3","dmrcate_lambda1000_C2_min3cpgs.csv"),
+  ln    = file.path(results_root,"results_ewas_ln","H6","DMRcate_Tier3","dmrcate_lambda1000_C2_min3cpgs.csv"),
+  dist  = file.path(results_root,"results_ewas_dist","H6","DMRcate_Tier3","dmrcate_lambda1000_C2_min3cpgs.csv")
+)
+
+summary_tbl <- purrr::imap_dfr(paths, ~ dplyr::bind_cols(phenotype=.y, summarize_dmrs(.x)))
+readr::write_csv(summary_tbl, file.path(results_root,"DMRcate_summary.csv"))
+print(summary_tbl)
+
+# Quick interval overlaps
+read_dmr_gr <- function(csv) {
+  x <- suppressMessages(readr::read_csv(csv, show_col_types = FALSE))
+  if (!nrow(x)) return(GRanges())
+  GRanges(seqnames = x$chr, ranges = IRanges(start = x$start, end = x$end))
+}
+gr_any  <- read_dmr_gr(paths$any)
+gr_ln   <- read_dmr_gr(paths$ln)
+gr_dist <- read_dmr_gr(paths$dist)
+ov_any_ln   <- length(subsetByOverlaps(gr_any, gr_ln))
+ov_any_dist <- length(subsetByOverlaps(gr_any, gr_dist))
+ov_ln_dist  <- length(subsetByOverlaps(gr_ln, gr_dist))
+data.frame(pair=c("any∩ln","any∩dist","ln∩dist"),
+           n_overlaps=c(ov_any_ln,ov_any_dist,ov_ln_dist))
+```
+```{r}
+library(ggplot2)
+library(readr)
+library(dplyr)
+
+# --- Load DMRcate results ---
+dmr <- read_csv("/Users/adiallo/Desktop/Thesis/Results/results_ewas_any/H6/DMRcate_Tier3/dmrcate_lambda1000_C2_min3cpgs.csv")
+
+# --- Clean up column names ---
+dmr <- dmr %>%
+  mutate(
+    meanmeth.diff = ifelse(!"meanmeth.diff" %in% names(.), meanmeth.diff, meanmeth.diff),
+    FDR = ifelse(!"FDR" %in% names(.), min_smoothed_fdr, FDR)
+  )
+
+# --- Cap zero FDRs to avoid log(0) issues ---
+dmr$FDR[dmr$FDR == 0] <- 1e-10
+
+# --- Create the volcano plot ---
+volcano_plot <- ggplot(dmr, aes(x = meanmeth.diff, y = -log10(FDR))) +
+  geom_point(alpha = 0.5, size = 1.2, color = "steelblue") +
+  geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  labs(
+    title = "DMRcate: Any Metastasis vs Non-Metastatic",
+    subtitle = paste0("n = ", nrow(dmr), " DMRs (median width ≈ ", round(median(dmr$end - dmr$start)), " bp)"),
+    x = "Mean methylation difference (Δβ)",
+    y = expression(-log[10](FDR))
+  ) +
+  theme_classic(base_size = 14)
+
+# --- Render + save ---
+print(volcano_plot)  # ensures display in non-interactive mode
+
+out_dir <- "/Users/adiallo/Desktop/Thesis/Results/results_ewas_any/H6/DMRcate_Tier3/"
+ggsave(file.path(out_dir, "volcano_any_mets.png"), plot = volcano_plot, width = 8, height = 6, dpi = 300)
+ggsave(file.path(out_dir, "volcano_any_mets.pdf"), plot = volcano_plot, width = 8, height = 6)
+```
+
+
+```{r}
+###############################################################################
+# Stable DMRcate plotting — compatible with v3.4+
+###############################################################################
+suppressPackageStartupMessages({
+  library(DMRcate)
+  library(GenomicRanges)
+  # Removed Gviz and biomaRt as they are not needed for this solution
+})
+
+# --- Verify required objects ---
+stopifnot(exists("dmrc"), exists("dmr_gene_hits"), exists("myAnno"), exists("meta_f"))
+
+# --- Output directory ---
+out_dir <- file.path(results_root, "results_ewas_any", "H6",
+                     "DMRcate_Tier3", "DMRplots_final_v4")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# --- Define phenotype colors ---
+grp <- factor(meta_f$pheno_bin, labels = c("Non-Metastatic", "Metastatic"))
+cols <- c("Non-Metastatic" = "#1f78b4", "Metastatic" = "#e31a1c")
+
+# --- Removed the gene_track creation block ---
+
+
+# --- Loop through DMRs overlapping key genes ---
+for (i in seq_along(dmr_gene_hits)) {
+  genes_here <- dmr_gene_hits$overlapping.genes[i]
+  chr_i <- as.character(seqnames(dmr_gene_hits)[i])
+  start_i <- start(dmr_gene_hits)[i]
+  end_i <- end(dmr_gene_hits)[i]
+
+  message(sprintf("Plotting %s (%s:%d-%d)",
+                  genes_here, chr_i, start_i, end_i))
+
+  png(file.path(out_dir,
+                sprintf("DMRplot_%s_%s_%d_%d.png",
+                        genes_here, chr_i, start_i, end_i)),
+      width = 1600, height = 900, res = 150)
+
+  try({
+    DMR.plot(
+      ranges = dmr_gene_hits,
+      dmr = i,
+      CpGs = myAnno,
+      what = "Beta",
+      arraytype = "EPICv1",
+      phen.col = cols[grp],
+      # genome = "hg19",  <-- ✅ REMOVED this line to prevent Ensembl query
+      flank = 2000,
+      heatmap = TRUE,
+      labels = paste0(genes_here, " (", chr_i, ":", start_i, "-", end_i, ")")
+      # GOfunc = gene_track  <-- ✅ REMOVED this (was causing the error)
+    )
+  }, silent = FALSE)
+  dev.off()
+}
+
+message("✅ DMRcate plots successfully saved to: ", out_dir)
+```
+

@@ -1,0 +1,531 @@
+---
+title: "Untitled"
+author: "Alos Diallo"
+date: "2025-09-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+EWAS for No mets vs Lymph node, Lymph node vs Distant
+```{r}
+################################################################################
+# ewas_metastasis_h6_normImmune_PAIRWISE.R
+# - MODIFIED FOR PAIRWISE COMPARISONS:
+#   1. No Metastasis vs. LN Only
+#   2. LN Only vs. Distant
+# - All other settings (HiTIMED, EpiScore, No ComBat) are unchanged.
+################################################################################
+
+## ── USER SETTINGS ───────────────────────────────────────────────────────────
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+variance_percentile <- 0.90  # 0 ⇒ keep all CpGs
+
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+
+## ── SETUP & HELPERS ─────────────────────────────────────────────────────────
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(minfi); library(sesame); library(ENmix); library(matrixStats)
+  library(limma); library(HiTIMED); library(EpiDISH); library(tidyverse)
+  library(glue)
+})
+
+read_csv_silent <- function(file, ...) {
+  if (utils::packageVersion("readr") >= "2.0.0") {
+    readr::read_csv(file, show_col_types = FALSE, ...)
+  } else {
+    suppressMessages(readr::read_csv(file, ...))
+  }
+}
+
+## ── 1) β-matrix (cached) ────────────────────────────────────────────────────
+cache_dir <- file.path(results_root, "ewas_cache")
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+beta_rds      <- file.path(cache_dir, "beta_comb_qc.rds")
+manifest_csv  <- file.path(cache_dir, "sample_manifest_v1_v2.csv")
+
+read_pp <- function(path, tag) {
+  rg  <- read.metharray.exp(path, recursive = TRUE, extended = TRUE, force = TRUE)
+  bet <- getBeta(preprocessNoob(rg, dyeMethod = "single"))
+  if (tag == "v2") bet <- betasCollapseToPfx(bet)
+  bad <- ENmix::QCinfo(rg)$badCpG
+  bet <- bet[ setdiff(rownames(bet), bad), , drop = FALSE]
+  bet
+}
+
+if (!file.exists(beta_rds)) {
+  msg("Reading / normalising IDATs …")
+  beta1 <- read_pp(idat_v1, "v1"); beta2 <- read_pp(idat_v2, "v2")
+  sample_ids_v1 <- colnames(beta1); sample_ids_v2 <- colnames(beta2)
+  common <- intersect(rownames(beta1), rownames(beta2)); stopifnot(length(common) > 0)
+  beta_comb <- cbind(beta1[common, , drop = FALSE], beta2[common, , drop = FALSE])
+  saveRDS(list(beta = beta_comb, sample_ids_v1 = sample_ids_v1, sample_ids_v2 = sample_ids_v2), beta_rds)
+  tibble(SampleID = c(sample_ids_v1, sample_ids_v2),
+         Array_Version = c(rep("v1", length(sample_ids_v1)), rep("v2", length(sample_ids_v2)))) %>%
+    distinct() %>% write_csv(manifest_csv)
+  msg("β-matrix cached.")
+} else {
+  cache_obj <- readRDS(beta_rds)
+  if (is.list(cache_obj) && !is.null(cache_obj$beta)) {
+    beta_comb     <- cache_obj$beta
+    sample_ids_v1 <- cache_obj$sample_ids_v1
+    sample_ids_v2 <- cache_obj$sample_ids_v2
+  } else {
+    beta_comb     <- cache_obj
+    sample_ids_v1 <- character(0); sample_ids_v2 <- character(0)
+  }
+  msg("β-matrix loaded from cache.")
+}
+
+get_annotation_for <- function(beta_mat) {
+  if (requireNamespace("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+    a <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  } else if (requireNamespace("IlluminaHumanMethylation450kanno.ilmn12.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(library(IlluminaHumanMethylation450kanno.ilmn12.hg19))
+    a <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  } else { stop("Install an Illumina methylation annotation package (EPIC or 450k).") }
+  a[rownames(a) %in% rownames(beta_mat), , drop = FALSE]
+}
+anno <- get_annotation_for(beta_comb)
+chr_vec <- NULL
+if ("chr" %in% colnames(anno)) chr_vec <- anno$chr
+if (is.null(chr_vec) && "CHR" %in% colnames(anno)) chr_vec <- anno$CHR
+if (is.null(chr_vec) && "seqnames" %in% colnames(anno)) chr_vec <- as.character(anno$seqnames)
+if (is.null(chr_vec)) stop("Could not find chromosome column in annotation.")
+is_sex_chr <- chr_vec %in% c("chrX","chrY","X","Y")
+sex_probes <- rownames(anno)[is_sex_chr]
+n_before <- nrow(beta_comb)
+if (length(sex_probes) > 0) beta_comb <- beta_comb[setdiff(rownames(beta_comb), sex_probes), , drop = FALSE]
+msg(length(sex_probes), " chrX/chrY probes removed; ", n_before, " → ", nrow(beta_comb), " CpGs remain.")
+
+M.mat <- log2(beta_comb / pmax(1 - beta_comb, 1e-6) + 1e-6)
+if (variance_percentile > 0) {
+  v <- rowVars(M.mat, na.rm = TRUE); var_thr <- quantile(v, variance_percentile, na.rm = TRUE)
+  keep <- v > var_thr; beta_comb <- beta_comb[keep, , drop = FALSE]; M.mat <- M.mat[keep, , drop = FALSE]
+  msg(sum(keep), " CpGs kept (top ", 100 * (1 - variance_percentile), "% var).")
+}
+
+## ── 2a) EpiScore & 2b) HiTIMED ──────────────────────────────────────────────
+data(centEpiFibIC.m)
+run_episcore <- function(beta) {
+  common <- intersect(rownames(beta), rownames(centEpiFibIC.m))
+  est <- epidish(beta[common, ], centEpiFibIC.m[common, ], method = "RPC")$estF; as.data.frame(est) * 100
+}
+msg("Running EpiScore (RPC) for fibroblast …")
+fib_scores <- run_episcore(beta_comb) %>% rownames_to_column("SampleID")
+msg("Running HiTIMED  h = 6 …")
+frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) %>% as.data.frame() %>%
+  rownames_to_column("SampleID") %>% left_join(fib_scores, by = "SampleID")
+
+## ── 3) & 4) Collapse Fractions & Tier Templates ───────────────────────────
+collapse_frac <- function(df) {
+  get_ <- function(x) if (x %in% names(df)) df[[x]] else 0
+  imm_cols <- c("CD8mem","CD8nv","CD4mem","CD4nv","Treg","Bmem","Bnv","DC","Mono","NK")
+  totalImm <- rowSums(df[imm_cols], na.rm = TRUE); totalImm[totalImm == 0] <- NA
+  tibble(SampleID = df$SampleID, Tumor = get_("Tumor"), Fibroblast = get_("Fib"),
+         StromalOther = get_("Endothelial") + get_("Epithelial"),
+         CD8_T = (get_("CD8mem") + get_("CD8nv")) / totalImm,
+         LymphOther = (get_("CD4mem") + get_("CD4nv") + get_("Treg") + get_("Bmem") + get_("Bnv")) / totalImm
+  ) %>% mutate(across(where(is.numeric), as.numeric))
+}
+tier_template <- list(
+  Tier1 = c("age","sex_num","MLH1_num"), Tier2 = c("age","sex_num","MLH1_num","Tumor"),
+  Tier3 = c("age","sex_num","MLH1_num","Tumor","Fibroblast","StromalOther","CD8_T","LymphOther")
+)
+trim_tiers <- function(tiers, avail) lapply(tiers, intersect, avail)
+
+################################################################################
+##  5) Loop over PAIRWISE comparisons (NO ComBat)
+################################################################################
+
+## <<< CHANGE: Define the specific pairwise comparisons to run
+comparisons <- list(
+  No_vs_LN   = c("No Metastasis", "LN Only"),
+  LN_vs_Dist = c("LN Only", "Distant")
+)
+
+for (comp_tag in names(comparisons)) {
+  msg("\n===== COMPARISON: ", comp_tag, " =====")
+
+  group_names <- comparisons[[comp_tag]]
+
+  # Load and prepare full metadata
+  meta <- read_csv_silent(meta_csv) %>%
+    mutate(
+      SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+      # Define a clear metastasis status column
+      Metastasis_Status = case_when(
+        Distant_Mets == 1 ~ "Distant",
+        ln_only == 1      ~ "LN Only",
+        TRUE              ~ "No Metastasis"
+      ),
+      sex_num  = as.integer(sex == "M"),
+      MLH1_num = as.integer(MLH1 == 1)
+    )
+
+  # Subset metadata to only the two groups in the current comparison
+  meta_subset <- meta %>%
+    filter(Metastasis_Status %in% group_names) %>%
+    # Create the binary phenotype variable for the comparison
+    # Group 1 (e.g., "No Metastasis") is the reference (0)
+    # Group 2 (e.g., "LN Only") is the target (1)
+    mutate(
+      pheno_bin = as.integer(factor(Metastasis_Status, levels = group_names)) - 1
+    )
+
+  stopifnot(all(meta_subset$pheno_bin %in% 0:1, na.rm = TRUE))
+
+  # Join with cell fraction data and filter for complete cases
+  frac_df  <- collapse_frac(frac_h6)
+  meta_all <- left_join(meta_subset, frac_df, by = "SampleID")
+  ok       <- complete.cases(meta_all[, tier_template$Tier3])
+  meta_f   <- meta_all[ok, , drop = FALSE]
+
+  # Check if we have samples left from both groups
+  if (length(unique(meta_f$pheno_bin)) < 2) {
+    msg("SKIPPING: Not enough samples in both groups for comparison '", comp_tag, "'.")
+    next
+  }
+  msg("Running EWAS for '", comp_tag, "' with ", nrow(meta_f), " samples.")
+
+  # Subset the methylation matrix to match the filtered metadata
+  M_f <- M.mat[, meta_f$SampleID, drop = FALSE]
+
+  ## NO ComBat: same-cohort v1/v2 + intersected probes is sufficient
+  M_cb <- M_f
+
+  tier_list <- trim_tiers(tier_template, names(meta_f))
+  fits <- purrr::map(tier_list, function(covs) {
+    is_var <- vapply(
+      meta_f[covs],
+      function(x) is.numeric(x) && is.finite(stats::sd(x, na.rm = TRUE)) && stats::sd(x, na.rm = TRUE) > 0,
+      logical(1)
+    )
+    nz <- covs[is_var]
+    form <- if (length(nz) == 0) {
+      ~ pheno_bin
+    } else {
+      as.formula(paste("~ pheno_bin +", paste(nz, collapse = " + ")))
+    }
+    des <- model.matrix(form, data = meta_f)
+    eBayes(lmFit(M_cb, des), trend = TRUE, robust = TRUE)
+  })
+
+  ## Write results under a new directory structure
+  out_dir <- file.path(results_root, glue("results_ewas_{comp_tag}"), "H6")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(fits, file.path(out_dir, "ewas_fits.rds"))
+  msg("✓  fits saved → ", out_dir)
+}
+
+msg("\n✅ Finished: Pairwise comparisons (HiTIMED-h6, immune-normalised + EpiScore; NO ComBat)")
+```
+
+Generate results list
+```{r}
+###############################################################################
+# summarize_top_cpgs_PAIRWISE.R
+# - MODIFIED to read results from pairwise EWAS runs.
+# - Generates Top 100 lists and comprehensive tables with ALL CpGs and betas.
+###############################################################################
+
+## --------------- USER SETTINGS ------------------------------------------- ##
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+meta_csv_path <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+h_level <- "H6"
+tier    <- "Tier3"
+top_n   <- 100
+
+## <<< CHANGE: Define the new comparison tags to look for
+comparisons_to_summarize <- c("No_vs_LN", "LN_vs_Dist")
+
+output_dir <- file.path(results_root, "results_summary_pairwise")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+## --------------- SETUP ---------------------------------------------------- ##
+suppressPackageStartupMessages({
+  library(limma); library(dplyr); library(glue)
+  library(readr); library(tibble)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+get_epic_annotation <- function() {
+  if (requireNamespace("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+    getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  } else {
+    warning("EPIC annotation package not available; 'Gene' column will be NA.")
+    NULL
+  }
+}
+
+###############################################################################
+##  1. LOAD BETA MATRIX AND METADATA
+###############################################################################
+msg("Loading main beta matrix and metadata...")
+
+beta_rds <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+if (!file.exists(beta_rds)) {
+  stop("Beta matrix cache file not found at: ", beta_rds)
+}
+beta_comb <- readRDS(beta_rds)$beta
+
+meta <- read_csv(meta_csv_path, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    Metastasis_Status = factor(case_when(
+        Distant_Mets == 1 ~ "Distant",
+        ln_only == 1      ~ "LN Only",
+        TRUE              ~ "No Metastasis"
+      ), levels = c("No Metastasis", "LN Only", "Distant"))
+  ) %>%
+  filter(SampleID %in% colnames(beta_comb)) %>%
+  arrange(Metastasis_Status)
+
+beta_comb_ordered <- beta_comb[, meta$SampleID]
+
+###############################################################################
+##  2. LOAD ALL PAIRWISE EWAS RESULTS
+###############################################################################
+msg("Loading all EWAS results from pairwise comparisons...")
+
+all_results <- list()
+
+for (comp_tag in comparisons_to_summarize) {
+  fit_file <- file.path(results_root, glue("results_ewas_{comp_tag}"), h_level, "ewas_fits.rds")
+  if (!file.exists(fit_file)) {
+    warning(glue("Could not find fits file for comparison '{comp_tag}'. Skipping."))
+    next
+  }
+  fits <- readRDS(fit_file)
+  if (!tier %in% names(fits)) {
+    warning(glue("Tier '{tier}' not found for comparison '{comp_tag}'. Skipping."))
+    next
+  }
+  fit_obj <- fits[[tier]]; if (!inherits(fit_obj, "MArrayLM")) fit_obj <- fit_obj$fit
+  tt <- topTable(fit_obj, coef = "pheno_bin", number = Inf, p.value = 1, adjust.method = "BH") %>%
+    tibble::rownames_to_column("CpG_ID")
+  all_results[[comp_tag]] <- tt
+}
+if (length(all_results) == 0) {
+  stop("No EWAS results found.")
+}
+
+###############################################################################
+##  3. LOAD/BUILD ANNOTATION MAP
+###############################################################################
+anno <- get_epic_annotation()
+probe2gene <- NULL
+if (!is.null(anno)) {
+  gn <- as.character(anno$UCSC_RefGene_Name)
+  gn <- sub(";.*$", "", gn)
+  names(gn) <- as.character(anno$Name)
+  probe2gene <- gn
+}
+
+###############################################################################
+##  4. MAIN LOOP TO GENERATE TABLES FOR EACH PAIRWISE COMPARISON
+###############################################################################
+for (primary_comparison in names(all_results)) {
+
+  msg(glue::glue("--- Generating tables for '{primary_comparison}' ---"))
+  primary_results <- all_results[[primary_comparison]]
+
+  # --- A. Generate and save the full data file with beta values ---
+  common_cpgs <- intersect(primary_results$CpG_ID, rownames(beta_comb_ordered))
+  stats_part <- primary_results %>% filter(CpG_ID %in% common_cpgs)
+  gene_part  <- tibble(CpG_ID = common_cpgs, Gene = unname(probe2gene[common_cpgs]))
+  beta_part  <- as.data.frame(beta_comb_ordered[common_cpgs, ]) %>% rownames_to_column("CpG_ID")
+  
+  full_data_table <- stats_part %>%
+    left_join(gene_part, by = "CpG_ID") %>%
+    left_join(beta_part, by = "CpG_ID") %>%
+    select(CpG_ID, Gene, logFC, P.Value, adj.P.Val, everything())
+    
+  out_full <- file.path(output_dir, glue::glue("Full_EWAS_Results_with_Betas_{primary_comparison}.csv"))
+  readr::write_csv(full_data_table, out_full)
+  msg(glue::glue("✓ Saved full data: {basename(out_full)}"))
+
+  # --- B. Generate and save the Top N summary tables ---
+  top_hyper_ids <- primary_results %>%
+    filter(is.finite(P.Value), logFC > 0) %>% arrange(P.Value) %>% slice_head(n = top_n) %>% pull(CpG_ID)
+  summary_table_hyper <- primary_results %>%
+    filter(CpG_ID %in% top_hyper_ids) %>% arrange(P.Value) %>% select(CpG_ID, logFC, P.Value, adj.P.Val)
+
+  top_hypo_ids <- primary_results %>%
+    filter(is.finite(P.Value), logFC < 0) %>% arrange(P.Value) %>% slice_head(n = top_n) %>% pull(CpG_ID)
+  summary_table_hypo <- primary_results %>%
+    filter(CpG_ID %in% top_hypo_ids) %>% arrange(P.Value) %>% select(CpG_ID, logFC, P.Value, adj.P.Val)
+
+  if (!is.null(probe2gene)) {
+    summary_table_hyper <- summary_table_hyper %>% mutate(Gene = unname(probe2gene[CpG_ID]), .after = CpG_ID)
+    summary_table_hypo  <- summary_table_hypo  %>% mutate(Gene = unname(probe2gene[CpG_ID]), .after = CpG_ID)
+  }
+  
+  out_hyper <- file.path(output_dir, glue("Top{top_n}_DMPs_Summary_from_{primary_comparison}_hyper.csv"))
+  out_hypo  <- file.path(output_dir, glue("Top{top_n}_DMPs_Summary_from_{primary_comparison}_hypo.csv"))
+  readr::write_csv(summary_table_hyper, out_hyper)
+  readr::write_csv(summary_table_hypo,  out_hypo)
+  msg(glue("✓ Saved Top {top_n} summary: {basename(out_hyper)}"))
+  msg(glue("✓ Saved Top {top_n} summary: {basename(out_hypo)}"))
+}
+
+msg("\n✅ All pairwise summary tables created successfully.")
+```
+```{r}
+################################################################################
+# final_heatmap_pairwise_script.R
+#
+# - Creates two separate heatmaps for pairwise comparisons:
+#   1. No Metastasis vs. LN Only
+#   2. LN Only vs. Distant
+# - Temporarily removes functional group annotations for a simplified view.
+# - Assumes 'beta_comb' and metadata are available.
+################################################################################
+
+## ---------------- 1. SETUP & LIBRARIES ----------------------------------- ##
+suppressPackageStartupMessages({
+  library(pheatmap); library(dplyr); library(readr); library(RColorBrewer)
+  library(grid); library(Cairo)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+## ---------------- 2. USER SETTINGS & FILE PATHS -------------------------- ##
+
+# Point this to the output directory from the new summary script
+summary_dir <- "/Users/adiallo/Desktop/Thesis/Results/results_summary_pairwise/"
+
+# Path to the full metadata file
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+# Where to save the final heatmap figures
+output_dir  <- "/Users/adiallo/Desktop/Thesis/Results/results_publication_figure_pairwise/"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Assumes 'beta_comb' is already loaded in your R environment.
+# If not, load it from your cache:
+if (!exists("beta_comb")) {
+  beta_rds <- "/Users/adiallo/Desktop/Thesis/Results/ewas_cache/beta_comb_qc.rds"
+  if (file.exists(beta_rds)) {
+    msg("Loading beta matrix from cache...")
+    beta_comb <- readRDS(beta_rds)$beta
+  } else {
+    stop("Please load the 'beta_comb' matrix into your R environment.")
+  }
+}
+
+################################################################################
+##  3. MAIN HEATMAP GENERATION FUNCTION
+################################################################################
+
+generate_pairwise_heatmap <- function(comparison_tag, groups_to_plot) {
+
+  msg(glue::glue("--- Generating heatmap for comparison: {comparison_tag} ---"))
+
+  ## --- A. Load the Top CpG lists for this comparison ---
+  top_hyper_file <- file.path(summary_dir, glue::glue("Top100_DMPs_Summary_from_{comparison_tag}_hyper.csv"))
+  top_hypo_file  <- file.path(summary_dir, glue::glue("Top100_DMPs_Summary_from_{comparison_tag}_hypo.csv"))
+
+  if (!file.exists(top_hyper_file) || !file.exists(top_hypo_file)) {
+    warning(glue::glue("SKIPPING: CpG list files not found for {comparison_tag}."))
+    return(NULL)
+  }
+
+  top_hyper_cpgs <- read_csv(top_hyper_file, show_col_types = FALSE)$CpG_ID
+  top_hypo_cpgs  <- read_csv(top_hypo_file, show_col_types = FALSE)$CpG_ID
+  final_cpgs_to_plot <- c(top_hyper_cpgs, top_hypo_cpgs)
+  gap_row_position <- length(top_hyper_cpgs)
+
+
+  ## --- B. Prepare Annotations, filtering for only the groups of interest ---
+  meta_for_heatmap <- read_csv(meta_csv, show_col_types = FALSE) %>%
+    mutate(
+      SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+      Metastasis_Status = case_when(
+        Distant_Mets == 1 ~ "Distant",
+        ln_only == 1      ~ "LN Only",
+        TRUE              ~ "No Metastasis"
+      )
+    ) %>%
+    filter(
+      SampleID %in% colnames(beta_comb),
+      Metastasis_Status %in% groups_to_plot ## <<< Filters to the two groups
+    ) %>%
+    mutate(Metastasis_Status = factor(Metastasis_Status, levels = groups_to_plot)) %>%
+    arrange(Metastasis_Status)
+
+  annotation_col <- meta_for_heatmap %>%
+    select(Metastasis_Status) %>%
+    as.data.frame()
+  rownames(annotation_col) <- meta_for_heatmap$SampleID
+
+  annotation_colors <- list(
+    Metastasis_Status = c("No Metastasis" = "#4575b4", "LN Only" = "#fdae61", "Distant" = "#d73027")
+  )
+
+  ## --- C. Prepare the data matrix ---
+  mat_ordered <- beta_comb[final_cpgs_to_plot, meta_for_heatmap$SampleID]
+  gap_col_positions <- which(diff(as.numeric(meta_for_heatmap$Metastasis_Status)) != 0)
+
+
+  ## --- D. Define color palette ---
+  plot_colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(100)
+  plot_breaks <- seq(-2.5, 2.5, length.out = 101)
+
+
+  ## --- E. Generate and save the heatmap using cairo_pdf ---
+  heatmap_filename <- file.path(output_dir, glue::glue("Heatmap_Body_{comparison_tag}.pdf"))
+  cairo_pdf(heatmap_filename, width = 8, height = 11)
+
+  pheatmap(
+    mat_ordered,
+    annotation_col = annotation_col,
+    annotation_colors = annotation_colors,
+    main = comparison_tag,
+    show_colnames = TRUE,
+    show_rownames = FALSE, ## <<< Hiding row names for a cleaner first look
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    scale = "row",
+    gaps_row = gap_row_position,
+    gaps_col = gap_col_positions,
+    legend = TRUE,
+    annotation_legend = TRUE,
+    border_color = NA,
+    color = plot_colors,
+    breaks = plot_breaks
+  )
+  dev.off()
+  msg(paste("✓ Heatmap saved to:", heatmap_filename))
+}
+
+################################################################################
+##  4. EXECUTE FOR BOTH COMPARISONS
+################################################################################
+
+# Generate the first heatmap: No Metastasis vs. LN Only
+generate_pairwise_heatmap(
+  comparison_tag = "No_vs_LN",
+  groups_to_plot = c("No Metastasis", "LN Only")
+)
+
+# Generate the second heatmap: LN Only vs. Distant
+generate_pairwise_heatmap(
+  comparison_tag = "LN_vs_Dist",
+  groups_to_plot = c("LN Only", "Distant")
+)
+
+msg("\n✅ All heatmaps generated successfully.")
+```
+

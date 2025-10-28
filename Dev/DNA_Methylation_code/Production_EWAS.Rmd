@@ -1,193 +1,719 @@
 ---
-title: "R Notebook"
+title: "Production EWAS Code"
 output: html_notebook
 ---
 
+Note: All Heatmaps migrated over to Production_Heatmaps
+
 Main EWAS
-```{r ewas_metastasis_h6_normImmune, echo=TRUE, message=FALSE, warning=FALSE}
-###############################################################################
-#  ewas_metastasis_h6_normImmune.R     ·  2025-07-18
-#  Single HiTIMED h = 6   →   immune-fraction normalisation
-#  Phenotypes:  any_mets   ·   ln_only   ·   distant
-###############################################################################
-##  USER SETTINGS  ────────────────────────────────────────────────────────────
+```{r}
+# ewas_metastasis_h6_normImmune.R     · 2025-07-18
+# Single HiTIMED h = 6 → immune-fraction normalisation + EpiScore
+# Phenotypes: any_mets · ln_only · distant
+
+## ── USER SETTINGS ───────────────────────────────────────────────────────────
 idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
 idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
 meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
 
-phenotypes          <- c(any = "any_mets",
-                         ln  = "ln_only",
-                         dist= "distant")
-variance_percentile <- 0.90              # 0 ⇒ keep all CpGs
-###############################################################################
-msg <- \(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+phenotypes          <- c(any  = "any_mets",
+                         ln   = "ln_only",
+                         dist = "distant")
+variance_percentile <- 0.90  # 0 ⇒ keep all CpGs
+
+## NEW: centralize outputs/caches here
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
 
 suppressPackageStartupMessages({
-  library(minfi);     library(sesame);  library(ENmix)
-  library(matrixStats); library(limma); library(sva)
-  library(HiTIMED);   library(tidyverse); library(glue)
+  library(minfi)
+  library(sesame)
+  library(ENmix)
+  library(matrixStats)
+  library(limma)
+  library(sva)
+  library(HiTIMED)
+  library(EpiDISH)
+  library(tidyverse)
+  library(glue)
 })
 
-###############################################################################
-##  1)  β-matrix  (cached)  ---------------------------------------------------
-###############################################################################
-cache_dir <- "results_ewas_cache" ; dir.create(cache_dir, FALSE)
-beta_rds  <- file.path(cache_dir, "beta_comb_qc.rds")
-
-read_pp <- function(path, tag){
-  rg  <- read.metharray.exp(path, recursive=TRUE, extended=TRUE, force=TRUE)
-  bet <- getBeta(preprocessNoob(rg, dyeMethod="single"))
-  if (tag=="v2") bet <- betasCollapseToPfx(bet)
-  bad <- ENmix::QCinfo(rg)$badCpG
-  bet[setdiff(rownames(bet), bad), ]
+read_csv_silent <- function(file, ...) {
+  if (utils::packageVersion("readr") >= "2.0.0") {
+    readr::read_csv(file, show_col_types = FALSE, ...)
+  } else {
+    suppressMessages(readr::read_csv(file, ...))
+  }
 }
 
-if (!file.exists(beta_rds)){
+## ── 1) β-matrix (cached) ────────────────────────────────────────────────────
+## NEW: cache under Results
+cache_dir <- file.path(results_root, "ewas_cache")
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+beta_rds  <- file.path(cache_dir, "beta_comb_qc.rds")
+## NEW: keep sample-origin manifests
+manifest_csv <- file.path(cache_dir, "sample_manifest_v1_v2.csv")
+
+read_pp <- function(path, tag) {
+  rg  <- read.metharray.exp(path, recursive = TRUE, extended = TRUE, force = TRUE)
+  bet <- getBeta(preprocessNoob(rg, dyeMethod = "single"))
+  if (tag == "v2") bet <- betasCollapseToPfx(bet)
+  bad <- ENmix::QCinfo(rg)$badCpG
+  bet <- bet[ setdiff(rownames(bet), bad), , drop = FALSE]
+  bet
+}
+
+## NEW: we’ll save sample IDs per platform so we can label Array_Version later
+if (!file.exists(beta_rds)) {
   msg("Reading / normalising IDATs …")
   beta1 <- read_pp(idat_v1, "v1")
   beta2 <- read_pp(idat_v2, "v2")
-  common     <- intersect(rownames(beta1), rownames(beta2))
-  beta_comb  <- cbind(beta1[common,], beta2[common,])
-  saveRDS(beta_comb, beta_rds);  msg("β-matrix cached.")
+
+  sample_ids_v1 <- colnames(beta1)
+  sample_ids_v2 <- colnames(beta2)
+
+  common    <- intersect(rownames(beta1), rownames(beta2))
+  beta_comb <- cbind(beta1[common, , drop = FALSE],
+                     beta2[common, , drop = FALSE])
+
+  saveRDS(list(beta = beta_comb,
+               sample_ids_v1 = sample_ids_v1,
+               sample_ids_v2 = sample_ids_v2),
+          beta_rds)
+
+  ## write a small manifest for sanity/debug
+  tibble(
+    SampleID = c(sample_ids_v1, sample_ids_v2),
+    Array_Version = c(rep("v1", length(sample_ids_v1)),
+                      rep("v2", length(sample_ids_v2)))
+  ) %>%
+    distinct() %>%
+    write_csv(manifest_csv)
+
+  msg("β-matrix cached.")
 } else {
-  beta_comb <- readRDS(beta_rds);   msg("β-matrix loaded from cache.")
+  cache_obj <- readRDS(beta_rds)
+  if (is.list(cache_obj) && !is.null(cache_obj$beta)) {
+    beta_comb     <- cache_obj$beta
+    sample_ids_v1 <- cache_obj$sample_ids_v1
+    sample_ids_v2 <- cache_obj$sample_ids_v2
+  } else {
+    ## backward compat if the RDS used to be only the matrix
+    beta_comb     <- cache_obj
+    sample_ids_v1 <- character(0)
+    sample_ids_v2 <- character(0)
+  }
+  msg("β-matrix loaded from cache.")
 }
 
-## ─ variance filter ─────────────────────────────────────────────────────────
-M.mat <- log2(beta_comb/(1-beta_comb) + 1e-6)
-if (variance_percentile > 0){
-  var_thr <- quantile(rowVars(M.mat, TRUE), variance_percentile)
-  keep    <- rowVars(M.mat, TRUE) > var_thr
-  beta_comb <- beta_comb[keep,];   M.mat <- M.mat[keep,]
-  msg(sum(keep), " CpGs kept (top ", 100*(1-variance_percentile), "% var).")
+##--- Remove sex linked probes--##
+get_annotation_for <- function(beta_mat) {
+  # Prefer EPIC; fallback to 450k
+  if (requireNamespace("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(
+      library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+    )
+    a <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  } else if (requireNamespace("IlluminaHumanMethylation450kanno.ilmn12.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(
+      library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+    )
+    a <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  } else {
+    stop("Install an Illumina methylation annotation package (EPIC or 450k).")
+  }
+  # Keep rows that exist in your beta matrix
+  a[rownames(a) %in% rownames(beta_mat), , drop = FALSE]
 }
 
-###############################################################################
-##  2)  HiTIMED  h = 6   ------------------------------------------------------
-###############################################################################
+anno <- get_annotation_for(beta_comb)
+
+# Try multiple possible chromosome fields across annotation versions
+chr_vec <- NULL
+if ("chr" %in% colnames(anno))       chr_vec <- anno$chr
+if (is.null(chr_vec) && "CHR" %in% colnames(anno)) chr_vec <- anno$CHR
+if (is.null(chr_vec) && "seqnames" %in% colnames(anno)) chr_vec <- as.character(anno$seqnames)
+
+if (is.null(chr_vec)) stop("Could not find chromosome column in annotation.")
+
+is_sex_chr <- chr_vec %in% c("chrX","chrY","X","Y")
+sex_probes <- rownames(anno)[is_sex_chr]
+
+n_before <- nrow(beta_comb)
+if (length(sex_probes) > 0) {
+  beta_comb <- beta_comb[setdiff(rownames(beta_comb), sex_probes), , drop = FALSE]
+}
+msg(length(sex_probes), " chrX/chrY probes removed; ",
+    n_before, " → ", nrow(beta_comb), " CpGs remain.")
+
+## ── Variance filter ─────────────────────────────────────────────────────────
+M.mat <- log2(beta_comb / (1 - beta_comb) + 1e-6)
+if (variance_percentile > 0) {
+  var_thr   <- quantile(rowVars(M.mat, TRUE), variance_percentile)
+  keep      <- rowVars(M.mat, TRUE) > var_thr
+  beta_comb <- beta_comb[keep, , drop = FALSE]
+  M.mat     <- M.mat[keep, , drop = FALSE]
+  msg(sum(keep), " CpGs kept (top ",
+      100 * (1 - variance_percentile), "% var).")
+}
+
+## ── 2a) Define & run EpiScore for fibroblasts ────────────────────────────────
+data(centEpiFibIC.m)  # built-in colon-fibroblast reference
+
+run_episcore <- function(beta) {
+  common <- intersect(rownames(beta), rownames(centEpiFibIC.m))
+  est    <- epidish(beta[common, ],
+                    centEpiFibIC.m[common, ],
+                    method = "RPC")$estF
+  as.data.frame(est) * 100    # columns = Epi, Fib, IC
+}
+
+msg("Running EpiScore (RPC) for fibroblast …")
+fib_scores <- run_episcore(beta_comb) %>%
+  rownames_to_column("SampleID")
+# fib_scores has SampleID, Epi, Fib, IC
+
+## ── 2b) HiTIMED deconvolution (h = 6) ────────────────────────────────────────
 msg("Running HiTIMED  h = 6 …")
-frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h=6) %>%
-             as.data.frame() %>% rownames_to_column("SampleID")
+frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(fib_scores, by = "SampleID")
+# now frac_h6 includes a "Fib" column (from EpiScore)
 
-###############################################################################
-##  3)  Collapse / normalise fractions  ---------------------------------------
-###############################################################################
-collapse_frac <- function(df){
-  get <- \(x) if (x %in% names(df)) df[[x]] else 0
+## ── 3) Collapse / normalise fractions ───────────────────────────────────────
+collapse_frac <- function(df) {
+  get_ <- function(x) if (x %in% names(df)) df[[x]] else 0
+  
   imm_cols <- c("CD8mem","CD8nv","CD4mem","CD4nv",
                 "Treg","Bmem","Bnv","DC","Mono","NK")
-  totalImm <- rowSums(df[imm_cols])
-  totalImm[totalImm==0] <- NA        # avoid div‐by‐zero
+  totalImm <- rowSums(df[imm_cols], na.rm = TRUE)
+  totalImm[totalImm == 0] <- NA
   
   tibble(
     SampleID     = df$SampleID,
-    Tumor        = get("Tumor"),
-    Fibroblast   = get("Fib"),
-    StromalOther = get("Endothelial") + get("Epithelial"),
-    ## immune, normalised (only two out of three to avoid collinearity) -----
-    CD8_T        = (get("CD8mem")+get("CD8nv"))/totalImm,
-    LymphOther   = (get("CD4mem")+get("CD4nv")+
-                    get("Treg")+get("Bmem")+get("Bnv"))/totalImm
+    Tumor        = get_("Tumor"),
+    Fibroblast   = get_("Fib"),       # now uses EpiScore Fib
+    StromalOther = get_("Endothelial") + get_("Epithelial"),
+    CD8_T        = (get_("CD8mem") + get_("CD8nv")) / totalImm,
+    LymphOther   = (get_("CD4mem") + get_("CD4nv") +
+                    get_("Treg")   + get_("Bmem") + get_("Bnv")) / totalImm
   ) %>% mutate(across(where(is.numeric), as.numeric))
 }
 
-###############################################################################
-##  4)  Tier templates  -------------------------------------------------------
-###############################################################################
+## ── 4) Tier templates ───────────────────────────────────────────────────────
 tier_template <- list(
   Tier1 = c("age","sex_num","MLH1_num"),
   Tier2 = c("age","sex_num","MLH1_num","Tumor"),
   Tier3 = c("age","sex_num","MLH1_num","Tumor",
             "Fibroblast","StromalOther",
-            "CD8_T","LymphOther")   # dropped Myeloid
+            "CD8_T","LymphOther")
 )
-trim_tiers <- \(tiers, avail) lapply(tiers, \(v) intersect(v, avail))
+trim_tiers <- function(tiers, avail) lapply(tiers, intersect, avail)
 
-###############################################################################
-##  5)  Loop over phenotypes  -------------------------------------------------
-###############################################################################
-for (pheno_tag in names(phenotypes)){
-  
+## ── 5) Loop over phenotypes ────────────────────────────────────────────────
+for (pheno_tag in names(phenotypes)) {
   pheno_var <- phenotypes[[pheno_tag]]
-  msg("\n================  ", pheno_var, "  ================")
+  msg("\n===== ", pheno_var, " =====")
   
-  ## metadata --------------------------------------------------------------
-  meta <- read_csv(meta_csv, show_col_types=FALSE) %>%
+  meta <- read_csv_silent(meta_csv) %>%
     mutate(
-      SampleID   = paste(Sentrix_ID,Sentrix_Position,sep="_"),
-      any_mets   = as.integer(any_mets),
-      distant    = as.integer(Distant_Mets),
-      ln_only    = as.integer(ln_only),
-      sex_num    = as.integer(sex=="M"),
-      MLH1_num   = as.integer(MLH1==1),
-      Array_Version = ifelse(SampleID %in% colnames(beta_comb),"v1","v2")
+      SampleID      = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+      any_mets      = as.integer(any_mets),
+      distant       = as.integer(Distant_Mets),
+      ln_only       = as.integer(ln_only),
+      sex_num       = as.integer(sex == "M"),
+      MLH1_num      = as.integer(MLH1 == 1)
     )
+
+  ## NEW: assign Array_Version using the vectors we saved at read time
+  meta <- meta %>%
+    mutate(
+      Array_Version = case_when(
+        SampleID %in% sample_ids_v1 ~ "v1",
+        SampleID %in% sample_ids_v2 ~ "v2",
+        TRUE                        ~ NA_character_
+      )
+    )
+
+  ## NEW: warn if any SampleID in meta not found in either list
+  if (any(is.na(meta$Array_Version))) {
+    miss <- meta$SampleID[is.na(meta$Array_Version)]
+    msg("WARNING: ", length(miss), " meta SampleIDs not matched to v1/v2: ",
+        paste(head(miss, 8), collapse = ", "),
+        if (length(miss) > 8) " …" else "")
+  }
   
-  ## binary outcome --------------------------------------------------------
-  meta$pheno_bin <- case_when(
-    pheno_var=="any_mets" ~ meta$any_mets,
-    pheno_var=="distant"  ~ meta$distant,
-    pheno_var=="ln_only"  ~ (meta$ln_only & !meta$distant),
-    TRUE ~ NA_integer_
+  meta$pheno_bin <- dplyr::case_when(
+    pheno_var == "any_mets" ~ meta$any_mets,
+    pheno_var == "distant"  ~ meta$distant,
+    pheno_var == "ln_only"  ~ (meta$ln_only & !meta$distant),
+    TRUE                    ~ NA_integer_
   )
-  stopifnot(all(meta$pheno_bin %in% 0:1))
+  stopifnot(all(meta$pheno_bin %in% 0:1, na.rm = TRUE))
   
-  ## join fractions & drop incomplete -------------------------------------
   frac_df  <- collapse_frac(frac_h6)
-  meta_all <- left_join(meta, frac_df, by="SampleID")
+  meta_all <- left_join(meta, frac_df, by = "SampleID")
   ok       <- complete.cases(meta_all[, tier_template$Tier3])
   meta_f   <- meta_all[ok, ]
-  M_f      <- M.mat[, meta_f$SampleID]
+  M_f      <- M.mat[, meta_f$SampleID, drop = FALSE]
   
-  ## ComBat adjustment -----------------------------------------------------
-  if (length(unique(meta_f$Array_Version))>1){
+  ## ComBat if both platforms are present after filtering
+  if (length(unique(na.omit(meta_f$Array_Version))) > 1) {
     mod_cb <- model.matrix(~ age + sex_num + MLH1_num + pheno_bin, meta_f)
-    M_cb   <- ComBat(M_f, batch=factor(meta_f$Array_Version),
-                     mod=mod_cb, par.prior=TRUE, prior.plots=FALSE)
-  } else M_cb <- M_f
+    M_cb   <- ComBat(M_f,
+                     batch       = factor(meta_f$Array_Version),
+                     mod         = mod_cb,
+                     par.prior   = TRUE,
+                     prior.plots = FALSE)
+  } else {
+    M_cb <- M_f
+  }
   
-  ## fit tiers -------------------------------------------------------------
   tier_list <- trim_tiers(tier_template, names(meta_f))
-  fits <- map(tier_list, \(covs){
-    nz  <- covs[sapply(meta_f[covs], sd, TRUE) > 0]
-    form<- if (length(nz)==0) ~ pheno_bin
-           else as.formula(paste("~ pheno_bin +", paste(nz, collapse=" + ")))
+  fits <- purrr::map(tier_list, function(covs) {
+    nz   <- covs[sapply(meta_f[covs], sd, TRUE) > 0]
+    form <- if (length(nz) == 0) {
+      ~ pheno_bin
+    } else {
+      as.formula(paste("~ pheno_bin +", paste(nz, collapse = " + ")))
+    }
     des <- model.matrix(form, meta_f)
-    eBayes(lmFit(M_cb, des), trend=TRUE, robust=TRUE)
+    eBayes(lmFit(M_cb, des), trend = TRUE, robust = TRUE)
   })
   
-  ## save results ----------------------------------------------------------
-  out_dir <- file.path(glue("results_ewas_{pheno_tag}"), "H6")
-  dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+  ## NEW: write results under Results root
+  out_dir <- file.path(results_root, glue("results_ewas_{pheno_tag}"), "H6")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   saveRDS(fits, file.path(out_dir, "ewas_fits.rds"))
   msg("✓  fits saved → ", out_dir)
 }
 
-msg("\n✅  Finished: Any, LN-only, Distant  (HiTIMED-h6, immune-normalised)")
+msg("\n✅ Finished: Any, LN-only, Distant  (HiTIMED-h6, immune-normalised + EpiScore)")
 ```
 
-Volcano plots
+Without Combat:
+```{r}
+# ewas_metastasis_h6_normImmune.R     · 2025-07-18
+# Single HiTIMED h = 6 → immune-fraction normalisation + EpiScore
+# Phenotypes: any_mets · ln_only · distant
+# NOTE: ComBat is DISABLED — same-cohort v1/v2; using intersected probes instead.
+
+## ── USER SETTINGS ───────────────────────────────────────────────────────────
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+phenotypes          <- c(any  = "any_mets",
+                         ln   = "ln_only",
+                         dist = "distant")
+variance_percentile <- 0.90  # 0 ⇒ keep all CpGs
+
+## NEW: centralize outputs/caches here
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(minfi)
+  library(sesame)
+  library(ENmix)
+  library(matrixStats)
+  library(limma)
+  # library(sva)   # <- not needed since ComBat is off
+  library(HiTIMED)
+  library(EpiDISH)
+  library(tidyverse)
+  library(glue)
+})
+
+read_csv_silent <- function(file, ...) {
+  if (utils::packageVersion("readr") >= "2.0.0") {
+    readr::read_csv(file, show_col_types = FALSE, ...)
+  } else {
+    suppressMessages(readr::read_csv(file, ...))
+  }
+}
+
+## ── 1) β-matrix (cached) ────────────────────────────────────────────────────
+## cache under Results
+cache_dir <- file.path(results_root, "ewas_cache")
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+beta_rds      <- file.path(cache_dir, "beta_comb_qc.rds")
+manifest_csv  <- file.path(cache_dir, "sample_manifest_v1_v2.csv")
+
+read_pp <- function(path, tag) {
+  rg  <- read.metharray.exp(path, recursive = TRUE, extended = TRUE, force = TRUE)
+  bet <- getBeta(preprocessNoob(rg, dyeMethod = "single"))
+  if (tag == "v2") bet <- betasCollapseToPfx(bet)
+  bad <- ENmix::QCinfo(rg)$badCpG
+  bet <- bet[ setdiff(rownames(bet), bad), , drop = FALSE]
+  bet
+}
+
+## Save sample IDs per platform so we can label Array_Version later
+if (!file.exists(beta_rds)) {
+  msg("Reading / normalising IDATs …")
+  beta1 <- read_pp(idat_v1, "v1")
+  beta2 <- read_pp(idat_v2, "v2")
+
+  sample_ids_v1 <- colnames(beta1)
+  sample_ids_v2 <- colnames(beta2)
+
+  common <- intersect(rownames(beta1), rownames(beta2))
+  stopifnot(length(common) > 0)
+  beta_comb <- cbind(beta1[common, , drop = FALSE],
+                     beta2[common, , drop = FALSE])
+
+  saveRDS(list(beta = beta_comb,
+               sample_ids_v1 = sample_ids_v1,
+               sample_ids_v2 = sample_ids_v2),
+          beta_rds)
+
+  tibble(
+    SampleID = c(sample_ids_v1, sample_ids_v2),
+    Array_Version = c(rep("v1", length(sample_ids_v1)),
+                      rep("v2", length(sample_ids_v2)))
+  ) %>%
+    distinct() %>%
+    write_csv(manifest_csv)
+
+  msg("β-matrix cached.")
+} else {
+  cache_obj <- readRDS(beta_rds)
+  if (is.list(cache_obj) && !is.null(cache_obj$beta)) {
+    beta_comb     <- cache_obj$beta
+    sample_ids_v1 <- cache_obj$sample_ids_v1
+    sample_ids_v2 <- cache_obj$sample_ids_v2
+  } else {
+    ## backward compat if the RDS used to be only the matrix
+    beta_comb     <- cache_obj
+    sample_ids_v1 <- character(0)
+    sample_ids_v2 <- character(0)
+  }
+  msg("β-matrix loaded from cache.")
+}
+
+## --- Remove sex-linked probes ----------------------------------------------
+get_annotation_for <- function(beta_mat) {
+  if (requireNamespace("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+    a <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  } else if (requireNamespace("IlluminaHumanMethylation450kanno.ilmn12.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(library(IlluminaHumanMethylation450kanno.ilmn12.hg19))
+    a <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  } else {
+    stop("Install an Illumina methylation annotation package (EPIC or 450k).")
+  }
+  a[rownames(a) %in% rownames(beta_mat), , drop = FALSE]
+}
+
+anno <- get_annotation_for(beta_comb)
+
+# Try multiple possible chromosome fields across annotation versions
+chr_vec <- NULL
+if ("chr" %in% colnames(anno))             chr_vec <- anno$chr
+if (is.null(chr_vec) && "CHR" %in% colnames(anno))      chr_vec <- anno$CHR
+if (is.null(chr_vec) && "seqnames" %in% colnames(anno)) chr_vec <- as.character(anno$seqnames)
+if (is.null(chr_vec)) stop("Could not find chromosome column in annotation.")
+
+is_sex_chr <- chr_vec %in% c("chrX","chrY","X","Y")
+sex_probes <- rownames(anno)[is_sex_chr]
+
+n_before <- nrow(beta_comb)
+if (length(sex_probes) > 0) {
+  beta_comb <- beta_comb[setdiff(rownames(beta_comb), sex_probes), , drop = FALSE]
+}
+msg(length(sex_probes), " chrX/chrY probes removed; ",
+    n_before, " → ", nrow(beta_comb), " CpGs remain.")
+
+## ── Variance filter (optional) ──────────────────────────────────────────────
+M.mat <- log2(beta_comb / pmax(1 - beta_comb, 1e-6) + 1e-6)
+if (variance_percentile > 0) {
+  v <- rowVars(M.mat, na.rm = TRUE)
+  var_thr <- quantile(v, variance_percentile, na.rm = TRUE)
+  keep    <- v > var_thr
+  beta_comb <- beta_comb[keep, , drop = FALSE]
+  M.mat     <- M.mat[keep, , drop = FALSE]
+  msg(sum(keep), " CpGs kept (top ", 100 * (1 - variance_percentile), "% var).")
+}
+
+## ── 2a) EpiScore for fibroblasts (RPC) ──────────────────────────────────────
+data(centEpiFibIC.m)  # built-in colon-fibroblast reference
+
+run_episcore <- function(beta) {
+  common <- intersect(rownames(beta), rownames(centEpiFibIC.m))
+  est    <- epidish(beta[common, ],
+                    centEpiFibIC.m[common, ],
+                    method = "RPC")$estF
+  as.data.frame(est) * 100    # columns = Epi, Fib, IC
+}
+
+msg("Running EpiScore (RPC) for fibroblast …")
+fib_scores <- run_episcore(beta_comb) %>%
+  rownames_to_column("SampleID")
+
+## ── 2b) HiTIMED deconvolution (h = 6) ───────────────────────────────────────
+msg("Running HiTIMED  h = 6 …")
+frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(fib_scores, by = "SampleID")   # adds Fib from EpiScore
+
+## ── 3) Collapse / normalise fractions ───────────────────────────────────────
+collapse_frac <- function(df) {
+  get_ <- function(x) if (x %in% names(df)) df[[x]] else 0
+  imm_cols <- c("CD8mem","CD8nv","CD4mem","CD4nv","Treg","Bmem","Bnv","DC","Mono","NK")
+  totalImm <- rowSums(df[imm_cols], na.rm = TRUE); totalImm[totalImm == 0] <- NA
+  tibble(
+    SampleID     = df$SampleID,
+    Tumor        = get_("Tumor"),
+    Fibroblast   = get_("Fib"),               # from EpiScore
+    StromalOther = get_("Endothelial") + get_("Epithelial"),
+    CD8_T        = (get_("CD8mem") + get_("CD8nv")) / totalImm,
+    LymphOther   = (get_("CD4mem") + get_("CD4nv") +
+                    get_("Treg")   + get_("Bmem") + get_("Bnv")) / totalImm
+  ) %>% mutate(across(where(is.numeric), as.numeric))
+}
+
+## ── 4) Tier templates (unchanged design) ────────────────────────────────────
+tier_template <- list(
+  Tier1 = c("age","sex_num","MLH1_num"),
+  Tier2 = c("age","sex_num","MLH1_num","Tumor"),
+  Tier3 = c("age","sex_num","MLH1_num","Tumor",
+            "Fibroblast","StromalOther",
+            "CD8_T","LymphOther")
+)
+trim_tiers <- function(tiers, avail) lapply(tiers, intersect, avail)
+
+## ── 5) Loop over phenotypes (NO ComBat) ─────────────────────────────────────
+for (pheno_tag in names(phenotypes)) {
+  pheno_var <- phenotypes[[pheno_tag]]
+  msg("\n===== ", pheno_var, " =====")
+
+  meta <- read_csv_silent(meta_csv) %>%
+    mutate(
+      SampleID      = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+      any_mets      = as.integer(any_mets),
+      distant       = as.integer(Distant_Mets),
+      ln_only       = as.integer(ln_only),
+      sex_num       = as.integer(sex == "M"),
+      MLH1_num      = as.integer(MLH1 == 1)
+    )
+
+  ## Use saved vectors to tag array version (for reference only)
+  meta <- meta %>%
+    mutate(
+      Array_Version = case_when(
+        SampleID %in% sample_ids_v1 ~ "v1",
+        SampleID %in% sample_ids_v2 ~ "v2",
+        TRUE                        ~ NA_character_
+      )
+    )
+
+  if (any(is.na(meta$Array_Version))) {
+    miss <- meta$SampleID[is.na(meta$Array_Version)]
+    msg("WARNING: ", length(miss), " meta SampleIDs not matched to v1/v2: ",
+        paste(head(miss, 8), collapse = ", "),
+        if (length(miss) > 8) " …" else "")
+  }
+
+  meta$pheno_bin <- dplyr::case_when(
+    pheno_var == "any_mets" ~ meta$any_mets,
+    pheno_var == "distant"  ~ meta$distant,
+    pheno_var == "ln_only"  ~ (meta$ln_only & !meta$distant),
+    TRUE                    ~ NA_integer_
+  )
+  stopifnot(all(meta$pheno_bin %in% 0:1, na.rm = TRUE))
+
+  frac_df  <- collapse_frac(frac_h6)
+  meta_all <- left_join(meta, frac_df, by = "SampleID")
+  ok       <- complete.cases(meta_all[, tier_template$Tier3])
+  meta_f   <- meta_all[ok, , drop = FALSE]
+  M_f      <- M.mat[, meta_f$SampleID, drop = FALSE]
+
+  ## NO ComBat: same-cohort v1/v2 + intersected probes is sufficient
+  M_cb <- M_f
+
+  tier_list <- trim_tiers(tier_template, names(meta_f))
+  fits <- purrr::map(tier_list, function(covs) {
+    # Only numeric covariates with non-zero variance; use stats::sd explicitly
+    is_var <- vapply(
+      meta_f[covs],
+      function(x) is.numeric(x) && is.finite(stats::sd(x, na.rm = TRUE)) && stats::sd(x, na.rm = TRUE) > 0,
+      logical(1)
+    )
+    nz <- covs[is_var]
+
+    form <- if (length(nz) == 0) {
+      ~ pheno_bin
+    } else {
+      as.formula(paste("~ pheno_bin +", paste(nz, collapse = " + ")))
+    }
+    des <- model.matrix(form, meta_f)
+    eBayes(lmFit(M_cb, des), trend = TRUE, robust = TRUE)
+  })
+
+  ## write results under Results root
+  out_dir <- file.path(results_root, glue("results_ewas_{pheno_tag}"), "H6")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(fits, file.path(out_dir, "ewas_fits.rds"))
+  msg("✓  fits saved → ", out_dir)
+}
+
+msg("\n✅ Finished: Any, LN-only, Distant  (HiTIMED-h6, immune-normalised + EpiScore; NO ComBat)")
+```
+
+Venn Diagram
+```{r}
+################################################################################
+# venn_diagram_progression.R  —  EWAS-based (no ANOVA object needed)
+#
+# Reads Tier3 fits from Any / LN / Distant metastasis,
+# thresholds by p < cutoff, and builds the Venn diagram.
+# Saves plot + region CSVs + membership matrix.
+################################################################################
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(limma)
+  library(ggplot2)
+  library(ggvenn)
+  library(glue)
+  library(readr)
+  library(tibble)
+  library(dplyr)
+})
+
+## ---------------- 1) SETTINGS ---------------------------------------------- ##
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+p_cutoff     <- 1e-3
+
+# Input EWAS fits (Tier3 results assumed inside)
+fit_files <- c(
+  any  = file.path(results_root, "results_ewas_any",  "H6", "ewas_fits.rds"),
+  ln   = file.path(results_root, "results_ewas_ln",   "H6", "ewas_fits.rds"),
+  dist = file.path(results_root, "results_ewas_dist", "H6", "ewas_fits.rds")
+)
+
+output_dir <- file.path(results_root, "venn_diagrams")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+msg("\n===== Generating Venn diagram for progression (EWAS Tier3, no ANOVA) =====")
+
+## ---------------- 2) LOAD FITS & EXTRACT SETS ----------------------------- ##
+get_sig_cpgs <- function(fit_file) {
+  if (!file.exists(fit_file)) return(character(0))
+  fits <- readRDS(fit_file)
+  fit3 <- if (inherits(fits$Tier3, "MArrayLM")) fits$Tier3 else fits$Tier3$fit
+  tt   <- topTable(fit3, coef = "pheno_bin", number = Inf)
+  rownames(tt[tt$P.Value < p_cutoff, , drop = FALSE])
+}
+
+cpg_sets <- list(
+  `Any Metastasis`      = get_sig_cpgs(fit_files["any"]),
+  `Lymph Node Only`     = get_sig_cpgs(fit_files["ln"]),
+  `Distant Metastasis`  = get_sig_cpgs(fit_files["dist"])
+)
+
+sizes_str <- paste0(names(cpg_sets), ": ",
+                    vapply(cpg_sets, length, integer(1)), collapse = " | ")
+msg("Set sizes → ", sizes_str)
+
+## ---------------- 3) PLOT & SAVE ------------------------------------------ ##
+venn_plot <- ggvenn(
+  cpg_sets,
+  fill_color = c("#4C78A8", "#FECB52", "#E45756"),
+  stroke_size = 0.6,
+  set_name_size = 5,
+  text_size = 4
+) +
+  labs(
+    title = "Significant DMPs (Tier3, p < 0.001)",
+    subtitle = NULL
+  ) +
+  theme(plot.title = element_text(hjust = 0, face = "bold"))
+
+plot_file <- file.path(output_dir, "venn_progression.pdf")
+ggsave(plot_file, venn_plot, device = cairo_pdf, width = 7.5, height = 8, dpi = 300)
+msg("✓ Venn diagram saved → ", plot_file)
+
+## ---------------- 4) REGION CSVs + MEMBERSHIP ----------------------------- ##
+A <- cpg_sets[["Any Metastasis"]]
+B <- cpg_sets[["Lymph Node Only"]]
+C <- cpg_sets[["Distant Metastasis"]]
+
+u <- union; int <- intersect; sd <- setdiff
+
+only_A <- sd(A, u(B, C))
+only_B <- sd(B, u(A, C))
+only_C <- sd(C, u(A, B))
+A_B    <- sd(int(A, B), C)
+A_C    <- sd(int(A, C), B)
+B_C    <- sd(int(B, C), A)
+A_B_C  <- Reduce(int, list(A, B, C))
+
+write_region <- function(vec, stub) {
+  out <- file.path(output_dir, paste0(stub, ".csv"))
+  write_csv(tibble(CpG_ID = vec), out)
+  msg("  - wrote ", stub, " (n=", length(vec), ")")
+}
+
+msg("Writing region CSVs …")
+write_region(only_A, "CpGs_ONLY_AnyMets")
+write_region(only_B, "CpGs_ONLY_LNonly")
+write_region(only_C, "CpGs_ONLY_Distant")
+write_region(A_B,    "CpGs_AnyMets_AND_LNonly_ONLY")
+write_region(A_C,    "CpGs_AnyMets_AND_Distant_ONLY")
+write_region(B_C,    "CpGs_LNonly_AND_Distant_ONLY")
+write_region(A_B_C,  "CpGs_ALL_THREE")
+
+all_cpgs <- sort(unique(c(A, B, C)))
+membership <- tibble(
+  CpG_ID            = all_cpgs,
+  Any_Metastasis    = as.integer(all_cpgs %in% A),
+  Lymph_Node_Only   = as.integer(all_cpgs %in% B),
+  Distant_Metastasis= as.integer(all_cpgs %in% C)
+) %>% mutate(SetCount = Any_Metastasis + Lymph_Node_Only + Distant_Metastasis)
+
+master_csv <- file.path(output_dir, "CpG_membership_matrix.csv")
+write_csv(membership, master_csv)
+msg("✓ Membership matrix saved → ", master_csv)
+
+msg("\n✅ Done.")
+```
+
+
+
+Volcano plots for figures:
 ```{r}
 ###############################################################################
 #  volcano_plots_gg_all_tiers.R  –  publication-ready volcano plots (Tiers 1–3)
-#  for Any mets, Lymph node mets, and Distant mets
+#  for Any mets, Lymph node mets, and Distant mets  [Helvetica everywhere]
 ###############################################################################
 suppressPackageStartupMessages({
   library(limma)
   library(ggplot2)
   library(ggrepel)
+  library(ggrastr)
   library(dplyr)
   library(glue)
   library(tibble)
-  library(rlang)      # for coalesce()
+  library(rlang)
+  library(latex2exp)
   library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 })
 
-## -------- phenotypes & directories ----------------------------------------
+## -------- central output root ----------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+
+## -------- phenotypes & directories (UNDER results_root) ---------------------
 phen_dirs <- c(
-  any  = "results_ewas_any",
-  ln   = "results_ewas_ln",
-  dist = "results_ewas_dist"
+  any  = file.path(results_root, "results_ewas_any"),
+  ln   = file.path(results_root, "results_ewas_ln"),
+  dist = file.path(results_root, "results_ewas_dist")
 )
 phen_labels <- c(
   any  = "Any metastasis",
@@ -195,331 +721,1867 @@ phen_labels <- c(
   dist = "Distant metastasis"
 )
 
-## -------- probe → primary gene symbol map --------------------------------
+## -------- probe → primary gene symbol map ----------------------------------
 anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-
-# 1) UCSC: first symbol before any “;”
 ucsc_raw <- anno$UCSC_RefGene_Name
-ucsc_map <- ifelse(!is.na(ucsc_raw) & ucsc_raw != "",
-                   sub(";.*$", "", ucsc_raw),
-                   NA_character_)
-
-# 2) GencodeBasic: safe extraction of last entry (or NA)
+ucsc_map <- ifelse(!is.na(ucsc_raw) & ucsc_raw != "", sub(";.*$", "", ucsc_raw), NA_character_)
 gencode_raw <- anno$GencodeBasicV12_NAME
-gencode_map <- vapply(
-  gencode_raw,
-  function(raw) {
-    if (is.na(raw) || raw == "") {
-      NA_character_
-    } else {
-      parts <- strsplit(raw, ";")[[1]]
-      tail(parts, 1)
-    }
-  },
-  FUN.VALUE = character(1)
-)
+gencode_map <- vapply(gencode_raw, function(raw) {
+  if (is.na(raw) || raw == "") NA_character_ else tail(strsplit(raw, ";")[[1]], 1)
+}, FUN.VALUE = character(1))
+probe2gene <- ifelse(!is.na(ucsc_map), ucsc_map,
+                     ifelse(!is.na(gencode_map), gencode_map, NA_character_))
+names(probe2gene) <- anno$Name
 
-# 3) coalesce: UCSC first, then Gencode, else NA
-probe2gene <- ifelse(
-  !is.na(ucsc_map), ucsc_map,
-  ifelse(!is.na(gencode_map), gencode_map, NA_character_)
-)
-names(probe2gene) <- anno$Name  # cgID → gene
-
-## -------- custom ggplot2 volcano function -------------------------------
-make_volcano_gg <- function(tt, title_txt,
-                            lfc_cut = 0.2, p_cut = 1e-3, top_n = 10,
+## -------- custom ggplot2 volcano function (Helvetica) ----------------------
+make_volcano_gg <- function(tt,
+                            lfc_cut = 0.2, p_cut = 1e-3, top_n = 15,
                             gene_map) {
-
   df <- tt %>%
-    rownames_to_column("CpG") %>%                 # make CpG a column
+    rownames_to_column("CpG") %>%
     mutate(
-      Gene = coalesce( na_if(gene_map[CpG], ""),  # turn "" → NA
-                       CpG ),                     # fallback
+      Gene    = coalesce(na_if(gene_map[CpG], ""), CpG),
       negLogP = -log10(P.Value),
-      Signif  = case_when(
+      Signif  = factor(dplyr::case_when(
         logFC >=  lfc_cut & P.Value < p_cut ~ "Hyper",
         logFC <= -lfc_cut & P.Value < p_cut ~ "Hypo",
         TRUE                                ~ "NS"
-      )
+      ), levels = c("Hyper", "Hypo", "NS"))
     )
 
-  top_hits <- df %>%
-    filter(Signif != "NS") %>%
-    arrange(P.Value) %>%
-    slice_head(n = top_n)
+  df_ns  <- dplyr::filter(df, Signif == "NS")
+  df_sig <- dplyr::filter(df, Signif != "NS")
+  top_hits <- df_sig %>% arrange(P.Value) %>% slice_head(n = top_n)
 
-  ggplot(df, aes(x = logFC, y = negLogP, color = Signif)) +
-    geom_point(size = 1.6, alpha = 0.8) +
-    scale_color_manual(values = c(Hyper="firebrick",
-                                  Hypo="dodgerblue",
-                                  NS="grey65")) +
-    geom_vline(xintercept = c(-lfc_cut, lfc_cut),
-               linetype = "dashed", size = 0.5) +
-    geom_hline(yintercept = -log10(p_cut),
-               linetype = "dashed", size = 0.5) +
+  ggplot(mapping = aes(x = logFC, y = negLogP, color = Signif)) +
+    geom_point_rast(data = df_ns, size = 1.6, alpha = 0.8, raster.dpi = 300) +
+    geom_point(data = df_sig, size = 1.6, alpha = 0.8) +
+    scale_color_manual(values = c(Hyper="firebrick", Hypo="dodgerblue", NS="grey65")) +
+    geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = "dashed", linewidth = 0.5) +
+    geom_hline(yintercept = -log10(p_cut), linetype = "dashed", linewidth = 0.5) +
     geom_text_repel(data = top_hits,
-                  aes(label = Gene),
-                  size          = 3,
-                  max.overlaps  = Inf,     # allow unlimited overlaps
-                  box.padding   = 0.5,     # give labels a bit more breathing room
-                  point.padding = 0.3,
-                  segment.size  = 0.2,
-                  force         = 1,       # increase repulsion force
-                  nudge_y       = 0.1) +   # nudge labels up slightly
-    labs(title    = title_txt,
-         subtitle = "HiTIMED h = 6",
-         x        = bquote(Log[2]~fold~change),
-         y        = bquote(-Log[10]~italic(P))) +
-    theme_minimal(base_size = 12) +
+                    aes(label = Gene),
+                    size = 3, max.overlaps = Inf,
+                    box.padding = 0.5, min.segment.length = 0) +
+    labs(title = NULL, subtitle = NULL,
+         x = expression(Log[2]~"fold change"),
+         y = expression(-Log[10]~italic(P))) +
+    theme_minimal(base_size = 12, base_family = "Helvetica") +
     theme(legend.position = "right")
 }
 
-## -------- main loop: phenotypes × tiers ----------------------------------
+## -------- main loop: phenotypes × tiers ------------------------------------
 for (ph_tag in names(phen_dirs)) {
   ph_dir   <- phen_dirs[[ph_tag]]
   fit_file <- file.path(ph_dir, "H6", "ewas_fits.rds")
   if (!file.exists(fit_file)) next
 
-  fits     <- readRDS(fit_file)   # list: Tier1, Tier2, Tier3
+  fits     <- readRDS(fit_file)
   plot_dir <- file.path(ph_dir, "H6", "plots_volcano_gg")
   dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
 
   for (tier_nm in names(fits)) {
-    fit_obj <- if (inherits(fits[[tier_nm]], "MArrayLM"))
-                 fits[[tier_nm]]
-               else
-                 fits[[tier_nm]]$fit
+    fit_obj <- if (inherits(fits[[tier_nm]], "MArrayLM")) fits[[tier_nm]] else fits[[tier_nm]]$fit
 
-    tt <- limma::topTable(fit_obj,
-                          coef          = "pheno_bin",
-                          number        = Inf,
-                          p.value       = 1,
-                          adjust.method = "none")
+    tt <- limma::topTable(fit_obj, coef = "pheno_bin", number = Inf,
+                          p.value = 1, adjust.method = "none")
 
-    title_txt <- glue("{tier_nm} — {phen_labels[[ph_tag]]}")
+    volcano <- make_volcano_gg(tt, gene_map = probe2gene, top_n = 15)
 
-    volcano <- make_volcano_gg(
-      tt,
-      title_txt = title_txt,
-      gene_map  = probe2gene
-    )
-
-    print(volcano)
+    # Save legendless version for Illustrator (Helvetica preserved in PDF)
+    volcano_no_title <- volcano +
+      labs(title = NULL, subtitle = NULL) +
+      theme(legend.position = "none")
 
     ggsave(
-      filename = file.path(plot_dir,
-                           glue("{ph_tag}_{tier_nm}_volcano.png")),
-      plot     = volcano,
-      width    = 6,
-      height   = 5,
-      dpi      = 300
+      filename = file.path(plot_dir, glue("{ph_tag}_{tier_nm}_volcano.pdf")),
+      plot     = volcano_no_title,
+      device   = cairo_pdf,
+      width    = 6, height = 5, dpi = 300
     )
   }
 }
 
-message("✅  All tiers (1–3) for Any, Lymph node, and Distant mets saved in each H6/plots_volcano_gg directory")
+message("✅  All volcano plots saved as 300-dpi PDFs under Results/<phen>/H6/plots_volcano_gg (Helvetica).")
+```
+
+
+Gene list:
+```{r}
+###############################################################################
+# summarize_top_cpgs.R
+# - For each phenotype (any, ln, dist):
+#   - Creates summary tables for the Top 100 hyper/hypo CpGs.
+#   - NEW: Creates a comprehensive table with ALL CpGs from the EWAS,
+#     including gene annotations and beta values for every sample.
+###############################################################################
+
+## --------------- USER SETTINGS ------------------------------------------- ##
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+meta_csv_path <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv" # Path to metadata
+
+h_level <- "H6"
+tier    <- "Tier3"
+top_n   <- 100
+
+output_dir <- file.path(results_root, "results_summary")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+## --------------- SETUP ---------------------------------------------------- ##
+suppressPackageStartupMessages({
+  library(limma); library(dplyr); library(glue)
+  library(readr); library(tibble)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+get_epic_annotation <- function() {
+  if (requireNamespace("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+    getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  } else {
+    warning("EPIC annotation package not available; 'Gene' column will be NA.")
+    NULL
+  }
+}
+
+###############################################################################
+##  NEW: 1. LOAD BETA MATRIX AND METADATA
+###############################################################################
+msg("Loading main beta matrix and metadata...")
+
+beta_rds <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+if (!file.exists(beta_rds)) {
+  stop("Beta matrix cache file not found at: ", beta_rds)
+}
+# Assuming the RDS contains a list with a 'beta' element
+beta_comb <- readRDS(beta_rds)$beta
+
+meta <- read_csv(meta_csv_path, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    Group = factor(if_else(any_mets == 1, "Metastasis", "No Metastasis"),
+                   levels = c("No Metastasis", "Metastasis"))
+  ) %>%
+  # Filter to samples present in the beta matrix and arrange them
+  filter(SampleID %in% colnames(beta_comb)) %>%
+  arrange(Group)
+
+# Order the beta matrix columns to match the ordered metadata
+beta_comb_ordered <- beta_comb[, meta$SampleID]
+
+
+###############################################################################
+##  2. LOAD ALL EWAS RESULTS
+###############################################################################
+msg("Loading all EWAS results...")
+
+phenotypes <- c("any", "ln", "dist")
+all_results <- list()
+
+for (ph_tag in phenotypes) {
+  fit_file <- file.path(results_root, glue("results_ewas_{ph_tag}"), h_level, "ewas_fits.rds")
+  if (!file.exists(fit_file)) {
+    warning(glue("Could not find fits file for phenotype '{ph_tag}'. Skipping."))
+    next
+  }
+  fits <- readRDS(fit_file)
+  if (!tier %in% names(fits)) {
+    warning(glue("Tier '{tier}' not found for phenotype '{ph_tag}'. Skipping."))
+    next
+  }
+  fit_obj <- fits[[tier]]; if (!inherits(fit_obj, "MArrayLM")) fit_obj <- fit_obj$fit
+  tt <- topTable(fit_obj, coef = "pheno_bin", number = Inf, p.value = 1, adjust.method = "BH") %>%
+    tibble::rownames_to_column("CpG_ID")
+  all_results[[ph_tag]] <- tt
+}
+if (length(all_results) == 0) {
+  stop("No EWAS results found.")
+}
+
+###############################################################################
+##  3. LOAD/BUILD ANNOTATION MAP
+###############################################################################
+anno <- get_epic_annotation()
+probe2gene <- NULL
+if (!is.null(anno)) {
+  gn <- as.character(anno$UCSC_RefGene_Name)
+  gn <- sub(";.*$", "", gn)
+  names(gn) <- as.character(anno$Name)
+  probe2gene <- gn
+}
+
+###############################################################################
+##  4. MAIN LOOP TO GENERATE TABLES FOR EACH PHENOTYPE
+###############################################################################
+for (primary_phenotype in phenotypes) {
+
+  if (!primary_phenotype %in% names(all_results)) next
+  
+  msg(glue::glue("--- Generating tables for '{primary_phenotype}' ---"))
+  primary_results <- all_results[[primary_phenotype]]
+
+  # --- A. Generate and save the full data file with beta values ---
+  
+  # Get CpGs that are in both the EWAS results and the main beta matrix
+  common_cpgs <- intersect(primary_results$CpG_ID, rownames(beta_comb_ordered))
+  
+  # Prepare the parts: stats, genes, and beta values
+  stats_part <- primary_results %>% filter(CpG_ID %in% common_cpgs)
+  gene_part  <- tibble(CpG_ID = common_cpgs, Gene = unname(probe2gene[common_cpgs]))
+  beta_part  <- as.data.frame(beta_comb_ordered[common_cpgs, ]) %>% rownames_to_column("CpG_ID")
+  
+  # Join everything together
+  full_data_table <- stats_part %>%
+    left_join(gene_part, by = "CpG_ID") %>%
+    left_join(beta_part, by = "CpG_ID") %>%
+    # Reorder columns for clarity
+    dplyr::select(CpG_ID, Gene, logFC, P.Value, adj.P.Val, everything())
+    
+  # Write out the full table
+  out_full <- file.path(output_dir, glue::glue("Full_EWAS_Results_with_Betas_{primary_phenotype}.csv"))
+  readr::write_csv(full_data_table, out_full)
+  msg(glue::glue("✓ Saved full data: {basename(out_full)}"))
+
+  # --- B. Generate and save the Top N summary tables (original functionality) ---
+  
+  top_hyper_ids <- primary_results %>%
+    filter(is.finite(P.Value), logFC > 0) %>% arrange(P.Value) %>% slice_head(n = top_n) %>% pull(CpG_ID)
+  summary_table_hyper <- primary_results %>%
+    filter(CpG_ID %in% top_hyper_ids) %>% arrange(P.Value) %>% dplyr::select(CpG_ID, logFC, P.Value, adj.P.Val) %>%
+    rename_with(~ glue("{.}_{primary_phenotype}"), .cols = -CpG_ID)
+
+  top_hypo_ids <- primary_results %>%
+    filter(is.finite(P.Value), logFC < 0) %>% arrange(P.Value) %>% slice_head(n = top_n) %>% pull(CpG_ID)
+  summary_table_hypo <- primary_results %>%
+    filter(CpG_ID %in% top_hypo_ids) %>% arrange(P.Value) %>% dplyr::select(CpG_ID, logFC, P.Value, adj.P.Val) %>%
+    rename_with(~ glue("{.}_{primary_phenotype}"), .cols = -CpG_ID)
+
+  # Add Gene column
+  if (!is.null(probe2gene)) {
+    summary_table_hyper <- summary_table_hyper %>% mutate(Gene = unname(probe2gene[CpG_ID]), .after = CpG_ID)
+    summary_table_hypo  <- summary_table_hypo  %>% mutate(Gene = unname(probe2gene[CpG_ID]), .after = CpG_ID)
+  }
+  
+  # Write out Top N tables
+  out_hyper <- file.path(output_dir, glue("Top{top_n}_DMPs_Summary_from_{primary_phenotype}_hyper.csv"))
+  out_hypo  <- file.path(output_dir, glue("Top{top_n}_DMPs_Summary_from_{primary_phenotype}_hypo.csv"))
+  readr::write_csv(summary_table_hyper, out_hyper)
+  readr::write_csv(summary_table_hypo,  out_hypo)
+  msg(glue("✓ Saved Top {top_n} summary: {basename(out_hyper)}"))
+  msg(glue("✓ Saved Top {top_n} summary: {basename(out_hypo)}"))
+}
+
+msg("\n✅ All summary tables created successfully.")
+```
+
+
+
+
+Obtaining information from the results
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+## ---- central results root ---------------------------------------------------
+results_root  <- "/Users/adiallo/Desktop/Thesis/Results"
+annot_out_dir <- file.path(results_root, "annotations")
+dir.create(annot_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+first_symbol <- function(x) sub(";.*$", "", ifelse(is.na(x), "", x))
+
+## ---- robust saver -----------------------------------------------------------
+.save_table <- function(df, out_path) {
+  dir.create(dirname(out_path), showWarnings = FALSE, recursive = TRUE)
+  readr::write_csv(df, out_path)
+  info <- file.info(out_path)
+  message(sprintf("✓ Wrote %s  (rows=%d, cols=%d, size=%.1f KB)",
+                  out_path, nrow(df), ncol(df), info$size/1024))
+  invisible(out_path)
+}
+
+## ---- annotate a vector of CpGs ---------------------------------------------
+annotate_cpg_vector <- function(cpg_ids) {
+  stopifnot(length(cpg_ids) > 0)
+
+  # Pull annotation and coerce to data.frame
+  anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  adf  <- as.data.frame(anno, stringsAsFactors = FALSE)
+
+  # Determine which column holds probe IDs, or promote rownames
+  idcol <- NULL
+  for (cand in c("Name", "IlmnID", "ID", "TargetID")) {
+    if (cand %in% names(adf)) { idcol <- cand; break }
+  }
+  if (is.null(idcol)) {
+    # Fall back to rownames
+    if (!is.null(rownames(adf)) && length(rownames(adf)) && nzchar(rownames(adf)[1])) {
+      adf <- tibble::rownames_to_column(adf, var = "ProbeID")
+      idcol <- "ProbeID"
+    } else {
+      stop("Could not locate a probe ID column (Name/IlmnID/ID/TargetID) or rownames in EPIC annotation.")
+    }
+  }
+
+  # Columns we’d like if present
+  desired_cols <- c(
+    idcol, "chr","pos","Strand",
+    "UCSC_RefGene_Name","UCSC_RefGene_Group",
+    "Relation_to_Island","Island_Name",
+    "Regulatory_Feature_Group","Enhancer",
+    "OpenSea","N_Shore","S_Shore","N_Shelf","S_Shelf",
+    "Probe_SNPs","Probe_SNPs.10","SNP_ID","SNP_DISTANCE","SNP_MINOR_ALLELE_FREQUENCY"
+  )
+  keep_cols <- intersect(desired_cols, names(adf))
+
+  ann_tidy <- adf[, keep_cols, drop = FALSE] %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(CpG_ID = .data[[idcol]])
+
+  # Ensure optional fields exist to avoid mutate errors
+  if (!"UCSC_RefGene_Name"  %in% names(ann_tidy)) ann_tidy$UCSC_RefGene_Name  <- NA_character_
+  if (!"UCSC_RefGene_Group" %in% names(ann_tidy)) ann_tidy$UCSC_RefGene_Group <- NA_character_
+
+  # Add gene columns, arrange columns
+  ann_tidy <- ann_tidy %>%
+    dplyr::mutate(
+      Gene_All   = .data$UCSC_RefGene_Name,
+      Gene       = sub(";.*$", "", ifelse(is.na(.data$Gene_All), "", .data$Gene_All)),
+      Gene_Group = .data$UCSC_RefGene_Group
+    ) %>%
+    dplyr::relocate(dplyr::any_of(c("CpG_ID","chr","pos","Strand","Gene","Gene_All","Gene_Group")), .before = 1) %>%
+    dplyr::select(-dplyr::all_of(idcol)) %>%   # drop the original id column (now have CpG_ID)
+    dplyr::relocate(CpG_ID, .before = 1)
+
+  # Preserve input order; flag missing
+  idx <- match(cpg_ids, ann_tidy$CpG_ID)
+  out <- ann_tidy[idx, , drop = FALSE]
+  out[["__found"]] <- !is.na(idx)
+  out
+}
+## ---- annotate a CSV on disk -------------------------------------------------
+annotate_cpg_csv <- function(in_csv,
+                             cpg_col = NULL,
+                             out_csv = NULL) {
+
+  df <- readr::read_csv(in_csv, show_col_types = FALSE)
+
+  # infer CpG column if not provided
+  if (is.null(cpg_col)) {
+    candidates <- intersect(c("CpG_ID","CpG","Probe_ID","cgid","ID","Name"), names(df))
+    if (!length(candidates)) {
+      cg_cols <- names(df)[vapply(df, function(x) any(grepl("^cg\\d+$", as.character(x))), logical(1))]
+      if (length(cg_cols)) candidates <- cg_cols[1]
+    }
+    if (!length(candidates)) stop("Could not infer the CpG column; set cpg_col.")
+    cpg_col <- candidates[1]
+  }
+
+  # default output path under Results/annotations with suffix
+  if (is.null(out_csv)) {
+    base <- sub("\\.csv$", "", basename(in_csv))
+    out_csv <- file.path(annot_out_dir, paste0(base, "_ANNOTATED.csv"))
+  } else {
+    # if user passed a directory, write inside it using input basename
+    if (dir.exists(out_csv)) {
+      base <- sub("\\.csv$", "", basename(in_csv))
+      out_csv <- file.path(out_csv, paste0(base, "_ANNOTATED.csv"))
+    } else {
+      dir.create(dirname(out_csv), showWarnings = FALSE, recursive = TRUE)
+    }
+  }
+
+  # annotate and join
+  cpgs <- df[[cpg_col]] |> as.character() |> unique()
+  ann  <- annotate_cpg_vector(cpgs)
+
+  res <- df %>%
+    left_join(dplyr::select(ann, -Gene_All), by = setNames("CpG_ID", cpg_col))
+
+  .save_table(res, out_csv)
+
+  # quick heads-up for any misses
+  missing <- ann %>% dplyr::filter(!`__found`) %>% dplyr::pull(CpG_ID)
+  if (length(missing)) {
+    message(length(missing), " CpG IDs not found in EPIC anno (hg19). Example: ",
+            paste(utils::head(missing, 5), collapse = ", "), " …")
+  }
+  invisible(res)
+}
+
+## ---- CALL THE ANNOTATOR ON ONE FILE & VERIFY -------------------------------
+# Pick one of your summary CSVs (change this to whichever you want to annotate)
+in_csv  <- "/Users/adiallo/Desktop/Thesis/Results/results_summary/Top100_DMPs_Summary_from_ln_hyper.csv"
+
+# Choose an explicit output path (so there’s no ambiguity)
+out_csv <- "/Users/adiallo/Desktop/Thesis/Results/annotations/Top100_DMPs_Summary_from_ln_hyper_ANNOTATED.csv"
+
+# Make sure the output directory exists
+dir.create(dirname(out_csv), showWarnings = FALSE, recursive = TRUE)
+
+# Call the function (this writes to disk internally via .save_table)
+res <- annotate_cpg_csv(in_csv, cpg_col = "CpG_ID", out_csv = out_csv)
+
+# Double-check that the file now exists (and report size)
+if (file.exists(out_csv)) {
+  info <- file.info(out_csv)
+  message(sprintf("✅ Wrote file: %s (rows=%d, cols=%d, size=%.1f KB)",
+                  out_csv, nrow(res), ncol(res), info$size/1024))
+} else {
+  stop("❌ Expected output not found at: ", out_csv,
+       "\nCheck that `in_csv` path is correct and the function ran without errors.")
+}
+```
+
+Genomic Regions plot for figure
+```{r}
+## ── SETUP: Load Libraries ─────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(limma)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(annotatr)
+  library(GenomicRanges)
+  library(purrr)
+  library(cowplot)    # get_legend, ggdraw
+  library(glue)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+## ── 0) PATHS ──────────────────────────────────────────────────────────────────
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+plot_dir     <- file.path(results_root, "plots", "location_mix")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+## ── 1) SETTINGS AND CUSTOM COLORS ─────────────────────────────────────────────
+phenotypes_to_run <- c(
+  "Any Mets" = "any",
+  "LN Only"  = "ln",
+  "Distant"  = "dist"
+)
+p_value_cutoff <- 0.001
+location_colors <- c(
+  "CGI"       = "#E3777A",
+  "CGI Shore" = "#B3E7FF",
+  "CGI Shelf" = "#F08F00",
+  "Promoter"  = "#B4A0C9",
+  "Open Sea"  = "#768692"
+)
+
+## ── 2) HELPER FUNCTION TO RUN ANALYSIS PER PHENOTYPE ─────────────────────────
+analyze_phenotype <- function(pheno_long_name, pheno_short_name) {
+  message("\nProcessing: ", pheno_long_name)
+  fit_file <- file.path(glue("results_ewas_{pheno_short_name}"), "H6", "ewas_fits.rds")
+  if (!file.exists(file.path(results_root, fit_file))) {
+    warning("Fit file not found for ", pheno_long_name, " at ", file.path(results_root, fit_file))
+    return(NULL)
+  }
+  fits      <- readRDS(file.path(results_root, fit_file))
+  fit_model <- fits$Tier3
+  if (!inherits(fit_model, "MArrayLM")) fit_model <- fit_model$fit
+
+  dmp_results <- topTable(fit_model, coef = "pheno_bin", number = Inf)
+  top_hits <- dmp_results %>%
+    filter(P.Value < p_value_cutoff) %>%
+    tibble::rownames_to_column("CpG_ID")
+
+  if (nrow(top_hits) == 0) {
+    warning("No hits found for ", pheno_long_name, " at p < ", p_value_cutoff)
+    return(NULL)
+  }
+
+  sites_to_annotate_df <- locations_df %>% filter(CpG_ID %in% top_hits$CpG_ID)
+  sites_to_annotate_gr <- makeGRangesFromDataFrame(sites_to_annotate_df, keep.extra.columns = TRUE)
+
+  annotated_regions <- annotate_regions(
+    regions      = sites_to_annotate_gr,
+    annotations  = annotations,
+    ignore.strand= TRUE,
+    quiet        = TRUE
+  )
+
+  as.data.frame(annotated_regions) %>%
+    left_join(dplyr::select(top_hits, CpG_ID, logFC), by = "CpG_ID") %>%
+    mutate(
+      Phenotype = pheno_long_name,
+      Status    = ifelse(logFC > 0, "Hypermethylated", "Hypomethylated")
+    )
+}
+
+## ── 3) RUN THE FULL ANALYSIS FOR ALL PHENOTYPES ──────────────────────────────
+message("Building annotation database…")
+annots <- c('hg19_cpgs', 'hg19_cpgshores', 'hg19_cpgshelves', 'hg19_genes_promoters')
+annotations <- build_annotations(genome = 'hg19', annotations = annots)
+
+message("Loading array locations…")
+array_locations <- getLocations(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+locations_df <- as.data.frame(array_locations) %>%
+  tibble::rownames_to_column("CpG_ID") %>%
+  dplyr::select(CpG_ID, chr = seqnames, start, end) %>%
+  distinct(CpG_ID, .keep_all = TRUE)
+
+all_annotated_hits <- map2_dfr(
+  names(phenotypes_to_run),
+  phenotypes_to_run,
+  analyze_phenotype
+)
+
+## ── 3b) BACKGROUND “ALL CpGs” CONTROL BAR ────────────────────────────────────
+build_background_control <- function(phenotypes_to_run, locations_df, annotations) {
+  first_pheno_tag <- unname(phenotypes_to_run[1])  # e.g., "any"
+  fit_file <- file.path(results_root, glue("results_ewas_{first_pheno_tag}"), "H6", "ewas_fits.rds")
+  if (!file.exists(fit_file)) stop("Fit file not found at: ", fit_file)
+  fits <- readRDS(fit_file)
+  fit3 <- fits$Tier3; if (!inherits(fit3, "MArrayLM")) fit3 <- fit3$fit
+
+  cpg_universe <- rownames(fit3$coefficients)
+  if (!length(cpg_universe)) stop("Empty CpG universe from Tier3 coefficients.")
+
+  bg_df <- locations_df %>% filter(CpG_ID %in% cpg_universe) %>% distinct(CpG_ID, .keep_all = TRUE)
+  if (!nrow(bg_df)) stop("No CpG coordinates matched the CpG universe.")
+
+  bg_gr <- makeGRangesFromDataFrame(bg_df, keep.extra.columns = TRUE)
+  bg_annot <- annotate_regions(bg_gr, annotations, ignore.strand = TRUE, quiet = TRUE) %>% as.data.frame()
+
+  bg_base <- bg_annot %>% transmute(Phenotype = "All CpGs", Status = NA_character_, annot.type)
+  bind_rows(
+    mutate(bg_base, Status = "Hypermethylated"),
+    mutate(bg_base, Status = "Hypomethylated")
+  )
+}
+background_bar <- build_background_control(phenotypes_to_run, locations_df, annotations)
+
+## ── 4) PLOTTING HELPER (Helvetica, 300 dpi PDF) ──────────────────────────────
+create_summary_plot <- function(data, plot_status, colors, background_df) {
+  plot_data <- bind_rows(data, background_df) %>%
+    filter(Status == plot_status) %>%
+    mutate(
+      Location = case_when(
+        grepl("islands",   annot.type, ignore.case = TRUE) ~ "CGI",
+        grepl("shores",    annot.type, ignore.case = TRUE) ~ "CGI Shore",
+        grepl("shelves",   annot.type, ignore.case = TRUE) ~ "CGI Shelf",
+        grepl("promoters", annot.type, ignore.case = TRUE) ~ "Promoter",
+        TRUE                                               ~ "Open Sea"
+      ),
+      Location = factor(Location, levels = names(colors)),
+      Phenotype = factor(Phenotype, levels = c("All CpGs", names(phenotypes_to_run)))
+    )
+
+  if (!nrow(plot_data)) {
+    return(ggplot() +
+             labs(title = plot_status, subtitle = "No significant sites found") +
+             theme_void(base_family = "Helvetica"))
+  }
+
+  ggplot(plot_data, aes(x = Phenotype, fill = Location)) +
+    geom_bar(position = "fill", width = 0.8, stat = "count") +
+    scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+    scale_fill_manual(values = colors, name = "Genomic Location") +
+    scale_x_discrete(expand = expansion(mult = 0.1)) +
+    labs(x = NULL, y = NULL) +
+    theme_classic(base_size = 14, base_family = "Helvetica") +
+    theme(
+      legend.position = "right",
+      axis.text.x     = element_text(angle = 45, hjust = 1),
+      plot.background = element_blank(),
+      panel.background= element_blank()
+    )
+}
+
+## ── 5) BUILD PLOTS, EXTRACT LEGEND, SAVE ─────────────────────────────────────
+plot_hyper_with_legend <- create_summary_plot(all_annotated_hits, "Hypermethylated", location_colors, background_bar)
+plot_hypo_with_legend  <- create_summary_plot(all_annotated_hits, "Hypomethylated",  location_colors, background_bar)
+
+# Extract legend as a gtable and wrap for ggsave
+shared_legend_gt <- cowplot::get_legend(plot_hyper_with_legend)
+legend_plot      <- cowplot::ggdraw(shared_legend_gt)
+
+# Drop legends for the main panels
+plot_hyper <- plot_hyper_with_legend + theme(legend.position = "none")
+plot_hypo  <- plot_hypo_with_legend  + theme(legend.position = "none")
+
+# Save PDFs (Helvetica, cairo, 300 dpi)
+ggsave(file.path(plot_dir, "hypermethylated_plot.pdf"),
+       plot = plot_hyper, device = cairo_pdf, width = 4, height = 4, dpi = 300)
+ggsave(file.path(plot_dir, "hypomethylated_plot.pdf"),
+       plot = plot_hypo,  device = cairo_pdf, width = 4, height = 4, dpi = 300)
+ggsave(file.path(plot_dir, "plot_legend.pdf"),
+       plot = legend_plot, device = cairo_pdf, width = 4, height = 2, dpi = 300)
+
+# Optional on-screen preview
+# print(plot_hyper); print(plot_hypo); print(legend_plot)
 ```
 
 ```{r}
-###############################################################################
-#  heatmap_integrated_analysis_final.R · 2025-07-19
-#  – Integrate EPIC-v1, EPIC-v2 and 450 k (TCGA) methylation arrays
-#  – Batch-correct, run limma, draw heat-maps of top hyper / hypo CpGs
-###############################################################################
+# FINAL SCRIPT WITH DEBUGGING in the plotting function.
+# Please run this and share the console output.
 
-## ---------------- USER SETTINGS ------------------------------------------ ##
-path_my_epic_v1       <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
-path_my_epic_v2       <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
-path_my_meta          <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
-
-path_tcga_normal_idats <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/TCGA/normal_idats"
-path_tcga_normal_meta  <- file.path(path_tcga_normal_idats, "tcga_normal_metadata.csv")
-
-ewas_phenotype <- "any"                                 # any / ln / dist
-phenotype_map  <- c(any = "any_mets", ln = "ln_only", dist = "distant")
-
-output_dir <- "results_heatmap_integrated_analysis"
-dir.create(output_dir, showWarnings = FALSE)
-
-## ---------------- SET-UP -------------------------------------------------- ##
-msg <- \(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
-
+## ── SETUP: Load Libraries ─────────────────────────────────────────────────────
 suppressPackageStartupMessages({
-  library(minfi); library(limma); library(sva); library(pheatmap)
-  library(dplyr); library(readr); library(glue); library(tibble)
+  library(limma); library(dplyr); library(ggplot2); library(patchwork)
+  library(annotatr); library(GenomicRanges); library(purrr)
+  library(cowplot); library(glue); library(forcats)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 })
 
+## ── 0) PATHS ──────────────────────────────────────────────────────────────────
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+plot_dir     <- file.path(results_root, "plots", "location_summary_debug") # New folder for debug output
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+## ── 1) SETTINGS AND CUSTOM COLORS ─────────────────────────────────────────────
+phenotypes_to_run <- c("Any Mets" = "any", "LN Only"  = "ln", "Distant"  = "dist")
+p_value_cutoff <- 0.001
+location_colors <- c(
+  "CGI"         = "#E3777A", "CGI Shore"   = "#B3E7FF", "CGI Shelf"   = "#F08F00",
+  "Promoter"    = "#B4A0C9", "Open Sea"    = "#768692"
+)
+location_categories <- c("CGI", "CGI Shore", "CGI Shelf", "Promoter", "Open Sea")
+
+## ── 2) ANALYSIS FUNCTIONS ─────────────────────────────────────────────────────
+# ... (analyze_phenotype and run_enrichment_test are unchanged) ...
+map_to_location <- function(df) {
+  df %>%
+    dplyr::mutate(Location = case_when(
+      grepl("islands", annot.type, ignore.case = TRUE)   ~ "CGI",
+      grepl("shores",  annot.type, ignore.case = TRUE)   ~ "CGI Shore",
+      grepl("shelves", annot.type, ignore.case = TRUE)   ~ "CGI Shelf",
+      grepl("promoters", annot.type, ignore.case = TRUE) ~ "Promoter",
+      TRUE ~ "Open Sea"
+    )) %>%
+    dplyr::mutate(Location = factor(Location, levels = location_categories))
+}
+analyze_phenotype <- function(pheno_long_name, pheno_short_name) {
+  message("\nProcessing: ", pheno_long_name)
+  fit_file <- file.path(results_root, glue("results_ewas_{pheno_short_name}"), "H6", "ewas_fits.rds")
+  if (!file.exists(fit_file)) return(NULL)
+  fits      <- readRDS(fit_file)
+  fit_model <- if (inherits(fits$Tier3, "MArrayLM")) fits$Tier3 else fits$Tier3$fit
+  dmp_results <- topTable(fit_model, coef = "pheno_bin", number = Inf)
+  top_hits <- dmp_results %>% dplyr::filter(P.Value < p_value_cutoff) %>% tibble::rownames_to_column("CpG_ID")
+  if (nrow(top_hits) == 0) return(NULL)
+  sites_df <- locations_df %>% dplyr::filter(CpG_ID %in% top_hits$CpG_ID)
+  sites_gr <- makeGRangesFromDataFrame(sites_df, keep.extra.columns = TRUE)
+  annotated <- annotate_regions(sites_gr, annotations, ignore.strand = TRUE, quiet = TRUE)
+  as.data.frame(annotated) %>%
+    map_to_location() %>%
+    dplyr::left_join(top_hits, by = "CpG_ID") %>%
+    dplyr::mutate(Phenotype = pheno_long_name, Status = ifelse(logFC > 0, "Hypermethylated", "Hypomethylated"))
+}
+run_enrichment_test <- function(dmp_df, background_df) {
+  background_props <- background_df %>%
+    dplyr::count(Location) %>%
+    dplyr::mutate(prop = n / sum(n))
+  dmp_df %>%
+    dplyr::group_by(Phenotype, Status) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(test_result = map(data, function(subset_df) {
+      observed_counts <- subset_df %>%
+        dplyr::count(Location) %>%
+        dplyr::right_join(tibble(Location = location_categories), by = "Location") %>%
+        dplyr::mutate(n = ifelse(is.na(n), 0, n)) %>%
+        dplyr::arrange(factor(Location, levels = location_categories)) %>%
+        dplyr::pull(n)
+      test <- chisq.test(x = observed_counts, p = background_props$prop, simulate.p.value = FALSE)
+      tibble(P = test$p.value)
+    })) %>%
+    dplyr::select(Phenotype, Status, test_result) %>%
+    tidyr::unnest(test_result)
+}
+
+################################################################################
+### --- DEBUGGING VERSION of create_summary_plot_with_stats --- ###
+################################################################################
+create_summary_plot_with_stats <- function(data, plot_status, colors, background_df, stats_df) {
+  
+  message(glue("\n--- Debugging plot for Status: {plot_status} ---"))
+  
+  plot_data <- bind_rows(data, background_df) %>%
+    dplyr::filter(Status == plot_status | Phenotype == "All CpGs") %>%
+    dplyr::mutate(Phenotype = factor(Phenotype, levels = c("All CpGs", names(phenotypes_to_run))))
+
+  message("1. Head of the full stats table ('stats_df') passed to this function:")
+  print(head(stats_df))
+  
+  # Filter to the current status (e.g., "Hypermethylated")
+  stats_for_status <- stats_df %>%
+    dplyr::filter(Status == plot_status)
+    
+  message(glue("2. Filtered stats table to just '{plot_status}' (found {nrow(stats_for_status)} rows):"))
+  print(stats_for_status)
+
+  # Now, filter by P-value
+  stars_to_add <- stats_for_status %>%
+    dplyr::filter(P < 0.05)
+    
+  message(glue("3. Filtered for P < 0.05 (found {nrow(stars_to_add)} rows to plot):"))
+  print(stars_to_add)
+
+  # The rest of the function continues...
+  if (nrow(stars_to_add) > 0) {
+    stars_to_add <- stars_to_add %>%
+      dplyr::mutate(
+        stars = case_when(P < 0.001 ~ "***",
+                          P < 0.01  ~ "**",
+                          TRUE      ~ "*"),
+        Phenotype = factor(Phenotype, levels = c("All CpGs", names(phenotypes_to_run))),
+        y = 1.05
+      )
+  }
+
+  p <- ggplot(plot_data, aes(x = Phenotype, fill = Location)) +
+    geom_bar(position = "fill", stat = "count", width = 0.8) +
+    scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+    scale_fill_manual(values = colors, name = "Genomic Location") +
+    labs(x = NULL, y = NULL, title = plot_status) +
+    theme_classic(base_size = 14, base_family = "Helvetica") +
+    theme(legend.position = "right", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  if (nrow(stars_to_add) > 0) {
+    p <- p + geom_text(
+      data = stars_to_add,
+      aes(x = Phenotype, y = y, label = stars),
+      inherit.aes = FALSE,
+      size = 8, vjust = 0
+    )
+  }
+  return(p)
+}
+
+
+## ── 3) RUN PIPELINE ──────────────────────────────────────────────────────────
+message("Building annotation database…")
+annotations <- build_annotations("hg19", c("hg19_cpgs", "hg19_cpgshores", "hg19_cpgshelves", "hg19_genes_promoters"))
+message("Loading array locations…")
+locations_df <- getLocations(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>%
+  as.data.frame() %>% tibble::rownames_to_column("CpG_ID") %>%
+  dplyr::select(CpG_ID, chr = seqnames, start, end) %>% distinct(CpG_ID, .keep_all = TRUE)
+
+all_annotated_hits <- map2_dfr(names(phenotypes_to_run), phenotypes_to_run, analyze_phenotype)
+background_mapped <- annotate_regions(makeGRangesFromDataFrame(locations_df), annotations, ignore.strand=TRUE, quiet=TRUE) %>%
+  as.data.frame() %>% map_to_location()
+
+enrichment_stats <- run_enrichment_test(all_annotated_hits, background_mapped)
+write.csv(enrichment_stats, file.path(plot_dir, "enrichment_stats_chisq_simulated_debug.csv"), row.names = FALSE)
+
+## ── 4) PLOTS & SAVE ──────────────────────────────────────────────────────────
+background_for_plot <- background_mapped %>%
+  transmute(Phenotype = "All CpGs", Status = NA_character_, Location) %>%
+  bind_rows(mutate(., Status = "Hypermethylated"), mutate(., Status = "Hypomethylated"))
+
+plot_hyper <- create_summary_plot_with_stats(all_annotated_hits, "Hypermethylated", location_colors, background_for_plot, enrichment_stats)
+plot_hypo  <- create_summary_plot_with_stats(all_annotated_hits, "Hypomethylated", location_colors, background_for_plot, enrichment_stats)
+legend     <- cowplot::get_legend(plot_hyper)
+plot_hyper_nolegend <- plot_hyper + theme(legend.position = "none")
+plot_hypo_nolegend  <- plot_hypo  + theme(legend.position = "none")
+
+ggsave(file.path(plot_dir, "hypermethylated_plot_debug.pdf"), plot_hyper_nolegend, device = cairo_pdf, width = 4.5, height = 4.5, dpi = 300)
+ggsave(file.path(plot_dir, "hypomethylated_plot_debug.pdf"), plot_hypo_nolegend,  device = cairo_pdf, width = 4.5, height = 4.5, dpi = 300)
+ggsave(file.path(plot_dir, "plot_legend.pdf"), cowplot::ggdraw(legend), device = cairo_pdf, width = 4, height = 2, dpi = 300)
+```
+
+
+
+Clustering + Use this UMAP for the paper
+```{r}
 ###############################################################################
-## 1. LOAD  →  PREPROCESS (Noob)  →  MERGE β-MATRICES                       ##
+# CpG-level PCA & UMAP (points = CpGs), colored by metastasis group with
+# highest mean methylation across samples.
+#
+# This version is robust to missing M_all / CpG column naming, and will:
+#   - Create M_all from M_cb / M.mat / cached betas if needed
+#   - Derive MetastasisStatus in meta_f if missing
+#   - Accept tt with CpG IDs in either a 'CpG'/'CpG_ID' column or rownames
+# Outputs: PDFs @ 300 dpi to .../Results/cpg_embeddings
 ###############################################################################
-msg("Loading IDATs…")
 
-## EPIC-v1 --------------------------------------------------------------------
-rg_epic_v1 <- read.metharray(
-  basenames = unique(sub("_Grn.idat|_Red.idat", "",
-                         list.files(path_my_epic_v1, full.names = TRUE,
-                                    pattern = "idat$"))),
-  force = TRUE)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(tibble)
+  library(matrixStats)
+  library(uwot)
+})
 
-## EPIC-v2  → tag as v1 so .isEPIC() passes ----------------------------------
-rg_epic_v2 <- read.metharray(
-  basenames = unique(sub("_Grn.idat|_Red.idat", "",
-                         list.files(path_my_epic_v2, full.names = TRUE,
-                                    pattern = "idat$"))),
-  force = TRUE)
-annotation(rg_epic_v2)[["array"]]      <- "IlluminaHumanMethylationEPIC"
-annotation(rg_epic_v2)[["annotation"]] <- "ilm10b4.hg38"
-msg("EPIC-v2 object re-tagged as EPIC-v1 (v2-specific probes will drop).")
+set.seed(12345)
 
-## Merge the two EPIC batches -------------------------------------------------
-rg_my_study <- combineArrays(rg_epic_v1, rg_epic_v2,
-                             outType = "IlluminaHumanMethylationEPIC")
-msg("EPIC v1+v2 merged.")
+## -------- central output root ----------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "cpg_embeddings")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-## TCGA 450 k -----------------------------------------------------------------
-rg_tcga <- read.metharray(
-  basenames = unique(sub("_Grn.idat|_Red.idat", "",
-                         list.files(path_tcga_normal_idats, full.names = TRUE,
-                                    pattern = "idat$"))),
-  force = TRUE)
-colnames(rg_tcga) <- sub("_.*", "", colnames(rg_tcga))
+## -------- 0) Ensure M_all + meta_f exist & align ---------------------------
+# Try to construct M_all if it's not already in the session
+if (!exists("M_all")) {
+  message("[init] M_all not found; attempting to construct it…")
+  if (exists("M_cb")) {
+    message("  -> using M_cb")
+    M_all <- M_cb
+  } else if (exists("M.mat")) {
+    message("  -> using M.mat")
+    M_all <- M.mat
+  } else {
+    cache_betas <- file.path(results_root, "results_ewas_cache", "beta_comb_qc.rds")
+    if (file.exists(cache_betas)) {
+      message("  -> computing M from cached betas: ", cache_betas)
+      beta_tmp <- readRDS(cache_betas)
+      # log2( β/(1-β) ), with eps for stability
+      eps <- 1e-6
+      M_all <- log2(pmax(beta_tmp, eps) / pmax(1 - beta_tmp, eps))
+      rm(beta_tmp)
+    } else {
+      stop("M_all is missing and no M_cb/M.mat/cached betas found at:\n  ",
+           cache_betas, "\nPlease load one of these and re-run.")
+    }
+  }
+}
+stopifnot(is.matrix(M_all), nrow(M_all) > 0, ncol(M_all) > 0)
 
-## Preprocess with Noob -------------------------------------------------------
-msg("Running preprocessNoob()…")
-beta_my   <- getBeta(preprocessNoob(rg_my_study))
-beta_tcga <- getBeta(preprocessNoob(rg_tcga))
+if (!exists("meta_f")) stop("meta_f is not in the session; load your metadata with SampleID + metastasis flags.")
+stopifnot("SampleID" %in% colnames(meta_f))
 
-## Intersect probes & bind columns -------------------------------------------
-common_probes <- intersect(rownames(beta_my), rownames(beta_tcga))
-beta_combined <- cbind(beta_my  [common_probes, ],
-                       beta_tcga[common_probes, ])
-msg(glue("β-matrix: {length(common_probes)} probes × {ncol(beta_combined)} samples."))
+## -------- 1) Configure CpG selection ---------------------------------------
+p_cutoff     <- 0.05
+max_sig_cpgs <- 5000
+top_var_k    <- 5000
 
-###############################################################################
-## 2. BUILD METADATA  &  COMBAT                                              ##
-###############################################################################
-phenotype_col <- phenotype_map[[ewas_phenotype]]
+## -------- 2) Ensure metastasis labels exist --------------------------------
+if (!"MetastasisStatus" %in% colnames(meta_f)) {
+  guess_cols <- c("any_mets","distant","ln_only")
+  if (!all(guess_cols %in% colnames(meta_f))) {
+    stop("meta_f lacks MetastasisStatus and I cannot find columns any_mets/distant/ln_only to derive it.")
+  }
+  meta_f <- meta_f %>%
+    mutate(
+      MetastasisStatus = case_when(
+        distant == 1 ~ "Distant",
+        ln_only == 1 ~ "Lymph_Node",
+        any_mets == 0 ~ "No_Mets",
+        TRUE ~ NA_character_
+      )
+    )
+}
+meta_f$MetastasisStatus <- factor(meta_f$MetastasisStatus,
+                                  levels = c("No_Mets","Lymph_Node","Distant"))
 
-meta_my_study <- read_csv(path_my_meta, show_col_types = FALSE) %>%
-  mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
-         Group    = if_else(.data[[phenotype_col]] == 1,
-                            "Metastasis", "No_Metastasis"),
-         Batch    = "My_Study") %>%
-  select(SampleID, Group, Batch)
+# Align metadata to matrix columns (intersection only)
+common_samples <- intersect(meta_f$SampleID, colnames(M_all))
+if (length(common_samples) == 0) {
+  stop("No overlap between meta_f$SampleID and colnames(M_all). Check naming.")
+}
+meta_f <- meta_f[match(common_samples, meta_f$SampleID), , drop = FALSE]
+M_all  <- M_all[, common_samples, drop = FALSE]
 
-meta_tcga <- read_csv(path_tcga_normal_meta, show_col_types = FALSE) %>%
-  rename(SampleID = geo_accession) %>%
-  mutate(Group = "TCGA_Normal", Batch = "TCGA") %>%
-  select(SampleID, Group, Batch)
+## -------- 3) Select CpG sets -----------------------------------------------
+## -------- 3) Select CpG sets (robust CpG ID detection) ----------------------
+tt_df <- as.data.frame(tt, stringsAsFactors = FALSE)
 
-meta_combined_full <- bind_rows(meta_my_study, meta_tcga)
+# Try to promote rownames if they look like cg IDs (even partially)
+rn <- rownames(tt_df)
+looks_like_cg <- !is.null(rn) && any(grepl("^cg\\d+$", rn))
 
-keep_samples <- intersect(colnames(beta_combined), meta_combined_full$SampleID)
-beta_final   <- beta_combined[, keep_samples]
-meta_final   <- meta_combined_full %>%
-                filter(SampleID %in% keep_samples) %>%
-                slice(match(colnames(beta_final), SampleID))
-
-## β → M-values ---------------------------------------------------------------
-epsilon        <- 1e-6
-beta_squeezed  <- pmax(pmin(beta_final, 1 - epsilon), epsilon)
-m_val_combined <- log2(beta_squeezed / (1 - beta_squeezed))
-
-## ComBat ---------------------------------------------------------------------
-batch_counts <- table(meta_final$Batch)
-if (length(batch_counts) > 1 && all(batch_counts > 1)) {
-  msg("Running ComBat()…")
-  m_val_corrected <- ComBat(m_val_combined,
-                            batch = meta_final$Batch,
-                            mod   = NULL)
+if (looks_like_cg) {
+  tt_df <- tibble::rownames_to_column(tt_df, var = "CpG")
+} else if ("CpG" %in% names(tt_df)) {
+  # already there
+} else if ("CpG_ID" %in% names(tt_df)) {
+  tt_df <- dplyr::rename(tt_df, CpG = CpG_ID)
+} else if ("Probe_ID" %in% names(tt_df)) {
+  tt_df <- dplyr::rename(tt_df, CpG = Probe_ID)
+} else if ("ID" %in% names(tt_df)) {
+  tt_df <- dplyr::rename(tt_df, CpG = ID)
 } else {
-  msg("Skipping ComBat (only one batch or singleton batch).")
-  m_val_corrected <- m_val_combined
+  stop(
+    paste0(
+      "Could not locate CpG IDs in 'tt'.\n",
+      "names(tt): ", paste(names(tt_df), collapse = ", "), "\n",
+      "head(rownames(tt)): ", paste(utils::head(rn %||% character(0)), collapse = ", "), "\n",
+      "Tip: ensure you built tt with limma::topTable(..., number = Inf) so CpG IDs stay in rownames."
+    )
+  )
 }
 
-###############################################################################
-## 3.  LIMMA DIFFERENTIAL METHYLATION                                       ##
-###############################################################################
-meta_final$Group <- factor(meta_final$Group,
-                           levels = c("No_Metastasis", "Metastasis", "TCGA_Normal"))
-
-design <- model.matrix(~ 0 + Group, meta_final)
-colnames(design) <- levels(meta_final$Group)
-
-fit <- lmFit(m_val_corrected, design)
-fit <- eBayes(contrasts.fit(fit,
-                            makeContrasts(Metastasis - No_Metastasis,
-                                          levels = design)))
-tt <- topTable(fit, coef = 1, number = Inf)
-
-###############################################################################
-## 3b.  VERIFY DIRECTION WITH GROUP-MEAN β VALUES                            ##
-###############################################################################
-beta_corrected <- 2^m_val_corrected / (1 + 2^m_val_corrected)
-
-mean_met  <- rowMeans(beta_corrected[ , meta_final$Group == "Metastasis"])
-mean_nom  <- rowMeans(beta_corrected[ , meta_final$Group == "No_Metastasis"])
-delta_beta <- mean_met - mean_nom                      # Met – NoMet
-
-tt$delta_beta <- delta_beta[rownames(tt)]              # add to table
-
-top_hyper <- tt %>%
-  filter(delta_beta > 0) %>%            # Metastasis genuinely HIGHER
-  arrange(adj.P.Val)  %>% head(100)
-
-top_hypo  <- tt %>%
-  filter(delta_beta < 0) %>%            # Metastasis genuinely LOWER
-  arrange(adj.P.Val)  %>% head(100)
-
-msg(glue("Top hyper CpGs: {nrow(top_hyper)}  ·  Top hypo CpGs: {nrow(top_hypo)}"))
-
-###############################################################################
-## 4.  HEAT-MAPS  (raw β, no scaling)                                       ##
-###############################################################################
-group_order <- c("Metastasis", "No_Metastasis", "TCGA_Normal")
-ann_colors  <- list(Group = c(Metastasis     = "#d73027",
-                              No_Metastasis = "#4575b4",
-                              TCGA_Normal    = "#1a9850"))
-
-## palette: blue 0  →  white 0.5  →  red 1
-breaks <- seq(0, 1, length.out = 101)
-palette <- colorRampPalette(c("#313695", "white", "#a50026"))(100)
-
-draw_heatmap <- function(cpg_ids, title, file_tag) {
-
-  mat <- beta_corrected[cpg_ids, ]
-  ord <- order(match(meta_final$Group, group_order))
-  mat <- mat[ , ord]
-
-  ann <- data.frame(Group = meta_final$Group,
-                    row.names = meta_final$SampleID)[ord, , drop = FALSE]
-
-  pheatmap(mat,
-           # color and breaks are removed to let pheatmap use its default for scaled data
-           annotation_col    = ann,
-           annotation_colors = ann_colors,
-           main              = title,
-           show_colnames     = FALSE,
-           cluster_rows      = TRUE,
-           cluster_cols      = FALSE,    # keep chosen order
-           scale             = "row",    # <-- THE KEY CHANGE
-           fontsize_row      = 6,
-           filename          = file.path(output_dir, file_tag),
-           width             = 12,
-           height            = 8)
-
-  msg(glue("✓ Heat-map saved → {file_tag}"))
+if (!("P.Value" %in% names(tt_df))) {
+  stop("Expected a P.Value column in tt/topTable output.")
 }
 
-draw_heatmap(rownames(top_hyper),
-             "Top Hyper-methylated CpGs  (Metastasis > No-Met)",
-             "heatmap_top_hyper_rawbeta.png")
+# Now select sets
+sig_cpgs <- tt_df %>%
+  dplyr::distinct(CpG, .keep_all = TRUE) %>%
+  dplyr::filter(P.Value < p_cutoff) %>%
+  dplyr::arrange(P.Value) %>%
+  dplyr::pull(CpG) %>%
+  intersect(rownames(M_all)) %>%
+  utils::head(max_sig_cpgs)
 
-draw_heatmap(rownames(top_hypo),
-             "Top Hypo-methylated CpGs  (Metastasis < No-Met)",
-             "heatmap_top_hypo_rawbeta.png")
+rv <- matrixStats::rowVars(M_all, na.rm = TRUE)
+top_var_cpgs <- names(sort(rv, decreasing = TRUE)) %>%
+  intersect(rownames(M_all)) %>%
+  utils::head(top_var_k)
 
-msg("✅ Raw-β hyper & hypo heat-maps created successfully.")
+message("=== Summary ===")
+message("Significant CpGs available: ", length(sig_cpgs))
+message("Top-variance CpGs available: ", length(top_var_cpgs))
+## -------- 4) Assign CpG to group with highest mean --------------------------
+assign_cpg_group <- function(M_sub, meta_df, group_col = "MetastasisStatus") {
+  grp_levels <- levels(meta_df[[group_col]])
+  stopifnot(!is.null(grp_levels))
+  split_idx <- split(seq_len(nrow(meta_df)), meta_df[[group_col]])
+
+  out <- vapply(seq_len(nrow(M_sub)), function(i) {
+    means <- vapply(
+      split_idx,
+      function(ix) if (length(ix)) mean(M_sub[i, ix], na.rm = TRUE) else NA_real_,
+      numeric(1)
+    )
+    means[is.na(means)] <- -Inf
+    grp <- names(means)[which.max(means)]
+    if (is.infinite(max(means))) NA_character_ else grp
+  }, FUN.VALUE = character(1))
+
+  factor(out, levels = grp_levels)
+}
+
+## -------- 5) UMAP runner ----------------------------------------------------
+run_umap <- function(X,
+                     n_neighbors = 15,
+                     min_dist = 0.3,
+                     metric = "cosine",
+                     pca = max(2, min(30, ncol(X) - 1)),
+                     repulsion_strength = 1,
+                     set_op_mix_ratio = 1,
+                     dens_scale = NULL,
+                     seed = 123) {
+  set.seed(seed)
+  uwot::umap(
+    X,
+    n_neighbors = n_neighbors,
+    min_dist    = min_dist,
+    metric      = metric,
+    pca         = pca,
+    repulsion_strength = repulsion_strength,
+    set_op_mix_ratio   = set_op_mix_ratio,
+    dens_scale  = dens_scale,
+    verbose     = FALSE
+  )
+}
+
+## -------- 6) Main worker: PCA+UMAP and save ---------------------------------
+run_cpg_embeddings <- function(cpg_ids, tag) {
+  cpg_ids <- intersect(cpg_ids, rownames(M_all))
+  if (length(cpg_ids) < 3) {
+    warning("Not enough CpGs in ", tag, " — skipping.")
+    return(invisible(NULL))
+  }
+
+  M_sub <- M_all[cpg_ids, , drop = FALSE]
+
+  # Z-score CpGs across samples
+  X <- t(scale(t(M_sub), center = TRUE, scale = TRUE))
+  X[!is.finite(X)] <- 0
+
+  # PCA (rows = CpGs / observations)
+  pca <- try(prcomp(X, center = FALSE, scale. = FALSE), silent = TRUE)
+  if (inherits(pca, "try-error")) {
+    warning("PCA failed for ", tag)
+    return(invisible(NULL))
+  }
+  pca_df <- tibble(
+    CpG = rownames(X),
+    PC1 = pca$x[, 1],
+    PC2 = pca$x[, 2]
+  )
+
+  # UMAP
+  um <- run_umap(X)
+  um_df <- tibble(
+    CpG   = rownames(X),
+    UMAP1 = um[, 1],
+    UMAP2 = um[, 2]
+  )
+
+  # Color by group with highest mean M-value
+  grp <- assign_cpg_group(M_sub, meta_f, "MetastasisStatus")
+  pca_df$Group <- grp
+  um_df$Group  <- grp
+
+  pal <- c("No_Mets" = "#1b9e77", "Lymph_Node" = "#d95f02", "Distant" = "#7570b3")
+
+  base_theme <- theme_classic(base_size = 11, base_family = "Helvetica") +
+    theme(legend.position = "right", panel.grid = element_blank())
+
+  p_pca <- ggplot(pca_df, aes(PC1, PC2, color = Group)) +
+    geom_point(size = 0.9, alpha = 0.9) +
+    scale_color_manual(values = pal, drop = FALSE) +
+    labs(x = "PC1", y = "PC2", color = "Metastasis") +
+    base_theme
+
+  p_umap <- ggplot(um_df, aes(UMAP1, UMAP2, color = Group)) +
+    geom_point(size = 0.9, alpha = 0.9) +
+    scale_color_manual(values = pal, drop = FALSE) +
+    labs(x = "UMAP-1", y = "UMAP-2", color = "Metastasis") +
+    base_theme
+
+  ggsave(file.path(out_dir, paste0(tag, "_PCA_byMetastasis.pdf")),
+         p_pca, width = 5.2, height = 4.2, device = cairo_pdf, dpi = 300)
+  ggsave(file.path(out_dir, paste0(tag, "_UMAP_byMetastasis.pdf")),
+         p_umap, width = 5.2, height = 4.2, device = cairo_pdf, dpi = 300)
+
+  message("✓ Saved: ", file.path(out_dir, paste0(tag, "_PCA_byMetastasis.pdf")))
+  message("✓ Saved: ", file.path(out_dir, paste0(tag, "_UMAP_byMetastasis.pdf")))
+}
+
+## -------- 7) Run both sets ---------------------------------------------------
+run_cpg_embeddings(sig_cpgs,     "CpG_SIG")
+run_cpg_embeddings(top_var_cpgs, "CpG_VAR")
+message("✅ Done.")
+```
+
+Permanova 
+```{r}
+###############################################################################
+# PERMANOVA on CpG signatures (Euclidean on standardized features)
+# Requires in the workspace:
+#   - M_all  : matrix of M-values (rows = CpGs, cols = SampleID)
+#   - meta_f : data.frame with SampleID and MetastasisStatus
+#   - sig_cpgs (or top_var_cpgs): character vector of CpG IDs to use
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(vegan)
+  library(readr)
+  library(tibble)
+})
+
+set.seed(12345)
+
+## ---- central output root ---------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "cpg_embeddings")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+## ---- choose CpG panel ------------------------------------------------------
+# Prefer the significant panel if available; otherwise fallback to top-variance
+if (exists("sig_cpgs") && length(sig_cpgs) >= 3) {
+  cpg_panel <- sig_cpgs
+  panel_tag <- "SIG"
+} else if (exists("top_var_cpgs") && length(top_var_cpgs) >= 3) {
+  cpg_panel <- top_var_cpgs
+  panel_tag <- "VAR"
+} else {
+  stop("No CpG panel found: expected 'sig_cpgs' or 'top_var_cpgs' in the workspace.")
+}
+
+# Build CpG×sample submatrix and align to metadata
+stopifnot(exists("M_all"), is.matrix(M_all))
+stopifnot(exists("meta_f"), is.data.frame(meta_f))
+
+# Keep only CpGs present in M_all
+cpg_panel <- intersect(cpg_panel, rownames(M_all))
+if (length(cpg_panel) < 3) stop("Too few CpGs after intersecting with M_all.")
+
+# Ensure MetastasisStatus exists
+if (!"MetastasisStatus" %in% colnames(meta_f)) {
+  stop("meta_f must contain a 'MetastasisStatus' column.")
+}
+
+# Filter metadata to samples we have
+meta_use <- meta_f %>%
+  filter(SampleID %in% colnames(M_all),
+         !is.na(MetastasisStatus)) %>%
+  mutate(MetastasisStatus = factor(MetastasisStatus,
+                                   levels = c("No_Mets","Lymph_Node","Distant")))
+
+# CpG matrix restricted to selected samples (rows=CpGs, cols=Samples)
+M_sub <- M_all[cpg_panel, meta_use$SampleID, drop = FALSE]
+
+# Transpose to samples×features and standardize features (columns)
+X <- t(M_sub)
+# Drop any zero-variance features to avoid numerical issues
+nzv <- apply(X, 2, function(col) stats::sd(col, na.rm = TRUE)) > 0
+X   <- X[, nzv, drop = FALSE]
+if (ncol(X) < 2) stop("Too few informative CpGs (non-zero variance) for PERMANOVA.")
+
+# Replace NA with feature means before scaling
+for (j in seq_len(ncol(X))) {
+  if (anyNA(X[, j])) {
+    m <- mean(X[, j], na.rm = TRUE)
+    X[is.na(X[, j]), j] <- m
+  }
+}
+# Scale features (z-score)
+X <- scale(X, center = TRUE, scale = TRUE)
+
+## ---- distance & PERMANOVA --------------------------------------------------
+# Euclidean distance between samples
+dist_mat <- dist(X, method = "euclidean")
+
+# PERMANOVA; add more covariates if you’d like (e.g., + Array_Version)
+permanova_res <- adonis2(dist_mat ~ MetastasisStatus,
+                         data = meta_use,
+                         permutations = 999, by = "margin")
+
+print(permanova_res)
+
+# Tidy-ish summary to console
+R2 <- permanova_res$R2[match("MetastasisStatus", rownames(permanova_res))]
+p  <- permanova_res$`Pr(>F)`[match("MetastasisStatus", rownames(permanova_res))]
+cat(sprintf("\nPERMANOVA (%s panel): R^2 = %.3f, p = %.4g\n", panel_tag, R2, p))
+
+## ---- save full table -------------------------------------------------------
+out_csv <- file.path(out_dir, sprintf("PERMANOVA_%s_Euclidean.csv", panel_tag))
+permanova_tbl <- permanova_res %>%
+  as.data.frame() %>%
+  rownames_to_column("Term")
+write_csv(permanova_tbl, out_csv)
+cat("✓ Wrote:", out_csv, "\n")
+```
+
+UMAP code Looking at grade site and MLH1
+```{r}
+###############################################################################
+# CpG-level UMAPs with DISCRETE coloring by sample variables
+# Points = CpGs. For each CpG and grouping variable (MLH1, Grade, Site),
+# assign the group with the highest mean z-scored methylation (min effect gap).
+# Saves one panel PDF **and a legend-only PDF** per variable.
+#
+# ✅ Fix included:
+# If `sig_cpgs_mat` (CpG x sample M-values) is NOT already in memory,
+# this script will automatically load it (and `meta_f`) from your EWAS outputs:
+#   Results/results_ewas_<any|ln|dist>/H6/ewas_inputs_for_embeddings.rds
+# and will select significant CpGs from Tier3_topTable.csv (p < p_select).
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tibble); library(readr)
+  library(ggplot2); library(uwot);  library(forcats); library(cowplot)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+set.seed(20250809)
+
+## -------- central output root ----------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "cpg_umap_by_meta_discrete")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+## -------- choose which phenotype to pull from (if we need to auto-load) -----
+# Use one of: "any", "ln", "dist"
+pheno_tag_to_pull <- "any"
+
+## -------- CpG selection threshold (used only if we auto-build the matrix) ---
+p_select         <- 1e-3     # significance threshold for picking CpGs
+min_cpg_required <- 200      # fallback to variance if fewer than this are found
+top_var_k        <- 5000     # fallback: top-K variance CpGs
+
+## -------- helper to load inputs if `sig_cpgs_mat` is missing ----------------
+## --- REPLACE the whole load_sig_matrix_if_needed() with this version --------
+load_sig_matrix_if_needed <- function() {
+  # 1) Already present? use them.
+  if (exists("sig_cpgs_mat") && is.matrix(sig_cpgs_mat) &&
+      exists("meta_f")       && is.data.frame(meta_f) &&
+      "SampleID" %in% names(meta_f)) {
+    message("Using in-memory sig_cpgs_mat and meta_f.")
+    return(invisible(NULL))
+  }
+
+  # 2) If M_cb + meta_f are available in the workspace, derive sig_cpgs_mat from them.
+  if (exists("M_cb") && is.matrix(M_cb) &&
+      exists("meta_f") && is.data.frame(meta_f) && "SampleID" %in% names(meta_f)) {
+    message("Building sig_cpgs_mat from in-memory M_cb/meta_f and Tier3 results …")
+
+    ph_dir   <- file.path(results_root, paste0("results_ewas_", pheno_tag_to_pull), "H6")
+    tt_csv   <- file.path(ph_dir, "Tier3_topTable.csv")
+    fits_rds <- file.path(ph_dir, "ewas_fits.rds")
+
+    # Get Tier3 top table (CpG + P.Value)
+    if (file.exists(tt_csv)) {
+      tt_df <- readr::read_csv(tt_csv, show_col_types = FALSE)
+      if (!("CpG" %in% names(tt_df)) && "CpG_ID" %in% names(tt_df)) {
+        tt_df <- dplyr::rename(tt_df, CpG = CpG_ID)
+      }
+    } else if (file.exists(fits_rds)) {
+      message("Tier3_topTable.csv not found; deriving from ewas_fits.rds")
+      fits <- readRDS(fits_rds)
+      fit3 <- if (inherits(fits$Tier3, "MArrayLM")) fits$Tier3 else fits$Tier3$fit
+      tt_df <- limma::topTable(fit3, coef = "pheno_bin", number = Inf) %>%
+        tibble::rownames_to_column("CpG")
+    } else {
+      stop("Could not find Tier3 results under: ", ph_dir,
+           "\nNeed either Tier3_topTable.csv or ewas_fits.rds.")
+    }
+
+    if (!("CpG" %in% names(tt_df))) stop("TopTable lacks CpG (or CpG_ID) column.")
+    if (!("P.Value" %in% names(tt_df))) stop("TopTable lacks P.Value column.")
+
+    # Pick significant CpGs; fallback to variance if too few
+    sig_cpgs <- tt_df %>%
+      dplyr::filter(P.Value < p_select) %>%
+      dplyr::arrange(P.Value) %>%
+      dplyr::pull(CpG) %>%
+      intersect(rownames(M_cb))
+
+    if (length(sig_cpgs) < min_cpg_required) {
+      message("Only ", length(sig_cpgs), " CpGs passed p < ", p_select,
+              " — falling back to top-variance CpGs (K = ", top_var_k, ").")
+      rv <- matrixStats::rowVars(M_cb, na.rm = TRUE)
+      top_var <- names(sort(rv, decreasing = TRUE))[seq_len(min(top_var_k, length(rv)))]
+      sig_cpgs <- intersect(top_var, rownames(M_cb))
+    }
+
+    sig_cpgs_mat <<- M_cb[sig_cpgs, , drop = FALSE]
+    message("sig_cpgs_mat built: ", nrow(sig_cpgs_mat), " CpGs × ", ncol(sig_cpgs_mat), " samples.")
+    return(invisible(NULL))
+  }
+
+  # 3) Last resort: look for the pre-baked inputs RDS (original path).
+  ph_dir   <- file.path(results_root, paste0("results_ewas_", pheno_tag_to_pull), "H6")
+  inputs_rds <- file.path(ph_dir, "ewas_inputs_for_embeddings.rds")
+  if (file.exists(inputs_rds)) {
+    message("Loading pre-baked inputs from: ", inputs_rds)
+    inp <- readRDS(inputs_rds)
+    if (is.null(inp$M_cb) || is.null(inp$meta_f)) {
+      stop("ewas_inputs_for_embeddings.rds present but lacks M_cb/meta_f.")
+    }
+    M_cb  <<- inp$M_cb
+    meta_f <<- inp$meta_f
+
+    # Derive CpGs exactly as above
+    tt_csv   <- file.path(ph_dir, "Tier3_topTable.csv")
+    fits_rds <- file.path(ph_dir, "ewas_fits.rds")
+    if (file.exists(tt_csv)) {
+      tt_df <- readr::read_csv(tt_csv, show_col_types = FALSE)
+      if (!("CpG" %in% names(tt_df)) && "CpG_ID" %in% names(tt_df)) {
+        tt_df <- dplyr::rename(tt_df, CpG = CpG_ID)
+      }
+    } else if (file.exists(fits_rds)) {
+      fits <- readRDS(fits_rds)
+      fit3 <- if (inherits(fits$Tier3, "MArrayLM")) fits$Tier3 else fits$Tier3$fit
+      tt_df <- limma::topTable(fit3, coef = "pheno_bin", number = Inf) %>%
+        tibble::rownames_to_column("CpG")
+    } else {
+      stop("Could not find Tier3 results under: ", ph_dir)
+    }
+
+    if (!("CpG" %in% names(tt_df))) stop("TopTable lacks CpG (or CpG_ID) column.")
+    if (!("P.Value" %in% names(tt_df))) stop("TopTable lacks P.Value column.")
+
+    sig_cpgs <- tt_df %>%
+      dplyr::filter(P.Value < p_select) %>%
+      dplyr::arrange(P.Value) %>%
+      dplyr::pull(CpG) %>%
+      intersect(rownames(M_cb))
+
+    if (length(sig_cpgs) < min_cpg_required) {
+      message("Only ", length(sig_cpgs), " CpGs passed p < ", p_select,
+              " — falling back to top-variance CpGs (K = ", top_var_k, ").")
+      rv <- matrixStats::rowVars(M_cb, na.rm = TRUE)
+      top_var <- names(sort(rv, decreasing = TRUE))[seq_len(min(top_var_k, length(rv)))]
+      sig_cpgs <- intersect(top_var, rownames(M_cb))
+    }
+
+    sig_cpgs_mat <<- M_cb[sig_cpgs, , drop = FALSE]
+    message("sig_cpgs_mat built from pre-baked inputs: ", nrow(sig_cpgs_mat), " × ", ncol(sig_cpgs_mat))
+    return(invisible(NULL))
+  }
+
+  # 4) If none of the above worked:
+  stop(
+    "No inputs available.\n",
+    "- Preferred: run EWAS script so M_cb/meta_f are in memory, then re-run.\n",
+    "- Or save pre-baked inputs at ",
+    file.path(results_root, paste0('results_ewas_', pheno_tag_to_pull), 'H6/ewas_inputs_for_embeddings.rds')
+  )
+}
+
+## -------- build/confirm inputs ----------------------------------------------
+load_sig_matrix_if_needed()
+
+# basic checks
+stopifnot(exists("sig_cpgs_mat"), is.matrix(sig_cpgs_mat))
+stopifnot(exists("meta_f"), is.data.frame(meta_f), "SampleID" %in% names(meta_f))
+
+## -------- align samples ------------------------------------------------------
+keep_samps <- intersect(colnames(sig_cpgs_mat), meta_f$SampleID)
+if (length(keep_samps) < 5) stop("Too few overlapping samples between matrix and metadata.")
+M_cpg  <- sig_cpgs_mat[, keep_samps, drop = FALSE]
+meta_f <- meta_f %>% filter(SampleID %in% keep_samps)
+meta_f <- meta_f[match(colnames(M_cpg), meta_f$SampleID), , drop = FALSE]
+
+## -------- z-score per CpG across samples ------------------------------------
+row_sd <- apply(M_cpg, 1, function(x) stats::sd(x, na.rm = TRUE))
+ok     <- is.finite(row_sd) & row_sd > 0
+M_cpg  <- M_cpg[ok, , drop = FALSE]
+
+Z_cpg  <- t(scale(t(M_cpg)))
+Z_cpg[!is.finite(Z_cpg)] <- 0
+
+## -------- single UMAP embedding for CpGs ------------------------------------
+umap_emb <- uwot::umap(
+  Z_cpg, n_neighbors = 30, min_dist = 0.2, metric = "cosine",
+  n_components = 2, verbose = TRUE
+)
+emb <- as.data.frame(umap_emb); colnames(emb) <- c("UMAP_1","UMAP_2")
+emb$CpG <- rownames(Z_cpg)
+
+## -------- optional: nearest gene for labels ---------------------------------
+epic_anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+common    <- intersect(emb$CpG, rownames(epic_anno))
+gene_nm   <- rep(NA_character_, nrow(emb))
+if (length(common) > 0) {
+  tmp <- epic_anno[common, "UCSC_RefGene_Name"]
+  g1  <- vapply(strsplit(as.character(tmp), ";", fixed = TRUE), `[`, "", 1)
+  gene_nm[match(common, emb$CpG)] <- ifelse(g1 == "" | is.na(g1), NA, g1)
+}
+emb$Gene <- gene_nm
+
+## -------- tidy/encode metadata factors --------------------------------------
+if ("MLH1" %in% names(meta_f) && is.numeric(meta_f$MLH1)) {
+  meta_f$MLH1 <- factor(ifelse(meta_f$MLH1 == 1, "Loss", "Intact"))
+}
+if ("Grade" %in% names(meta_f)) meta_f$Grade <- factor(meta_f$Grade)
+
+# accept either `site` or `Site`
+if ("site" %in% names(meta_f)) {
+  meta_f$site <- factor(meta_f$site)
+} else if ("Site" %in% names(meta_f)) {
+  meta_f$site <- factor(meta_f$Site)
+}
+
+## -------- winner-take-all labeler with min effect gap -----------------------
+assign_cpg_labels <- function(Zmat, groups, min_effect = 0.15) {
+  groups <- droplevels(groups)
+  if (any(is.na(groups))) stop("Grouping contains NA; subset first.")
+  levs <- levels(groups)
+  grp_means <- sapply(levs, function(lv) rowMeans(Zmat[, groups == lv, drop = FALSE], na.rm = TRUE))
+  if (!is.matrix(grp_means)) grp_means <- cbind(grp_means)
+
+  if (ncol(grp_means) == 2) {
+    diff12 <- grp_means[,2] - grp_means[,1]
+    lab <- ifelse(abs(diff12) >= min_effect,
+                  ifelse(diff12 > 0, levs[2], levs[1]),
+                  "No clear difference")
+  } else {
+    max_idx    <- apply(grp_means, 1, which.max)
+    max_val    <- apply(grp_means, 1, max)
+    second_max <- apply(grp_means, 1, function(v) sort(v, partial = length(v)-1)[length(v)-1])
+    gap <- max_val - second_max
+    lab <- ifelse(gap >= min_effect, levs[max_idx], "No clear difference")
+  }
+  factor(lab, levels = c(setdiff(levs, character(0)), "No clear difference"))
+}
+
+## -------- legend saver -------------------------------------------------------
+save_legend_pdf <- function(plot_with_legend, out_pdf, width = 3.5, height = 2) {
+  leg <- cowplot::get_legend(plot_with_legend)
+  leg_gg <- cowplot::ggdraw(leg)
+  ggsave(out_pdf, leg_gg, device = cairo_pdf, width = width, height = height, dpi = 300)
+}
+
+## -------- plotting helper (returns plot WITH legend) ------------------------
+build_plot_with_legend <- function(emb_df, label_col, title, pt_size = 0.55) {
+  levs <- levels(emb_df[[label_col]])
+  base_cols <- scales::hue_pal()(max(1, length(levs) - 1))
+  cols <- setNames(
+    c(base_cols, "grey70"),
+    c(levs[levs != "No clear difference"], "No clear difference")
+  )
+
+  ggplot(emb_df, aes(UMAP_1, UMAP_2, color = .data[[label_col]])) +
+    geom_point(size = pt_size, alpha = 0.9) +
+    scale_color_manual(values = cols, drop = FALSE, name = NULL) +
+    coord_equal() +
+    labs(x = "UMAP-1", y = "UMAP-2", title = title) +
+    theme_classic(base_size = 11, base_family = "Helvetica") +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold"),
+      legend.position  = "right"
+    )
+}
+
+## -------- driver: make one panel + legend PDF per variable ------------------
+make_panel <- function(var_name, pretty, filename, min_effect = 0.15) {
+  if (!var_name %in% names(meta_f)) { message("Skipping ", var_name, " (not found)."); return(invisible(NULL)) }
+  g_all <- meta_f[[var_name]]
+  keep  <- !is.na(g_all)
+  if (sum(keep) < 4 || length(unique(g_all[keep])) < 2) {
+    message("Skipping ", var_name, " (too few samples/levels after NA removal)."); return(invisible(NULL))
+  }
+
+  labs <- assign_cpg_labels(Z_cpg[, keep, drop = FALSE], factor(g_all[keep]), min_effect = min_effect)
+  emb_tmp <- emb
+  emb_tmp[[pretty]] <- labs
+
+  p_with_legend <- build_plot_with_legend(emb_tmp, label_col = pretty, title = pretty)
+
+  # Save legendless panel
+  panel_pdf <- file.path(out_dir, filename)
+  ggsave(panel_pdf, p_with_legend + theme(legend.position = "none"),
+         device = cairo_pdf, width = 6.5, height = 5.5, dpi = 300)
+  message("✓ Saved: ", panel_pdf)
+
+  # Save legend-only
+  legend_pdf <- file.path(out_dir, sub("\\.pdf$", "_legend.pdf", filename))
+  save_legend_pdf(p_with_legend, legend_pdf, width = 3.5, height = 2.0)
+  message("✓ Saved: ", legend_pdf)
+
+  invisible(list(panel = panel_pdf, legend = legend_pdf))
+}
+
+## -------- run the panels -----------------------------------------------------
+make_panel("MLH1",  "MLH1 winner",  "CpG_UMAP_by_MLH1_discrete.pdf",  min_effect = 0.15)
+make_panel("Grade", "Grade winner", "CpG_UMAP_by_Grade_discrete.pdf", min_effect = 0.20)
+make_panel("site",  "Site winner",  "CpG_UMAP_by_Site_discrete.pdf",  min_effect = 0.20)
+
+message("All done. Files in: ", normalizePath(out_dir))
+```
+
+UMAP with many peramiters 
+```{r}
+###############################################################################
+# CpG-level UMAP param sweep on EWAS-SIGNIFICANT CpGs ONLY (points = CpGs)
+# - Uses the same SIG CpG set as your "good" plot (prefers 'tt' in memory;
+#   otherwise reads Tier3 for the chosen phenotype).
+# - Asserts rows = CpGs; bails if orientation flips.
+# - Sweeps safe UMAP params; n_neighbors is capped to < #CpGs automatically.
+# - Saves one PDF per param combo: .../Results/cpg_embeddings_sig_grid/
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tibble); library(ggplot2)
+  library(matrixStats); library(uwot); library(glue); library(limma)
+  library(tidyr)   # <-- needed for expand_grid
+  library(rlang)   # <-- needed for sym() in rename
+})
+
+set.seed(12345)
+
+## -------- central output root ----------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "cpg_embeddings_sig_grid")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+## -------- inputs expected in workspace --------------------------------------
+stopifnot(exists("M_all"), is.matrix(M_all))
+stopifnot(exists("meta_f"), is.data.frame(meta_f), "SampleID" %in% names(meta_f))
+
+## -------- ensure a metastasis grouping exists -------------------------------
+if (!"MetastasisStatus" %in% colnames(meta_f)) {
+  guess_cols <- c("any_mets","distant","ln_only")
+  if (all(guess_cols %in% colnames(meta_f))) {
+    meta_f <- meta_f %>%
+      mutate(
+        MetastasisStatus = case_when(
+          distant == 1 ~ "Distant",
+          ln_only == 1 ~ "Lymph_Node",
+          any_mets == 0 ~ "No_Mets",
+          TRUE ~ NA_character_
+        )
+      )
+  } else {
+    stop("meta_f must have MetastasisStatus or (any_mets, distant, ln_only).")
+  }
+}
+meta_f$MetastasisStatus <- factor(meta_f$MetastasisStatus,
+                                  levels = c("No_Mets","Lymph_Node","Distant"))
+
+## -------- choose significant CpGs (match the 'good' plot) -------------------
+phenotype_to_use <- "any"   # change if you want sig CpGs from another phenotype
+p_cutoff         <- .01
+top_N            <- 5000     # try 500–1000 for clean structure
+
+get_sig_cpgs_from_fits <- function(results_root, phen_tag, p_cutoff, top_N) {
+  fit_file <- file.path(results_root, glue("results_ewas_{phen_tag}"), "H6", "ewas_fits.rds")
+  if (!file.exists(fit_file)) return(character(0))
+  fits <- readRDS(fit_file)
+  fit3 <- if (inherits(fits$Tier3, "MArrayLM")) fits$Tier3 else fits$Tier3$fit
+  tt   <- topTable(fit3, coef = "pheno_bin", number = Inf, p.value = 1, adjust.method = "none") %>%
+    tibble::rownames_to_column("CpG")
+  tt %>%
+    filter(is.finite(P.Value), P.Value < p_cutoff) %>%
+    arrange(P.Value) %>%
+    pull(CpG) %>%
+    head(top_N)
+}
+
+sig_cpgs <- character(0)
+if (exists("tt")) {
+  tt_df <- as.data.frame(tt, stringsAsFactors = FALSE)
+
+  # 1) If rownames look like cg IDs, promote them
+  rn <- rownames(tt_df)
+  if (!is.null(rn)) {
+    rn_cg_frac <- mean(grepl("^cg\\d{5,}$", as.character(rn)))
+    if (is.finite(rn_cg_frac) && rn_cg_frac > 0.5) {
+      tt_df <- tibble::rownames_to_column(tt_df, var = "CpG")
+    }
+  }
+
+  # 2) If we still don't have a CpG column, try common names
+  if (!("CpG" %in% names(tt_df))) {
+    common_candidates <- c("CpG","CpG_ID","Probe_ID","ID","Name","cgid","probe","probe_id")
+    hit <- intersect(common_candidates, names(tt_df))
+    if (length(hit)) {
+      tt_df <- dplyr::rename(tt_df, CpG = !!rlang::sym(hit[1]))
+    } else {
+      # 3) Heuristic scan: pick the column with >50% cg-like entries
+      cg_like_frac <- vapply(tt_df, function(col) {
+        v <- as.character(col)
+        mean(grepl("^cg\\d{5,}$", v))
+      }, numeric(1))
+      if (length(cg_like_frac) && max(cg_like_frac, na.rm = TRUE) > 0.5) {
+        best_col <- names(which.max(cg_like_frac))
+        tt_df <- dplyr::rename(tt_df, CpG = !!rlang::sym(best_col))
+      }
+    }
+  }
+
+  # 4) Final guardrail
+  if (!("CpG" %in% names(tt_df))) {
+    stop("‘tt’ present but CpG IDs are still not detectable: ",
+         "no CpG-like rownames and no column with cg-style IDs. ",
+         "Add a CpG/CpG_ID column or ensure rownames are cg IDs.")
+  }
+  if (!("P.Value" %in% names(tt_df))) {
+    stop("‘tt’ is missing a P.Value column. Provide limma::topTable output.")
+  }
+
+  # 5) Build the significant set
+  sig_cpgs <- tt_df %>%
+    dplyr::mutate(CpG = as.character(CpG)) %>%
+    dplyr::filter(is.finite(P.Value), P.Value < p_cutoff) %>%
+    dplyr::arrange(P.Value) %>%
+    dplyr::pull(CpG) %>%
+    unique() %>%
+    head(top_N)
+}
+if (length(sig_cpgs) == 0) {
+  sig_cpgs <- get_sig_cpgs_from_fits(results_root, phenotype_to_use, p_cutoff, top_N)
+}
+stopifnot(length(sig_cpgs) > 0)
+
+## -------- align samples & CpGs (intersection only) --------------------------
+keep_samples <- intersect(colnames(M_all), meta_f$SampleID)
+if (length(keep_samples) < 5) stop("Too few overlapping samples between M_all and meta_f.")
+M_all  <- M_all[, keep_samples, drop = FALSE]
+meta_f <- meta_f[match(keep_samples, meta_f$SampleID), , drop = FALSE]
+
+sig_cpgs <- intersect(sig_cpgs, rownames(M_all))
+if (length(sig_cpgs) < 10) stop("Fewer than 10 significant CpGs overlap M_all; cannot embed.")
+
+M_sub <- M_all[sig_cpgs, , drop = FALSE]  # rows = CpGs, cols = samples
+
+## -------- z-score per CpG across samples; ASSERT orientation ----------------
+Z <- t(scale(t(M_sub)))
+Z[!is.finite(Z)] <- 0
+stopifnot(nrow(Z) == length(sig_cpgs), ncol(Z) == ncol(M_sub))  # rows are CpGs!
+
+## -------- label each CpG by group with highest mean across samples ----------
+assign_cpg_group <- function(M_sub, meta_df, group_col = "MetastasisStatus") {
+  g <- droplevels(meta_df[[group_col]])
+  if (any(is.na(g))) stop("Grouping has NA; clean meta_f first.")
+  split_idx <- split(seq_len(nrow(meta_df)), g)
+  labs <- sapply(seq_len(nrow(M_sub)), function(i) {
+    means <- vapply(split_idx, function(ix) mean(M_sub[i, ix], na.rm = TRUE), numeric(1))
+    names(means)[which.max(means)]
+  })
+  factor(labs, levels = levels(g))
+}
+grp_cpg <- assign_cpg_group(M_sub, meta_f, "MetastasisStatus")
+stopifnot(length(grp_cpg) == nrow(Z))
+
+## -------- UMAP runner + plotting -------------------------------------------
+run_umap <- function(X, n_neighbors, min_dist, metric = "cosine",
+                     pca = min(30, ncol(X) - 1), init = "spectral",
+                     repulsion_strength = 1, set_op_mix_ratio = 1,
+                     dens_scale = NULL, n_trees = 50L, seed = 123) {
+  set.seed(seed)
+  uwot::umap(
+    X,
+    n_neighbors        = n_neighbors,
+    min_dist           = min_dist,
+    metric             = metric,
+    pca                = if (pca > 1) pca else NULL,
+    init               = init,
+    repulsion_strength = repulsion_strength,
+    set_op_mix_ratio   = set_op_mix_ratio,
+    dens_scale         = dens_scale,
+    nn_method          = "annoy",
+    n_trees            = n_trees,
+    search_k           = 2 * n_neighbors * n_trees,
+    verbose            = FALSE
+  )
+}
+
+plot_umap <- function(df, pal, out_pdf, width = 5.2, height = 4.2) {
+  p <- ggplot(df, aes(UMAP1, UMAP2, color = Group)) +
+    geom_point(size = 0.9, alpha = 0.9) +
+    scale_color_manual(values = pal, drop = FALSE) +
+    labs(x = "UMAP-1", y = "UMAP-2", color = "Metastasis") +
+    theme_classic(base_size = 11, base_family = "Helvetica") +
+    theme(legend.position = "right", panel.grid = element_blank())
+  ggsave(out_pdf, p, device = cairo_pdf, width = width, height = height, dpi = 300)
+}
+
+pal <- c("No_Mets" = "#1b9e77", "Lymph_Node" = "#d95f02", "Distant" = "#7570b3")
+
+## -------- safe param grid (auto-caps n_neighbors to < n_cpg) ----------------
+n_cpg   <- nrow(Z)
+base_nn <- c(10, 20, 30, 50)
+safe_nn <- sort(unique(pmax(2, pmin(base_nn, n_cpg - 1))))  # ensure < n_cpg
+
+param_grid <- tidyr::expand_grid(
+  n_neighbors = safe_nn,
+  min_dist    = c(0.05, 0.2, 0.4),
+  metric      = c("cosine", "euclidean"),
+  dens_scale  = c(NA, 0.7)   # NA=off; 0.7=densMAP-ish
+) %>%
+  filter(!(metric == "euclidean" & isTRUE(dens_scale == 0.7)))  # optional trim
+
+message("SIG CpGs: ", n_cpg, " | Samples: ", ncol(Z),
+        " | n_neighbors tried: ", paste(safe_nn, collapse = ", "))
+
+apply(param_grid, 1, function(row) {
+  nn   <- as.integer(row[["n_neighbors"]])
+  md   <- as.numeric(row[["min_dist"]])
+  met  <- as.character(row[["metric"]])
+  dens <- if (is.na(row[["dens_scale"]])) NULL else as.numeric(row[["dens_scale"]])
+
+  um <- run_umap(
+    Z,
+    n_neighbors = nn,
+    min_dist    = md,
+    metric      = met,
+    dens_scale  = dens,
+    pca         = min(30, ncol(Z) - 1),
+    init        = "spectral",
+    repulsion_strength = 1,
+    set_op_mix_ratio   = 1,
+    n_trees      = 50L,
+    seed         = 123
+  )
+
+  um_df <- tibble(
+    CpG   = rownames(Z),
+    UMAP1 = um[, 1],
+    UMAP2 = um[, 2],
+    Group = grp_cpg
+  )
+
+  tag      <- glue("SIGonly_{phenotype_to_use}_p{format(p_cutoff, scientific = TRUE)}_top{top_N}")
+  dens_tag <- if (is.null(dens)) "" else glue("_dens{dens}")
+  fname    <- glue("{tag}_UMAP_nn{nn}_md{md}_{met}{dens_tag}.pdf")
+  out      <- file.path(out_dir, fname)
+
+  plot_umap(um_df, pal, out_pdf = out)
+  message("✓ Saved: ", basename(out), "  [points=", nrow(um_df), " CpGs]")
+  invisible(NULL)
+})
+
+message("✅ Done. PDFs in: ", normalizePath(out_dir))
+```
+
+Looking at positions for top CpG's
+```{r}
+###############################################################################
+# Figure: TSS vs Body methylation across metastasis groups
+# Author: Alos Diallo
+# Style: Publication / Clinical Epigenetics ready
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(glue)
+  library(ggplot2); library(purrr); library(patchwork)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+# ---- Inputs --------------------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir_ind  <- file.path(results_root, "GeneRegionSummaries_clean")
+dir.create(out_dir_ind, showWarnings = FALSE, recursive = TRUE)
+
+out_dir_comb <- file.path(results_root, "CombinedFigures_clean")
+dir.create(out_dir_comb, showWarnings = FALSE, recursive = TRUE)
+
+beta_rds <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+# Genes
+hyper_genes <- c("JMJD8","ADRA2C","SLIT2","ABL1","CCDC60","C8orf33","SPTBN4")
+hypo_genes  <- c("CAPN13","LINC00424","GALNT14","ANK1","FER1L6-AS2","C10orf11")
+
+genes_of_interest <- c(hyper_genes, hypo_genes)
+
+# ---- Load data -----------------------------------------------------------
+beta_comb <- {
+  obj <- readRDS(beta_rds)
+  if (is.list(obj) && !is.null(obj$beta)) obj$beta else obj
+}
+meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    mets_progression = case_when(
+      Distant_Mets == 1 ~ "Distant Mets",
+      ln_only == 1      ~ "LN-only Mets",
+      TRUE              ~ "No Mets"
+    ),
+    mets_progression = factor(mets_progression,
+                              levels = c("No Mets","LN-only Mets","Distant Mets"))
+  ) %>%
+  dplyr::select(SampleID, mets_progression)
+
+common_ids <- intersect(colnames(beta_comb), meta$SampleID)
+beta_comb <- beta_comb[, common_ids, drop = FALSE]
+meta      <- filter(meta, SampleID %in% common_ids)
+
+# ---- Annotation ----------------------------------------------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>% as.data.frame()
+
+get_gene_cpgs <- function(gene_symbol, beta_mat, anno_df) {
+  df <- anno_df %>%
+    dplyr::filter(
+      UCSC_RefGene_Name == gene_symbol,
+      UCSC_RefGene_Group %in% c("TSS200","TSS1500","5'UTR","1stExon","Body")
+    ) %>%
+    dplyr::select(Name, UCSC_RefGene_Group) %>%
+    dplyr::filter(Name %in% rownames(beta_mat))
+
+  list(
+    tss = df %>%
+      dplyr::filter(UCSC_RefGene_Group %in% c("TSS200","TSS1500","5'UTR","1stExon")) %>%
+      dplyr::pull(Name),
+    body = df %>%
+      dplyr::filter(UCSC_RefGene_Group == "Body") %>%
+      dplyr::pull(Name)
+  )
+}
+
+# ---- Helper functions ----------------------------------------------------
+to_m <- function(b) log2((b + 1e-6) / (1 - b + 1e-6))
+
+collapse_region <- function(cpgs, beta_mat, label){
+  if (!length(cpgs)) return(NULL)
+  B <- beta_mat[cpgs, , drop = FALSE]
+  M <- t(apply(B, 1, to_m))
+  tibble(
+    SampleID      = colnames(B),
+    Region        = label,
+    BetaCollapsed = colMeans(B, na.rm = TRUE),
+    Mmean         = colMeans(M, na.rm = TRUE)
+  )
+}
+
+# ---- Plot function -------------------------------------------------------
+make_gene_plot <- function(gene_symbol, beta_mat, meta_df, anno_df, save_dir) {
+
+  cpgs <- get_gene_cpgs(gene_symbol, beta_mat, anno_df)
+  if (!length(cpgs$tss) && !length(cpgs$body)) {
+    message("Skipping ", gene_symbol, ": no TSS or Body CpGs.")
+    return(NULL)
+  }
+
+  df_tss  <- collapse_region(cpgs$tss,  beta_mat, "TSS")
+  df_body <- collapse_region(cpgs$body, beta_mat, "Body")
+
+  scores <- bind_rows(df_tss, df_body) %>%
+    left_join(meta_df, by = "SampleID") %>%
+    filter(!is.na(mets_progression))
+
+  have_both <- all(c("TSS","Body") %in% unique(scores$Region))
+
+  stars_df <- NULL
+  if (have_both) {
+    df_wide <- scores %>%
+      dplyr::select(SampleID, Region, Mmean, mets_progression) %>%
+      tidyr::pivot_wider(names_from = Region, values_from = Mmean)
+
+    stars_df <- df_wide %>%
+      group_by(mets_progression) %>%
+      group_modify(~{
+        d <- .x
+        ok <- complete.cases(d$Body, d$TSS)
+        if (sum(ok) < 3) return(tibble(p = NA_real_))
+        wt <- wilcox.test(d$Body[ok], d$TSS[ok], paired = TRUE, exact = FALSE)
+        tibble(p = wt$p.value)
+      }) %>%
+      mutate(
+        label = case_when(
+          p < 0.001 ~ "***",
+          p < 0.01  ~ "**",
+          p < 0.05  ~ "*",
+          TRUE      ~ ""
+        )
+      ) %>%
+      left_join(
+        scores %>%
+          group_by(mets_progression) %>%
+          summarise(y = pmin(1.05, max(BetaCollapsed, na.rm = TRUE) + 0.05),
+                    .groups = "drop"),
+        by = "mets_progression"
+      )
+  }
+
+  p <- ggplot(scores, aes(x = Region, y = BetaCollapsed, fill = Region)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.85, color = "gray40") +
+    geom_jitter(aes(group = SampleID), width = 0.15, size = 0.7, alpha = 0.6) +
+    facet_wrap(~ mets_progression, ncol = 3) +
+    { if (!is.null(stars_df))
+        geom_text(data = stars_df,
+                  aes(x = 1.5, y = y, label = label),
+                  size = 4, vjust = 0, inherit.aes = FALSE) } +
+    { if (!have_both)
+        annotate("text", x = 1.5, y = 1.05,
+                 label = "Only one region available",
+                 size = 3.2, color = "gray40", fontface = "italic") } +
+    scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+    coord_cartesian(ylim = c(0, 1.1)) +
+    labs(title = gene_symbol, x = NULL, y = expression(paste(beta, "-value"))) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "none",
+      strip.background = element_blank(),
+      strip.text = element_text(size = 8, face = "bold"),
+      plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+      axis.text = element_text(size = 8)
+    )
+
+  ggsave(file.path(save_dir, paste0(gene_symbol, "_TSSvsBody_betaPlot.pdf")),
+         p, width = 90/25.4, height = 60/25.4, device = cairo_pdf)
+
+  p
+}
+
+# ---- Generate individual plots ------------------------------------------
+plots_list <- map(genes_of_interest, make_gene_plot, beta_comb, meta, anno, out_dir_ind)
+names(plots_list) <- genes_of_interest
+plots_list <- plots_list[!sapply(plots_list, is.null)]
+
+# ---- Combine into 2-row figure ------------------------------------------
+hyper_plots <- plots_list[hyper_genes]
+hypo_plots  <- plots_list[hypo_genes]
+
+combined_hyper <- wrap_plots(hyper_plots, ncol = 4) + plot_annotation(title = "Hypermethylated Genes")
+combined_hypo  <- wrap_plots(hypo_plots,  ncol = 4) + plot_annotation(title = "Hypomethylated Genes")
+
+final_fig <- combined_hyper / combined_hypo +
+  plot_layout(heights = c(1,1)) &
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12))
+
+# ---- Save final figures --------------------------------------------------
+ggsave(file.path(out_dir_comb, "Figure_Hyper_vs_Hypo_2Rows_Clean_170x225mm.pdf"),
+       final_fig, width = 170/25.4, height = 225/25.4, device = cairo_pdf)
+ggsave(file.path(out_dir_comb, "Figure_Hyper_vs_Hypo_2Rows_Clean_225x170mm.pdf"),
+       final_fig, width = 225/25.4, height = 170/25.4, device = cairo_pdf)
+
+cat("✓ Saved per-gene and combined clean figures:\n", out_dir_comb, "\n")
 ```
 

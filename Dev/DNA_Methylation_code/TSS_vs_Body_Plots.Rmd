@@ -1,0 +1,669 @@
+---
+title: "TSS vs Body Plots"
+author: "Alos Diallo"
+date: "2025-10-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Clear the R environment to start fresh
+rm(list = ls())
+
+# Load the library
+library(AnnotationHub)
+
+# 1. Connect to AnnotationHub
+ah <- AnnotationHub()
+
+# 2. Load the data using the correct ID that YOU found
+correct_id <- "AH116484"
+anno_hg38_gr <- ah[[correct_id]]
+
+# 3. Convert the object to a standard data frame
+anno_hg38 <- as.data.frame(anno_hg38_gr)
+
+# 4. Define the CpGs you are looking for
+cpgs_of_interest <- c("cg27498387", "cg09390241", "cg00377344")
+
+# 5. Subset the data. The CpG IDs are the rownames.
+my_cpg_info_hg38 <- anno_hg38[cpgs_of_interest, ]
+
+# 6. Print the final results with the correct columns
+# This data object should contain the standard Bioconductor column names.
+print(my_cpg_info_hg38[, c("CHR", "MAPINFO", "UCSC_RefGene_Name", "UCSC_RefGene_Group")])
+```
+
+
+```{r}
+# Load the annotation library
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# Get the full annotation data object from the package
+anno_data <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# Define the vector of CpG IDs you're interested in
+cpgs_of_interest <- c("cg16474170")
+
+# Subset the annotation data frame for your specific CpGs
+my_cpg_info <- anno_data[cpgs_of_interest, ]
+
+# Print the most relevant columns
+print(my_cpg_info)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Make sure the necessary libraries are loaded
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(dplyr)
+library(tibble)
+
+# 1. Create a clean vector of your unique CpG IDs
+blank_cpgs <- c(
+    # Hyper-methylated
+    "cg26750188", "cg06631010", "cg04888241", "cg10573232", "cg26166804",
+    "cg16474170", "cg09304803", "cg10655471", "cg20964064", "cg07702509",
+    "cg06224587", "cg24480555", "cg13831596", "cg14362370",
+    # Hypo-methylated
+    "cg16756764", "cg19221542", "cg10213101", "cg11895993", "cg24529549",
+    "cg04165214", "cg24396358", "cg14501323", "cg27498387", "cg12691739",
+    "cg18886245", "cg23355745", "cg21056723", "cg19020602", "cg26996201", "cg11287055"
+)
+
+# 2. Get the main annotation object using the correct function
+full_annotation <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# 3. Subset the annotation data for ONLY your blank CpGs
+blank_cpg_details <- as.data.frame(full_annotation[blank_cpgs, ])
+
+# 4. Display a clean table with just the key information
+# This makes it easier to see the genes you were missing.
+final_info <- blank_cpg_details %>%
+  dplyr::select(UCSC_RefGene_Name, UCSC_RefGene_Group, Relation_to_Island) %>%
+  rownames_to_column("CpG_ID")
+
+print(final_info)
+
+```
+
+```{r}
+# Make sure the rownames (CpG IDs) are a column we can work with
+# install.packages("tibble") # If you don't have it
+library(tibble)
+cpg_details_df <- as.data.frame(blank_cpg_details) %>%
+  rownames_to_column("CpG_ID")
+
+# Create a new, clean data frame with just the info you need
+final_table <- data.frame(
+  CpG_ID = cpg_details_df$CpG_ID,
+  
+  # Get the first gene name before the semicolon ";"
+  Gene = sapply(strsplit(cpg_details_df$UCSC_RefGene_Name, ";"), `[`, 1),
+  
+  # Get the first genomic location before the semicolon ";"
+  Genomic_Location = sapply(strsplit(cpg_details_df$UCSC_RefGene_Group, ";"), `[`, 1)
+)
+
+# Print the clean, final table
+print(final_table)
+```
+
+
+```{r}
+###############################################################################
+# gene_region_beta_plots_Mstats.R
+# Purpose: For each gene of interest, show β-values (TSS vs Body) across
+#          No Mets / LN-only / Distant, with paired Wilcoxon stats on M-values.
+# Output : One PDF per gene + a combined CSV of stats.
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(glue)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(ggplot2); library(ggpubr)
+})
+
+## ---- Inputs you can tweak ---------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "GeneRegionSummaries")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+beta_rds     <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+meta_csv     <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+## Choose a small, hypothesis-driven set (edit this vector).
+## Examples pulled from your significant contrasts:
+# genes_of_interest <- c(
+#   "PDCD1",       # (reference)
+#   "SLIT2", "SOCS1", "COL11A1", "ZEB1", "INHBB",
+#   "WNT7A", "WNT6", "ROBO1", "LCP1", "EPHB1", "ADAMTS18"
+# )
+
+genes_of_interest <- c(
+  "JMJD8",       # (Top Hyper)
+  "ADRA2C", "SLIT2", "ABL1", "CCDC60", "PTPRM",
+  "PTPRM", "C8orf33", "KCNQ2", "ATP7B", "ATP7B", "SPTBN4","CYP24A1",
+  "CAPN13",       # (Top Hypo)
+  "CA10", "LINC00424", "ANK1", "GALNT14", "FER1L6-AS2",
+  "PAK1", "C10orf11", "HLA-DOA", "LOC644145", "TFAP2B", "DSCR3", "APC","P53","KRAS"
+)
+## ---- Load β-matrix + meta ---------------------------------------------------
+beta_comb <- {
+  obj <- readRDS(beta_rds)
+  if (is.list(obj) && !is.null(obj$beta)) obj$beta else obj
+}
+meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    mets_progression = case_when(
+      Distant_Mets == 1 ~ "Distant Mets",
+      ln_only == 1      ~ "LN-only Mets",
+      TRUE              ~ "No Mets"
+    ),
+    mets_progression = factor(mets_progression,
+                              levels = c("No Mets","LN-only Mets","Distant Mets"))
+  ) %>% dplyr::select(SampleID, mets_progression)
+
+common_ids <- intersect(colnames(beta_comb), meta$SampleID)
+stopifnot(length(common_ids) > 0)
+beta_comb <- beta_comb[, common_ids, drop = FALSE]
+meta      <- filter(meta, SampleID %in% common_ids)
+
+## ---- Annotation helper ------------------------------------------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>% as.data.frame()
+
+get_gene_cpgs <- function(gene_symbol, beta_mat, anno_df){
+  df <- anno_df %>%
+    dplyr::filter(UCSC_RefGene_Name == gene_symbol,
+                  UCSC_RefGene_Group %in% c("TSS200","TSS1500","Body")) %>%
+    dplyr::select(Name, UCSC_RefGene_Group) %>%
+    dplyr::filter(Name %in% rownames(beta_mat))
+  list(
+    tss  = df %>% dplyr::filter(UCSC_RefGene_Group %in% c("TSS200","TSS1500")) %>% dplyr::pull(Name),
+    body = df %>% dplyr::filter(UCSC_RefGene_Group == "Body") %>% dplyr::pull(Name)
+  )
+}
+
+## ---- Transform + collapse ---------------------------------------------------
+to_m <- function(b) log2((b + 1e-6) / (1 - b + 1e-6))  # safe logit2
+
+collapse_region <- function(cpgs, beta_mat, label){
+  if (!length(cpgs)) return(NULL)
+  B <- beta_mat[cpgs, , drop = FALSE]
+  M <- t(apply(B, 1, to_m))
+  tibble(
+    SampleID      = colnames(B),
+    Region        = label,
+    BetaCollapsed = colMeans(B, na.rm = TRUE),
+    Mmean         = colMeans(M, na.rm = TRUE)
+  )
+}
+
+## ---- Core function: one gene -> plot + stats row ----------------------------
+analyze_gene <- function(gene_symbol, beta_mat, meta_df, anno_df, out_dir){
+  cpgs <- get_gene_cpgs(gene_symbol, beta_mat, anno_df)
+  if (!length(cpgs$tss) && !length(cpgs$body)) {
+    message("Skipping ", gene_symbol, ": no TSS or Body CpGs present in matrix.")
+    return(NULL)
+  }
+  df_tss  <- collapse_region(cpgs$tss,  beta_mat, "TSS")
+  df_body <- collapse_region(cpgs$body, beta_mat, "Body")
+  scores <- bind_rows(df_tss, df_body) %>%
+    left_join(meta_df, by = "SampleID") %>%
+    filter(!is.na(mets_progression))
+
+  # If either region missing, still plot what exists; stats need both.
+  have_both <- all(c("TSS","Body") %in% unique(scores$Region))
+  stats_tbl <- NULL
+  if (have_both) {
+    df_wide <- scores %>%
+      dplyr::select(SampleID, Region, BetaCollapsed, Mmean, mets_progression) %>%
+      tidyr::pivot_wider(names_from = Region, values_from = c(BetaCollapsed, Mmean))
+
+    stats_tbl <- df_wide %>%
+      group_by(mets_progression) %>%
+      group_modify(~{
+        d <- .x
+        ok <- complete.cases(d$Mmean_Body, d$Mmean_TSS)
+        if (!any(ok)) return(tibble(
+          n_pairs = 0, wilcox_p = NA_real_, HL_delta_M = NA_real_,
+          HL_CI_low_M = NA_real_, HL_CI_high_M = NA_real_,
+          median_delta_beta = NA_real_, mean_delta_beta = NA_real_
+        ))
+        wt <- wilcox.test(d$Mmean_Body[ok], d$Mmean_TSS[ok],
+                          paired = TRUE, conf.int = TRUE, conf.level = 0.95,
+                          alternative = "two.sided", exact = FALSE)
+        delta_beta <- d$BetaCollapsed_Body[ok] - d$BetaCollapsed_TSS[ok]
+        tibble(
+          n_pairs            = sum(ok),
+          wilcox_p           = wt$p.value,
+          HL_delta_M         = unname(wt$estimate),
+          HL_CI_low_M        = wt$conf.int[1],
+          HL_CI_high_M       = wt$conf.int[2],
+          median_delta_beta  = median(delta_beta, na.rm = TRUE),
+          mean_delta_beta    = mean(delta_beta,  na.rm = TRUE)
+        )
+      }) %>%
+      ungroup() %>%
+      mutate(gene = gene_symbol,
+             wilcox_p_adj = p.adjust(wilcox_p, method = "BH")) %>%
+      relocate(gene, .before = 1)
+  }
+
+  # Build plot labels (β-space)
+  plot_df <- scores %>% dplyr::select(SampleID, Region, BetaCollapsed, mets_progression)
+  lab_df <- NULL
+  if (!is.null(stats_tbl)) {
+    lab_df <- stats_tbl %>%
+      mutate(label = glue("Wilcoxon (M): p(BH) = {formatC(wilcox_p_adj, format='e', digits=2)}\nΔβ median = {sprintf('%.3f', median_delta_beta)}")) %>%
+      left_join(
+        plot_df %>% group_by(mets_progression) %>% summarise(y = min(0.98, max(BetaCollapsed) + 0.06)),
+        by = "mets_progression"
+      )
+  }
+
+  p <- ggplot(plot_df, aes(x = Region, y = BetaCollapsed, fill = Region)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.75, color = "gray30") +
+    geom_jitter(aes(group = SampleID), width = 0.15, size = 0.8, alpha = 0.6) +
+    facet_wrap(~ mets_progression) +
+    { if (!is.null(lab_df)) geom_text(data = lab_df, aes(x = 1.5, y = y, label = label),
+                                      size = 3.2, vjust = 0, inherit.aes = FALSE) } +
+    scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+      title = glue("{gene_symbol}: Body vs TSS methylation within metastasis groups"),
+      x = NULL, y = "β-value (mean across CpGs per region)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position = "none",
+      strip.background = element_rect(fill = "gray90", color = "gray50"),
+      axis.text.x = element_text(angle = 0, hjust = 0.5)
+    )
+
+  ggsave(file.path(out_dir, glue("{gene_symbol}_TSSvsBody_betaPlot.pdf")),
+         p, width = 7.2, height = 5.0, device = cairo_pdf)
+
+  stats_tbl
+}
+library(dplyr)
+## ---- Run over all genes and save a combined stats table ---------------------
+all_stats <- purrr::map_dfr(genes_of_interest, ~ analyze_gene(.x, beta_comb, meta, anno, out_dir))
+
+if (nrow(all_stats)) {
+  write_csv(all_stats, file.path(out_dir, "AllGenes_TSSvsBody_population_stats.csv"))
+}
+
+cat("✓ Saved per-gene PDF plots to:\n  ", out_dir,
+    "\n✓ Stats CSV (if any):\n  ", file.path(out_dir, "AllGenes_TSSvsBody_population_stats.csv"), "\n")
+```
+
+```{r}
+###############################################################################
+# gene_region_beta_plots_Mstats.R (REVISED FOR ROBUST GENE FINDING)
+# Purpose: For each gene of interest, show β-values (TSS vs Body) across
+#          No Mets / LN-only / Distant, with paired Wilcoxon stats on M-values.
+# Output : One PDF per gene + a combined CSV of stats.
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(glue)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(ggplot2); library(ggpubr)
+})
+
+## ---- Inputs you can tweak ---------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "GeneRegionSummaries")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+beta_rds     <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+meta_csv     <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+# Using official gene symbols for TP53, APC, and KRAS
+genes_of_interest <- c("TP53;WRAP53", "APC", "KRAS")
+
+## ---- Load β-matrix + meta ---------------------------------------------------
+beta_comb <- {
+  obj <- readRDS(beta_rds)
+  if (is.list(obj) && !is.null(obj$beta)) obj$beta else obj
+}
+meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    mets_progression = case_when(
+      Distant_Mets == 1 ~ "Distant Mets",
+      ln_only == 1      ~ "LN-only Mets",
+      TRUE              ~ "No Mets"
+    ),
+    mets_progression = factor(mets_progression,
+                              levels = c("No Mets","LN-only Mets","Distant Mets"))
+  ) %>% dplyr::select(SampleID, mets_progression)
+
+common_ids <- intersect(colnames(beta_comb), meta$SampleID)
+stopifnot(length(common_ids) > 0)
+beta_comb <- beta_comb[, common_ids, drop = FALSE]
+meta      <- filter(meta, SampleID %in% common_ids)
+
+## ---- Annotation helper ------------------------------------------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>% as.data.frame()
+
+# --- NEW, ROBUST GENE FINDING LOGIC ---
+# This function correctly finds genes even with complex, semicolon-separated annotations.
+get_gene_cpgs <- function(gene_symbol, beta_mat, anno_df){
+  
+  # Helper function to check for an EXACT match in a semicolon-separated list
+  is_gene_match <- function(gene_string, target_gene) {
+    target_gene %in% unlist(strsplit(as.character(gene_string), ";"))
+  }
+  
+  # Apply this function to find all rows matching our gene of interest
+  indices <- sapply(anno_df$UCSC_RefGene_Name, is_gene_match, target_gene = gene_symbol)
+  
+  df <- anno_df[indices, ] %>%
+    dplyr::filter(UCSC_RefGene_Group %in% c("TSS200","TSS1500","Body")) %>%
+    dplyr::select(Name, UCSC_RefGene_Group) %>%
+    dplyr::filter(Name %in% rownames(beta_mat))
+    
+  list(
+    tss  = df %>% dplyr::filter(grepl("TSS", UCSC_RefGene_Group)) %>% dplyr::pull(Name) %>% unique(),
+    body = df %>% dplyr::filter(grepl("Body", UCSC_RefGene_Group)) %>% dplyr::pull(Name) %>% unique()
+  )
+}
+
+## ---- Transform + collapse ---------------------------------------------------
+to_m <- function(b) log2((b + 1e-6) / (1 - b + 1e-6)) # safe logit2
+
+collapse_region <- function(cpgs, beta_mat, label){
+  if (!length(cpgs)) return(NULL)
+  B <- beta_mat[cpgs, , drop = FALSE]
+  M <- t(apply(B, 1, to_m))
+  tibble(
+    SampleID      = colnames(B),
+    Region        = label,
+    BetaCollapsed = colMeans(B, na.rm = TRUE),
+    Mmean         = colMeans(M, na.rm = TRUE)
+  )
+}
+
+## ---- Core function: one gene -> plot + stats row ----------------------------
+# This function remains unchanged as it works on the CpG lists provided by the new helper.
+analyze_gene <- function(gene_symbol, beta_mat, meta_df, anno_df, out_dir){
+  cpgs <- get_gene_cpgs(gene_symbol, beta_mat, anno_df)
+  if (!length(cpgs$tss) && !length(cpgs$body)) {
+    message("Skipping ", gene_symbol, ": no TSS or Body CpGs present in matrix.")
+    return(NULL)
+  }
+  df_tss  <- collapse_region(cpgs$tss,  beta_mat, "TSS")
+  df_body <- collapse_region(cpgs$body, beta_mat, "Body")
+  scores <- bind_rows(df_tss, df_body) %>%
+    left_join(meta_df, by = "SampleID") %>%
+    filter(!is.na(mets_progression))
+
+  have_both <- all(c("TSS","Body") %in% unique(scores$Region))
+  stats_tbl <- NULL
+  if (have_both) {
+    df_wide <- scores %>%
+      dplyr::select(SampleID, Region, BetaCollapsed, Mmean, mets_progression) %>%
+      tidyr::pivot_wider(names_from = Region, values_from = c(BetaCollapsed, Mmean))
+
+    stats_tbl <- df_wide %>%
+      group_by(mets_progression) %>%
+      group_modify(~{
+        d <- .x
+        ok <- complete.cases(d$Mmean_Body, d$Mmean_TSS)
+        if (!any(ok)) return(tibble(n_pairs = 0, wilcox_p = NA_real_))
+        
+        wt <- wilcox.test(d$Mmean_Body[ok], d$Mmean_TSS[ok],
+                          paired = TRUE, conf.int = TRUE, conf.level = 0.95,
+                          alternative = "two.sided", exact = FALSE)
+        delta_beta <- d$BetaCollapsed_Body[ok] - d$BetaCollapsed_TSS[ok]
+        tibble(
+          n_pairs           = sum(ok),
+          wilcox_p          = wt$p.value,
+          HL_delta_M        = unname(wt$estimate),
+          HL_CI_low_M       = wt$conf.int[1],
+          HL_CI_high_M      = wt$conf.int[2],
+          median_delta_beta = median(delta_beta, na.rm = TRUE),
+          mean_delta_beta   = mean(delta_beta,  na.rm = TRUE)
+        )
+      }) %>%
+      ungroup() %>%
+      mutate(gene = gene_symbol,
+             wilcox_p_adj = p.adjust(wilcox_p, method = "BH")) %>%
+      relocate(gene, .before = 1)
+  }
+
+  plot_df <- scores %>% dplyr::select(SampleID, Region, BetaCollapsed, mets_progression)
+  lab_df <- NULL
+  if (!is.null(stats_tbl)) {
+    lab_df <- stats_tbl %>%
+      mutate(label = glue("Wilcoxon (M): p(BH) = {formatC(wilcox_p_adj, format='e', digits=2)}\nΔβ median = {sprintf('%.3f', median_delta_beta)}")) %>%
+      left_join(
+        plot_df %>% group_by(mets_progression) %>% summarise(y = min(0.98, max(BetaCollapsed, na.rm=TRUE) + 0.06)),
+        by = "mets_progression"
+      )
+  }
+
+  p <- ggplot(plot_df, aes(x = Region, y = BetaCollapsed, fill = Region)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.75, color = "gray30") +
+    geom_jitter(aes(group = SampleID), width = 0.15, size = 0.8, alpha = 0.6) +
+    facet_wrap(~ mets_progression) +
+    { if (!is.null(lab_df)) geom_text(data = lab_df, aes(x = 1.5, y = y, label = label),
+                                      size = 3.2, vjust = 0, inherit.aes = FALSE) } +
+    scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+      title = glue("{gene_symbol}: Body vs TSS methylation within metastasis groups"),
+      x = NULL, y = "β-value (mean across CpGs per region)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position = "none",
+      strip.background = element_rect(fill = "gray90", color = "gray50"),
+      axis.text.x = element_text(angle = 0, hjust = 0.5)
+    )
+
+  ggsave(file.path(out_dir, glue("{gene_symbol}_TSSvsBody_betaPlot.pdf")),
+         p, width = 7.2, height = 5.0)
+
+  stats_tbl
+}
+
+## ---- Run over all genes and save a combined stats table ---------------------
+all_stats <- purrr::map_dfr(genes_of_interest, ~ analyze_gene(.x, beta_comb, meta, anno, out_dir))
+
+if (nrow(all_stats) > 0) {
+  write_csv(all_stats, file.path(out_dir, "AllGenes_TSSvsBody_population_stats.csv"))
+}
+
+cat("✓ Saved per-gene PDF plots to:\n  ", out_dir,
+    "\n✓ Stats CSV (if any):\n  ", file.path(out_dir, "AllGenes_TSSvsBody_population_stats.csv"), "\n")
+```
+
+```{r}
+# Load the annotation library
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# Get the full annotation data object from the package
+anno_data <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# This first step correctly finds all CpGs associated with the TP53/WRAP53 locus
+Gene_name_cpgs <- anno_data[grepl("KRAS", anno_data$UCSC_RefGene_Name), ]
+
+# FIX: Use grepl() with an "OR" operator (|) to search for promoter terms
+# This will find any entry that CONTAINS "TSS1500" or "TSS200"
+Gene_promoter_cpgs <- Gene_name_cpgs[grepl("TSS1500|TSS200", Gene_name_cpgs$UCSC_RefGene_Group), ]
+
+# Print the final, correctly filtered results
+print(Gene_promoter_cpgs[, c("Name", "UCSC_RefGene_Name", "UCSC_RefGene_Group", "Relation_to_Island")])
+```
+
+Looking at TSS and Body methylation levels for PD-1 for Possible exhaustion story
+```{r}
+###############################################################################
+# PDCD1_region_comparison_population.R
+# Population-level test: Is Body methylation ≠ TSS within each mets group?
+# - Plot β-values (TSS vs Body) with optional paired lines
+# - Stats on M-values (paired Wilcoxon), with HL median difference + 95% CI
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(glue)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(ggplot2); library(ggpubr)
+})
+
+## ---- Inputs ----------------------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "PDCD1_summary")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+beta_rds     <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+meta_csv     <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+## ---- Load beta matrix + meta ------------------------------------------------
+beta_comb <- {
+  obj <- readRDS(beta_rds)
+  if (is.list(obj) && !is.null(obj$beta)) obj$beta else obj
+}
+meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    mets_progression = case_when(
+      Distant_Mets == 1 ~ "Distant Mets",
+      ln_only == 1      ~ "LN-only Mets",
+      TRUE              ~ "No Mets"
+    ),
+    mets_progression = factor(mets_progression,
+                              levels = c("No Mets","LN-only Mets","Distant Mets"))
+  ) %>% select(SampleID, mets_progression)
+
+common_ids <- intersect(colnames(beta_comb), meta$SampleID)
+stopifnot(length(common_ids) > 0)
+beta_comb <- beta_comb[, common_ids, drop = FALSE]
+meta      <- filter(meta, SampleID %in% common_ids)
+
+## ---- Annotation: PDCD1 CpGs (TSS + Body) -----------------------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>% as.data.frame()
+pdcd1_tbl <- anno %>%
+  filter(UCSC_RefGene_Name == "PDCD1",
+         UCSC_RefGene_Group %in% c("TSS1500","TSS200","Body")) %>%
+  select(Name, UCSC_RefGene_Group) %>%
+  filter(Name %in% rownames(beta_comb))
+
+tss_cpgs  <- pdcd1_tbl %>% filter(UCSC_RefGene_Group %in% c("TSS1500","TSS200")) %>% pull(Name)
+body_cpgs <- pdcd1_tbl %>% filter(UCSC_RefGene_Group == "Body") %>% pull(Name)
+if (!length(tss_cpgs) && !length(body_cpgs)) stop("No PDCD1 TSS or Body CpGs present in matrix.")
+
+## ---- Collapse per region (β for plot; M for stats) -------------------------
+to_m <- function(b) log2((b + 1e-6) / (1 - b + 1e-6))  # safe logit2
+
+collapse_region <- function(cpgs, beta_mat, region_label){
+  B <- beta_mat[cpgs, , drop = FALSE]                    # CpG x sample (β)
+  M <- apply(B, 1, to_m) %>% t()                         # CpG x sample (M)
+  tibble(
+    SampleID      = colnames(B),
+    Region        = region_label,
+    BetaCollapsed = colMeans(B, na.rm = TRUE),           # mean β across CpGs
+    Mmean         = colMeans(M, na.rm = TRUE)            # mean M across CpGs
+  )
+}
+df_tss  <- collapse_region(tss_cpgs,  beta_comb, "TSS")
+df_body <- collapse_region(body_cpgs, beta_comb, "Body")
+
+scores <- bind_rows(df_tss, df_body) %>%
+  left_join(meta, by = "SampleID") %>%
+  filter(!is.na(mets_progression))
+
+## ---- Compute paired stats (Body vs TSS) per mets group ---------------------
+# For each group, form paired vectors of Mmean_Body and Mmean_TSS per patient.
+paired_stats <- scores %>%
+  select(SampleID, Region, BetaCollapsed, Mmean, mets_progression) %>%
+  pivot_wider(names_from = Region, values_from = c(BetaCollapsed, Mmean)) %>%
+  group_by(mets_progression) %>%
+  group_modify(~{
+    df <- .x
+    # Paired Wilcoxon on M-values, with HL median difference & 95% CI
+    wt <- wilcox.test(df$Mmean_Body, df$Mmean_TSS,
+                      paired = TRUE, conf.int = TRUE, conf.level = 0.95,
+                      alternative = "two.sided", exact = FALSE)
+
+    # Also compute Δβ for interpretability
+    delta_beta <- df$BetaCollapsed_Body - df$BetaCollapsed_TSS
+    tibble(
+      n_pairs         = sum(complete.cases(df$Mmean_Body, df$Mmean_TSS)),
+      wilcox_p        = wt$p.value,
+      HL_delta_M      = unname(wt$estimate),             # Hodges–Lehmann (Body−TSS) on M
+      HL_CI_low_M     = wt$conf.int[1],
+      HL_CI_high_M    = wt$conf.int[2],
+      median_delta_beta = median(delta_beta, na.rm = TRUE),
+      mean_delta_beta   = mean(delta_beta,  na.rm = TRUE)
+    )
+  }) %>% ungroup() %>%
+  mutate(wilcox_p_adj = p.adjust(wilcox_p, method = "BH"))
+
+# Save stats
+stats_csv <- file.path(out_dir, "PDCD1_TSSvsBody_population_stats.csv")
+write_csv(paired_stats, stats_csv)
+
+## ---- Build plot data (β-values) --------------------------------------------
+plot_df <- scores %>%
+  select(SampleID, Region, BetaCollapsed, mets_progression)
+
+# Make label table to show BH-adjusted p per facet
+lab_df <- paired_stats %>%
+  mutate(label = glue::glue("Wilcoxon (M): p(BH) = {formatC(wilcox_p_adj, format='e', digits=2)}\nΔβ median = {sprintf('%.3f', median_delta_beta)}")) %>%
+  left_join(
+    plot_df %>% group_by(mets_progression) %>% summarise(y = min(0.98, max(BetaCollapsed) + 0.06)),
+    by = "mets_progression"
+  )
+
+## ---- Plot: β-values with TSS vs Body side-by-side per group ----------------
+p <- ggplot(plot_df, aes(x = Region, y = BetaCollapsed, fill = Region)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.75, color = "gray30") +
+  geom_jitter(aes(group = SampleID), width = 0.15, size = 0.8, alpha = 0.6) +
+  # optional: paired lines help reviewers see the within-patient direction
+  # geom_line(aes(group = SampleID), color = "gray70", alpha = 0.5,
+  #           position = position_dodge2(width = 0.6, preserve = "single")) +
+  facet_wrap(~ mets_progression) +
+  geom_text(data = lab_df, aes(x = 1.5, y = y, label = label),
+            size = 3.4, vjust = 0, inherit.aes = FALSE) +
+  scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    title = "PDCD1: Body vs TSS methylation within metastasis groups",
+    x = NULL, y = "β-value (mean across CpGs per region)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "gray90", color = "gray50"),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(file.path(out_dir, "PDCD1_TSSvsBody_population_plot.pdf"),
+       p, width = 7.2, height = 5.0, device = cairo_pdf)
+
+cat("✓ Saved:\n  -", stats_csv, "\n  -", file.path(out_dir, "PDCD1_TSSvsBody_population_plot.pdf"), "\n")
+```
