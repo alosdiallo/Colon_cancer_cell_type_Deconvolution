@@ -1,0 +1,359 @@
+---
+title: "test_script_EWAS"
+author: "Alos Diallo"
+date: "2025-07-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+###############################################################################
+#  ewas_metastasis_multi-deconv.R  ·  2025-07-17
+#  - Runs analysis WITH and WITHOUT sex chromosome probes.
+#  - EWAS with HiTIMED h = 2 / 3 / 5
+#  - Phenotypes: any_mets / ln_only / distant
+###############################################################################
+##  USER SETTINGS  ────────────────────────────────────────────────────────────
+# FIX: Define a base directory for all output
+base_output_dir <- "/Users/adiallo/Desktop/Thesis/code/"
+
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+phenotypes           <- c(any = "any_mets", ln = "ln_only", dist = "distant")
+variance_percentile  <- 0.90
+###############################################################################
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(minfi);  library(sesame);  library(ENmix)
+  library(matrixStats);  library(limma);  library(sva)
+  library(HiTIMED)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(tidyverse);    library(glue)
+})
+
+###############################################################################
+##  1)  β-matrix  (cached)  ---------------------------------------------------
+###############################################################################
+out_cache <- "results_ewas_cache"
+# Create cache in the base output directory
+dir.create(file.path(base_output_dir, out_cache), showWarnings = FALSE)
+beta_rds <- file.path(base_output_dir, out_cache, "beta_comb_qc.rds")
+
+read_preprocess <- function(path, tag){
+  rg  <- read.metharray.exp(path, recursive = TRUE, extended = TRUE, force = TRUE)
+  bet <- getBeta(preprocessNoob(rg, dyeMethod = "single"))
+  if (tag == "v2") bet <- betasCollapseToPfx(bet)
+  bad <- ENmix::QCinfo(rg)$badCpG
+  bet[setdiff(rownames(bet), bad), ]
+}
+
+if (!file.exists(beta_rds)){
+  msg("Reading & NOOB-normalising v1 + v2 …")
+  beta1 <- read_preprocess(idat_v1, "v1")
+  beta2 <- read_preprocess(idat_v2, "v2")
+  common     <- intersect(rownames(beta1), rownames(beta2))
+  beta_comb_full  <- cbind(beta1[common, ], beta2[common, ])
+  saveRDS(beta_comb_full, beta_rds);  msg("β-matrix saved → ", beta_rds)
+} else {
+  msg("β-matrix cache found – loading ", beta_rds)
+  beta_comb_full <- readRDS(beta_rds)
+}
+
+###############################################################################
+##  NEW: Loop to run analysis WITH and WITHOUT sex probes
+###############################################################################
+for (sex_handling_mode in c("withSex", "noSex")) {
+
+  msg(glue("\n\n################ RUNNING ANALYSIS: {sex_handling_mode} ################"))
+  
+  beta_comb <- beta_comb_full # Start with the full matrix each time
+  
+  # Conditionally remove sex probes
+  if (sex_handling_mode == "noSex") {
+    msg("Removing probes on X and Y chromosomes...")
+    anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+    sex_probes <- rownames(anno[anno$chr %in% c("chrX", "chrY"), ])
+    probes_to_remove <- intersect(rownames(beta_comb), sex_probes)
+    if (length(probes_to_remove) > 0) {
+      beta_comb <- beta_comb[!rownames(beta_comb) %in% probes_to_remove, ]
+      msg(glue("Removed {length(probes_to_remove)} probes from sex chromosomes."))
+    }
+  }
+
+  ## variance filter -----------------------------------------------------------
+  M.mat <- log2(beta_comb / (1 - beta_comb) + 1e-6)
+  if (variance_percentile > 0){
+    var_vec <- rowVars(M.mat, na.rm = TRUE)
+    var_cut <- quantile(var_vec, variance_percentile, na.rm = TRUE)
+    keep_id <- names(var_vec)[var_vec > var_cut]
+    beta_comb <- beta_comb[keep_id, ];   M.mat <- M.mat[keep_id, ]
+    msg(length(keep_id), " CpGs retained (top ", 100*(1-variance_percentile), "% variance)")
+  } else msg("Variance filter skipped.")
+
+  ## Helpers & Templates -------------------------------------------------------
+  collapse_frac <- function(df){
+    n <- nrow(df);  zero <- numeric(n)
+    get <- \(c) if (c %in% names(df)) as.numeric(df[[c]]) else zero
+    tibble(
+      SampleID    = df$SampleID, Tumor       = get("Tumor"), Fibroblast  = get("Fib"),
+      Endothelial = get("Endothelial"), Epithelial  = get("Epithelial"),
+      Stromal     = get("Stromal"), CD8_T       = get("CD8mem") + get("CD8nv"),
+      CD4_Treg    = get("CD4mem") + get("CD4nv") + get("Treg"),
+      B_total     = get("Bmem")   + get("Bnv")
+    ) %>% mutate(across(-SampleID, as.numeric))
+  }
+
+  tier_template <- list(
+    Tier1 = c("age","sex_num","MLH1_num"),
+    Tier2 = c("age","sex_num","MLH1_num","Tumor"),
+    Tier3 = c("age","sex_num","MLH1_num","Tumor","Fibroblast",
+              "Endothelial","Epithelial","Stromal", "CD8_T","CD4_Treg","B_total")
+  )
+  trim_tiers <- \(tiers, avail) lapply(tiers, \(v) intersect(v, avail))
+  
+  run_hitimed <- function(h){
+    msg("→ HiTIMED h = ", h)
+    HiTIMED_deconvolution(beta_comb, "COAD", h = h) %>%
+      as.data.frame() %>% rownames_to_column("SampleID")
+  }
+  
+  ## Main Loop over Phenotypes ------------------------------------------------
+  for (pheno_tag in names(phenotypes)){
+    phenotype_to_use <- phenotypes[[pheno_tag]]
+    msg("\n================  Phenotype: ", phenotype_to_use, "  ================")
+    
+    meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+              mutate(SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+                     any_mets = ifelse(any_mets ,1L,0L), distant  = ifelse(Distant_Mets,1L,0L),
+                     ln_only  = ifelse(ln_only ,1L,0L), sex_num  = ifelse(sex=="M",1,0),
+                     MLH1_num = ifelse(MLH1==1,1,0),
+                     Array_Version = ifelse(SampleID %in% colnames(beta_comb), "v1","v2"),
+                     pheno_bin     = .data[[phenotype_to_use]])
+    
+    deconv_list <- list(H2 = run_hitimed(2), H3 = run_hitimed(3), H5 = run_hitimed(5))
+    
+    fit_one_tag <- function(tag, frac_df){
+      msg("----  ", tag, "  ----")
+      
+      # Construct the full, absolute path for the output directory
+      output_folder_name <- paste0("results_ewas_", pheno_tag, "_", sex_handling_mode)
+      out_dir <- file.path(base_output_dir, output_folder_name, tag)
+      dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+      
+      frac_w <- collapse_frac(frac_df)
+      meta2  <- meta %>% left_join(frac_w, by = "SampleID")
+      fmat <- frac_w %>% column_to_rownames("SampleID") %>% as.matrix()
+      ok   <- rowSums(is.na(fmat)) == 0 & rowSums(fmat) > 0
+      keep <- rownames(fmat)[ok]
+      M_samp <- M.mat[, keep]
+      meta_f <- meta2 %>% filter(SampleID %in% keep)
+      
+      M_cb <- if (length(unique(meta_f$Array_Version)) > 1){
+                mod_cb <- model.matrix(~ age + sex_num + MLH1_num + pheno_bin, meta_f)
+                ComBat(M_samp, batch = factor(meta_f$Array_Version), mod = mod_cb, par.prior = TRUE, prior.plots = FALSE)
+              } else M_samp
+      
+      tier_list <- trim_tiers(tier_template, names(meta_f))
+      fits <- list()
+      for (tn in names(tier_list)){
+        covs <- tier_list[[tn]]
+        sds  <- sapply(meta_f[covs], sd, na.rm = TRUE)
+        nz   <- covs[!is.na(sds) & sds > 0]
+        form <- if (length(nz)==0) ~ pheno_bin else as.formula(paste("~ pheno_bin +", paste(nz, collapse = " + ")))
+        des  <- model.matrix(form, meta_f)
+        fits[[tn]] <- list(design = des,
+                           fit    = eBayes(lmFit(M_cb, des), trend = TRUE, robust = TRUE))
+      }
+      saveRDS(fits, file.path(out_dir, "ewas_fits.rds"))
+    }
+    
+    walk2(names(deconv_list), deconv_list, fit_one_tag)
+  }
+}
+
+msg("\n✅  EWAS finished for all versions.")
+```
+
+
+
+```{r}
+###############################################################################
+#  Hallmark pathway analysis (Hyper vs. Hypo with variable cutoffs)
+#  • Uses robust methylgometh function
+#  • Separates analysis for hyper- and hypo-methylated CpGs
+###############################################################################
+suppressPackageStartupMessages({
+  library(limma); library(methylGSA); library(msigdbr); library(dplyr)
+  library(purrr); library(readr); library(ggplot2); library(glue); library(tibble)
+})
+
+# ---------------------------------------------------------------------------
+# 0)  USER SETTINGS
+# ---------------------------------------------------------------------------
+base_output_dir <- "/Users/adiallo/Desktop/Thesis/code/"
+
+phen_dirs <- c(
+  "results_ewas_any_withSex", "results_ewas_any_noSex",
+  "results_ewas_ln_withSex", "results_ewas_ln_noSex",
+  "results_ewas_dist_withSex", "results_ewas_dist_noSex"
+)
+
+# Parameters to test
+alpha_cutoffs <- c(1e-1, 1e-2, 1e-3)
+topN_cutoffs  <- c(2000, 1000, 500)
+
+# ---------------------------------------------------------------------------
+# 1)  one-time Hallmark gene-set list
+# ---------------------------------------------------------------------------
+hallmark_list <- msigdbr("HS", category = "H") %>%
+  distinct(gs_name, entrez_gene) %>%
+  group_by(gs_name) %>%
+  summarise(genes = list(entrez_gene), .groups = "drop") %>%
+  tibble::deframe()
+
+# ---------------------------------------------------------------------------
+# 2)  helpers
+# ---------------------------------------------------------------------------
+# UPDATED helper function with a simpler tryCatch
+safe_methylgometh <- function(tt, idx,
+                              minsize = 10,
+                              maxsize = 500) {
+  if (length(idx) < 2) return(NULL)
+  
+  cpg_pval <- setNames(tt$P.Value[idx], tt$CpG_ID[idx])
+  
+  # Use a simpler try() which will catch any error without causing a new one
+  result <- try(
+    methylGSA::methylgometh(
+      cpg.pval   = cpg_pval,
+      array.type = "EPIC",
+      GS.list    = hallmark_list,
+      GS.idtype  = "ENTREZID",
+      minsize    = minsize,
+      maxsize    = maxsize
+    ),
+    silent = TRUE # Don't print the error to the console twice
+  )
+  
+  # If the try() resulted in an error, return NULL
+  if (inherits(result, "try-error")) {
+    message("       · methylgometh failed.")
+    return(NULL)
+  }
+  
+  return(result)
+}
+
+plot_hallmark_bar <- function(res, ttl, top_k = 15, color_by = "padj") {
+  legend_label <- if (color_by == "padj") "Adjusted P-value" else "P-value"
+  adj_p_col <- if ("padj" %in% names(res)) "padj" else if ("fdr" %in% names(res)) "fdr" else "FDR"
+  res %>%
+    arrange(pvalue) %>%
+    slice_head(n = top_k) %>%
+    mutate(ID = factor(ID, levels = rev(ID))) %>%
+    ggplot(aes(ID, Size, fill = .data[[color_by]])) +
+      geom_col() +
+      coord_flip() +
+      scale_fill_gradient(low = "#4575b4", high = "#d73027") +
+      labs(title = ttl, x = NULL, y = "Gene-set size", fill = legend_label) +
+      theme_minimal(base_size = 11)
+}
+
+# ---------------------------------------------------------------------------
+# 3)  MAIN LOOP
+# ---------------------------------------------------------------------------
+for (alpha_cut in alpha_cutoffs) {
+  for (topN in topN_cutoffs) {
+    
+    msg(glue("\n\n################ RUNNING WITH P-CUTOFF = {alpha_cut} AND TOPN = {topN} ################"))
+    
+    for (phen_dir in phen_dirs) {
+      
+      full_phen_dir <- file.path(base_output_dir, phen_dir)
+      if (!dir.exists(full_phen_dir)) {
+          cat("\n  -> Directory not found:", full_phen_dir, "- Skipping.\n")
+          next
+      }
+      cat("\n==========  Phenotype:", phen_dir, " ==========\n")
+      
+      tag_dirs <- dir(full_phen_dir, full.names = TRUE, pattern = "^H[235]$")
+
+      if (length(tag_dirs) == 0) {
+          cat("  -> No H2, H3, or H5 results found, skipping.\n")
+          next
+      }
+
+      p_out   <- file.path(base_output_dir, phen_dir, "pathway_results")
+      p_plots <- file.path(p_out, "plots")
+      dir.create(p_plots, recursive = TRUE, showWarnings = FALSE)
+
+      for (tag_dir in tag_dirs) {
+        tag <- basename(tag_dir)
+        fit_path <- file.path(tag_dir, "ewas_fits.rds")
+        if (!file.exists(fit_path)) next
+        fits_tag <- readRDS(fit_path)
+
+        for (tier_nm in names(fits_tag)) {
+          fit_obj <- fits_tag[[tier_nm]]$fit
+          if (is.null(fit_obj) || !"pheno_bin" %in% colnames(fit_obj)) next
+          
+          cat(glue("► {tag} | {tier_nm} | pheno_bin\n"))
+          tt <- limma::topTable(fit_obj, coef = "pheno_bin", number = Inf, p.value = 1, adjust.method = "none") %>%
+            rownames_to_column("CpG_ID")
+
+          # --- Analysis logic (hyper/hypo, Mode A/B) ---
+          idx_A_hyper <- which(tt$P.Value < alpha_cut & tt$logFC > 0)
+          res_A_hyper <- safe_methylgometh(tt, idx_A_hyper)
+          if (!is.null(res_A_hyper)) {
+            stem <- glue("{tag}_{tier_nm}_P{alpha_cut}_hyper")
+            write_csv(res_A_hyper, file.path(p_out, glue("{stem}.csv")))
+            ggsave(file.path(p_plots, glue("{stem}_by_padj.png")), plot_hallmark_bar(res_A_hyper, stem, color_by = "padj"), width = 7, height = 5, bg = "white")
+            ggsave(file.path(p_plots, glue("{stem}_by_pvalue.png")), plot_hallmark_bar(res_A_hyper, stem, color_by = "pvalue"), width = 7, height = 5, bg = "white")
+            cat("       · mode A (Hyper):", length(idx_A_hyper), "CpGs → saved 2 plots\n")
+          } else { cat("       · mode A (Hyper): skipped (", length(idx_A_hyper), " CpGs)\n") }
+
+          idx_A_hypo <- which(tt$P.Value < alpha_cut & tt$logFC < 0)
+          res_A_hypo <- safe_methylgometh(tt, idx_A_hypo)
+          if (!is.null(res_A_hypo)) {
+            stem <- glue("{tag}_{tier_nm}_P{alpha_cut}_hypo")
+            write_csv(res_A_hypo, file.path(p_out, glue("{stem}.csv")))
+            ggsave(file.path(p_plots, glue("{stem}_by_padj.png")), plot_hallmark_bar(res_A_hypo, stem, color_by = "padj"), width = 7, height = 5, bg = "white")
+            ggsave(file.path(p_plots, glue("{stem}_by_pvalue.png")), plot_hallmark_bar(res_A_hypo, stem, color_by = "pvalue"), width = 7, height = 5, bg = "white")
+            cat("       · mode A (Hypo):", length(idx_A_hypo), "CpGs → saved 2 plots\n")
+          } else { cat("       · mode A (Hypo): skipped (", length(idx_A_hypo), " CpGs)\n") }
+
+          idx_B_hyper <- tt %>% filter(logFC > 0) %>% slice_head(n = topN) %>% pull(CpG_ID) %>% match(tt$CpG_ID)
+          res_B_hyper <- safe_methylgometh(tt, idx_B_hyper)
+          if (!is.null(res_B_hyper)) {
+            stem <- glue("{tag}_{tier_nm}_Top{topN}_hyper")
+            write_csv(res_B_hyper, file.path(p_out, glue("{stem}.csv")))
+            ggsave(file.path(p_plots, glue("{stem}_by_padj.png")), plot_hallmark_bar(res_B_hyper, stem, color_by = "padj"), width = 7, height = 5, bg = "white")
+            ggsave(file.path(p_plots, glue("{stem}_by_pvalue.png")), plot_hallmark_bar(res_B_hyper, stem, color_by = "pvalue"), width = 7, height = 5, bg = "white")
+            cat("       · mode B (Hyper):", length(idx_B_hyper), "CpGs → saved 2 plots\n")
+          } else { cat("       · mode B (Hyper): analysis failed or no significant pathways found\n") }
+
+          idx_B_hypo <- tt %>% filter(logFC < 0) %>% slice_head(n = topN) %>% pull(CpG_ID) %>% match(tt$CpG_ID)
+          res_B_hypo <- safe_methylgometh(tt, idx_B_hypo)
+          if (!is.null(res_B_hypo)) {
+            stem <- glue("{tag}_{tier_nm}_Top{topN}_hypo")
+            write_csv(res_B_hypo, file.path(p_out, glue("{stem}.csv")))
+            ggsave(file.path(p_plots, glue("{stem}_by_padj.png")), plot_hallmark_bar(res_B_hypo, stem, color_by = "padj"), width = 7, height = 5, bg = "white")
+            ggsave(file.path(p_plots, glue("{stem}_by_pvalue.png")), plot_hallmark_bar(res_B_hypo, stem, color_by = "pvalue"), width = 7, height = 5, bg = "white")
+            cat("       · mode B (Hypo):", length(idx_B_hypo), "CpGs → saved 2 plots\n")
+          } else { cat("       · mode B (Hypo): analysis failed or no significant pathways found\n") }
+        }
+      }
+    }
+  }
+}
+
+cat("\n✔  Hallmark pathway analysis complete for all versions.\n")
+```
+
+

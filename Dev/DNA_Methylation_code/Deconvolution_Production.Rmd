@@ -9,7 +9,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-Validation box plots
+Suplemental Figure 1: Validation box plots
 ```{r}
 ###############################################################################
 #  deconv_DH_GTEx_TCGA_boxplots.R  ·  Figure 2 draft (v1.6)
@@ -139,7 +139,7 @@ run_epidish_fib <- function(beta_mat){
   data("centEpiFibIC.m", package = "EpiDISH", envir = environment())
   common <- intersect(rownames(beta_mat), rownames(centEpiFibIC.m))
   epidish(beta_mat[common, ], centEpiFibIC.m[common, ], "RPC")$estF %>%
-    as.data.frame() %>% deplyr::select(Fib) %>% rownames_to_column("SampleID")
+    as.data.frame() %>% dplyr::select(Fib) %>% rownames_to_column("SampleID")
 }
 
 normalise_fractions <- function(df){
@@ -169,6 +169,7 @@ make_group_var <- function(meta_df){
 }
 
 # UPDATED plotting function with new jitter parameters
+# UPDATED plotting function with "thin box" settings
 draw_plots_level <- function(combined_df, cell_cols, level_tag, out_dir){
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
@@ -191,53 +192,85 @@ draw_plots_level <- function(combined_df, cell_cols, level_tag, out_dir){
                   "DH non-mets"          = "#d95f02",
                   "DH mets"              = "#e7298a")
 
-  msg("    Saving individual cell plots (PDF)…")
+  msg("    Saving individual cell plots (PDF)...")
   purrr::walk(unique(long_df$Cell), function(cl){
     dfc   <- filter(long_df, Cell == cl)
     comps <- combn(levels(dfc$group4), 2, simplify = FALSE)
 
     p <- ggplot(dfc, aes(group4, Prop, fill = group4)) +
-      geom_boxplot(outlier.shape = NA, width = 0.65, alpha = 0.7) +
-      # FIX: Adjusted jitter width and size
-      geom_jitter(width = 0.2, size = 1.2, alpha = 0.8) +
+      geom_boxplot(
+        outlier.shape = NA,
+        width = 0.25, # <--- EDIT: Was 0.65
+        alpha = 0.85, # <--- EDIT: Added alpha for consistency
+        color = "gray25" # <--- EDIT: Added color for consistency
+      ) +
+      geom_jitter(
+        width = 0.05, # <--- EDIT: Was 0.2
+        size = 0.8, # <--- EDIT: Was 1.2, reduced to match tighter jitter
+        alpha = 0.6 # <--- EDIT: Was 0.8
+      ) +
       stat_compare_means(comparisons = comps, method = "wilcox.test",
                          label = "p.signif", hide.ns = TRUE, size = 3) +
       scale_fill_manual(values = pal_groups, guide = "none") +
+      # <--- EDIT: Added y-axis expansion to give stats more space
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +
       theme_bw(base_size = 11) +
       theme(
-        axis.text.x = element_text(angle = 35, hjust = 1),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8), # <--- EDIT: 90 degrees
         plot.title  = element_blank(),
-        panel.grid.major = element_blank(),
-        panel.grid.minor = element_blank()
+        axis.title.x = element_blank(), # <--- EDIT: Added to remove x-axis label
+        axis.ticks = element_blank(), # <--- EDIT: Added to match example
+        panel.grid = element_blank(), # <--- EDIT: Was panel.grid.major/minor
+        panel.border = element_blank() # <--- EDIT: Added to match example
       ) +
       labs(x = NULL, y = "Proportion")
 
     ggsave(file.path(out_dir,
                      paste0("BOX_", gsub("[^A-Za-z0-9]+","_", cl), "_", level_tag, ".pdf")),
-           p, width = 4.2, height = 4.2, device = cairo_pdf)
+           p,
+           width = 2.5, # <--- EDIT: Was 4.2. Reduced width to compress groups.
+           height = 4.2,
+           device = cairo_pdf)
   })
 
-  msg("    Saving faceted plot (PDF)…")
+  msg("    Saving faceted plot (PDF)...")
   comps_all <- combn(levels(long_df$group4), 2, simplify = FALSE)
   p_all <- ggplot(long_df, aes(group4, Prop, fill = group4)) +
-    geom_boxplot(outlier.shape = NA, width = 0.65, alpha = 0.7) +
-    # FIX: Adjusted jitter width and size
-    geom_jitter(width = 0.15, size = 0.8, alpha = 0.7) +
+    geom_boxplot(
+      outlier.shape = NA,
+      width = 0.25, # <--- EDIT: Was 0.65
+      alpha = 0.85, # <--- EDIT: Was 0.7, matched style
+      color = "gray25" # <--- EDIT: Added color
+    ) +
+    geom_jitter(
+      width = 0.05, # <--- EDIT: Was 0.15
+      size = 0.4, # <--- EDIT: Was 0.8, matched style
+      alpha = 0.6 # <--- EDIT: Was 0.7, matched style
+    ) +
     facet_wrap(~ Cell, scales = "free_y", ncol = 5) +
     stat_compare_means(comparisons = comps_all, method = "wilcox.test",
-                       label = "p.signif", hide.ns = TRUE, size = 2.8) +
+                       label = "p.signif", hide.ns = TRUE, size = 2.1) + # <--- EDIT: Was 2.8
     scale_fill_manual(values = pal_groups, guide = "none") +
+    # <--- EDIT: Added y-axis expansion
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
     theme_bw(base_size = 11) +
     theme(
-      axis.text.x = element_text(angle = 35, hjust = 1),
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7), # <--- EDIT: 90 degrees
       plot.title  = element_blank(),
-      panel.grid.major = element_blank(),
-      panel.grid.minor = element_blank()
+      axis.title.x = element_blank(), # <--- EDIT: Added
+      axis.ticks = element_blank(), # <--- EDIT: Added
+      panel.grid = element_blank(), # <--- EDIT: Was panel.grid.major/minor
+      panel.border = element_blank(), # <--- EDIT: Added
+      strip.background = element_blank(), # <--- EDIT: Added
+      strip.text = element_text(face = "bold", size = 8.5) # <--- EDIT: Added
     ) +
     labs(x = NULL, y = "Proportion")
 
   ggsave(file.path(out_dir, paste0("FACET_allCells_", level_tag, ".pdf")),
-         p_all, width = 11, height = 8.8, device = cairo_pdf)
+         p_all,
+         width = 8.0, # <--- EDIT: Was 11. Reduced to compress facets.
+         height = 8.8,
+         device = cairo_pdf)
 }
 
 ## ── MAIN ────────────────────────────────────────────────────────────────────
@@ -250,11 +283,11 @@ TCGA_beta <- use_if_exists("TCGA_beta", function() read_beta_TCGA(path_tcga_norm
 
 # 2) Metadata
 
-meta_raw <- read_csv(path_dh_meta_csv, show_col_types = FALSE)              # read once
-has_node <- "node_stage" %in% names(meta_raw)                       # flag
+meta_raw <- read_csv(path_dh_meta_csv, show_col_types = FALSE)           # read once
+has_node <- "node_stage" %in% names(meta_raw)                         # flag
 
 meta_DH <- meta_raw %>%
-  
+ 
   mutate(
     # 1. Create a unique SampleID
     SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
@@ -264,23 +297,24 @@ meta_DH <- meta_raw %>%
 
     # 3. Create the main 3-level metastasis category (renamed to 'mets_cat')
      mets_cat = case_when(
-       Distant_Mets == TRUE                        ~ "Distant",
-       has_node & node_stage > 0                   ~ "LN-only",
-       !has_node & ln_only == TRUE                 ~ "LN-only",
-       TRUE                                        ~ "No Mets"
+       Distant_Mets == TRUE               ~ "Distant",
+       has_node & node_stage > 0          ~ "LN-only",
+       !has_node & ln_only == TRUE        ~ "LN-only",
+       TRUE                               ~ "No Mets"
      ),
 
     # 4. Convert 'mets_cat' to an ordered factor for plotting
     mets_cat = factor(mets_cat,
-                      levels = c("No Metastasis", "LN Metastasis", "Distant Metastasis")),
+                      # <--- THIS IS THE FIX: Levels now match the values from Step 3
+                      levels = c("No Mets", "LN-only", "Distant")),
 
     # 5. Create the simplified binary factor for any metastasis
-        any_mets = factor(ifelse(mets_cat == "No Mets",
-                                      "No Mets", "Mets")),
-        ln_only  = factor(ifelse(mets_cat == "LN-only",
-                                      "LN Mets", "No LN Mets")),
-        dist     = factor(ifelse(mets_cat == "Distant",
-                                      "Distant Mets", "No Distant Mets")),
+     any_mets = factor(ifelse(mets_cat == "No Mets",
+                                    "No Mets", "Mets")),
+     ln_only  = factor(ifelse(mets_cat == "LN-only",
+                                    "LN Mets", "No LN Mets")),
+     dist     = factor(ifelse(mets_cat == "Distant",
+                                    "Distant Mets", "No Distant Mets")),
 
     # 6. Add the dataset label
     dataset = "DH"
@@ -306,6 +340,7 @@ fib_DH   <- use_if_exists("fib_DH",   function() run_epidish_fib(DH_beta))
 fib_GTEx <- use_if_exists("fib_GTEx", function() run_epidish_fib(GTEx_beta))
 fib_TCGA <- use_if_exists("fib_TCGA", function() run_epidish_fib(TCGA_beta))
 
+library(dplyr)
 ## 4) Loop per h-level
 for (h in ih_vec) {
   level_tag <- paste0("h", h)
@@ -343,7 +378,7 @@ msg("\n✅  All levels complete. Outputs in: ", out_root)
 ```
 
 
-Stacked Bar plots
+Figure 2a: Stacked Bar plots
 ```{r}
 ###############################################################################
 #  stackbars_DH_after_deconv.R  ·  run AFTER the main deconv script
@@ -531,7 +566,7 @@ message("Saved: ", fn_all)
 message("✓ Done.")
 ```
 
-Disease progression box plots
+Figure 2C: Disease progression box plots
 ```{r}
 ###############################################################################
 #  deconv_DH_progression_boxplots.R · Figure 2 draft (v2.8 - P-Value Position)
@@ -758,6 +793,7 @@ for (h in ih_vec) {
 
 ```
 
+Figure 2B
 ```{r}
 #New Code 10/20/25
 ###############################################################################
