@@ -1,0 +1,343 @@
+---
+title: "Cell_type_analysis"
+author: "Alos Diallo"
+date: "2025-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+# ewas_metastasis_h6_normImmune.R     · 2025-07-18
+# Single HiTIMED h = 6 → immune-fraction normalisation + EpiScore
+# Phenotypes: any_mets · ln_only · distant
+# NOTE: ComBat is DISABLED — same-cohort v1/v2; using intersected probes instead.
+
+## ── USER SETTINGS ───────────────────────────────────────────────────────────
+idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+phenotypes          <- c(any  = "any_mets",
+                         ln   = "ln_only",
+                         dist = "distant")
+variance_percentile <- 0.90  # 0 ⇒ keep all CpGs
+
+## NEW: centralize outputs/caches here
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+suppressPackageStartupMessages({
+  library(minfi)
+  library(sesame)
+  library(ENmix)
+  library(matrixStats)
+  library(limma)
+  # library(sva)   # <- not needed since ComBat is off
+  library(HiTIMED)
+  library(EpiDISH)
+  library(tidyverse)
+  library(glue)
+})
+
+read_csv_silent <- function(file, ...) {
+  if (utils::packageVersion("readr") >= "2.0.0") {
+    readr::read_csv(file, show_col_types = FALSE, ...)
+  } else {
+    suppressMessages(readr::read_csv(file, ...))
+  }
+}
+
+## ── 1) β-matrix (cached) ────────────────────────────────────────────────────
+## cache under Results
+cache_dir <- file.path(results_root, "ewas_cache")
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+beta_rds      <- file.path(cache_dir, "beta_comb_qc.rds")
+manifest_csv  <- file.path(cache_dir, "sample_manifest_v1_v2.csv")
+
+read_pp <- function(path, tag) {
+  rg  <- read.metharray.exp(path, recursive = TRUE, extended = TRUE, force = TRUE)
+  bet <- getBeta(preprocessNoob(rg, dyeMethod = "single"))
+  if (tag == "v2") bet <- betasCollapseToPfx(bet)
+  bad <- ENmix::QCinfo(rg)$badCpG
+  bet <- bet[ setdiff(rownames(bet), bad), , drop = FALSE]
+  bet
+}
+
+## Save sample IDs per platform so we can label Array_Version later
+if (!file.exists(beta_rds)) {
+  msg("Reading / normalising IDATs …")
+  beta1 <- read_pp(idat_v1, "v1")
+  beta2 <- read_pp(idat_v2, "v2")
+
+  sample_ids_v1 <- colnames(beta1)
+  sample_ids_v2 <- colnames(beta2)
+
+  common <- intersect(rownames(beta1), rownames(beta2))
+  stopifnot(length(common) > 0)
+  beta_comb <- cbind(beta1[common, , drop = FALSE],
+                     beta2[common, , drop = FALSE])
+
+  saveRDS(list(beta = beta_comb,
+               sample_ids_v1 = sample_ids_v1,
+               sample_ids_v2 = sample_ids_v2),
+          beta_rds)
+
+  tibble(
+    SampleID = c(sample_ids_v1, sample_ids_v2),
+    Array_Version = c(rep("v1", length(sample_ids_v1)),
+                      rep("v2", length(sample_ids_v2)))
+  ) %>%
+    distinct() %>%
+    write_csv(manifest_csv)
+
+  msg("β-matrix cached.")
+} else {
+  cache_obj <- readRDS(beta_rds)
+  if (is.list(cache_obj) && !is.null(cache_obj$beta)) {
+    beta_comb     <- cache_obj$beta
+    sample_ids_v1 <- cache_obj$sample_ids_v1
+    sample_ids_v2 <- cache_obj$sample_ids_v2
+  } else {
+    ## backward compat if the RDS used to be only the matrix
+    beta_comb     <- cache_obj
+    sample_ids_v1 <- character(0)
+    sample_ids_v2 <- character(0)
+  }
+  msg("β-matrix loaded from cache.")
+}
+
+## --- Remove sex-linked probes ----------------------------------------------
+get_annotation_for <- function(beta_mat) {
+  if (requireNamespace("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+    a <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  } else if (requireNamespace("IlluminaHumanMethylation450kanno.ilmn12.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(library(IlluminaHumanMethylation450kanno.ilmn12.hg19))
+    a <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  } else {
+    stop("Install an Illumina methylation annotation package (EPIC or 450k).")
+  }
+  a[rownames(a) %in% rownames(beta_mat), , drop = FALSE]
+}
+
+anno <- get_annotation_for(beta_comb)
+
+# Try multiple possible chromosome fields across annotation versions
+chr_vec <- NULL
+if ("chr" %in% colnames(anno))             chr_vec <- anno$chr
+if (is.null(chr_vec) && "CHR" %in% colnames(anno))      chr_vec <- anno$CHR
+if (is.null(chr_vec) && "seqnames" %in% colnames(anno)) chr_vec <- as.character(anno$seqnames)
+if (is.null(chr_vec)) stop("Could not find chromosome column in annotation.")
+
+is_sex_chr <- chr_vec %in% c("chrX","chrY","X","Y")
+sex_probes <- rownames(anno)[is_sex_chr]
+
+n_before <- nrow(beta_comb)
+if (length(sex_probes) > 0) {
+  beta_comb <- beta_comb[setdiff(rownames(beta_comb), sex_probes), , drop = FALSE]
+}
+msg(length(sex_probes), " chrX/chrY probes removed; ",
+    n_before, " → ", nrow(beta_comb), " CpGs remain.")
+
+## ── Variance filter (optional) ──────────────────────────────────────────────
+M.mat <- log2(beta_comb / pmax(1 - beta_comb, 1e-6) + 1e-6)
+if (variance_percentile > 0) {
+  v <- rowVars(M.mat, na.rm = TRUE)
+  var_thr <- quantile(v, variance_percentile, na.rm = TRUE)
+  keep    <- v > var_thr
+  beta_comb <- beta_comb[keep, , drop = FALSE]
+  M.mat     <- M.mat[keep, , drop = FALSE]
+  msg(sum(keep), " CpGs kept (top ", 100 * (1 - variance_percentile), "% var).")
+}
+
+## ── 2a) EpiScore for fibroblasts (RPC) ──────────────────────────────────────
+data(centEpiFibIC.m)  # built-in colon-fibroblast reference
+
+run_episcore <- function(beta) {
+  common <- intersect(rownames(beta), rownames(centEpiFibIC.m))
+  est    <- epidish(beta[common, ],
+                    centEpiFibIC.m[common, ],
+                    method = "RPC")$estF
+  as.data.frame(est) * 100    # columns = Epi, Fib, IC
+}
+
+msg("Running EpiScore (RPC) for fibroblast …")
+fib_scores <- run_episcore(beta_comb) %>%
+  rownames_to_column("SampleID")
+
+## ── 2b) HiTIMED deconvolution (h = 6) ───────────────────────────────────────
+msg("Running HiTIMED  h = 6 …")
+frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(fib_scores, by = "SampleID")   # adds Fib from EpiScore
+
+## ── 3) Collapse / normalise fractions ───────────────────────────────────────
+collapse_frac <- function(df) {
+  get_ <- function(x) if (x %in% names(df)) df[[x]] else 0
+  imm_cols <- c("CD8mem","CD8nv","CD4mem","CD4nv","Treg","Bmem","Bnv","DC","Mono","NK")
+  totalImm <- rowSums(df[imm_cols], na.rm = TRUE); totalImm[totalImm == 0] <- NA
+  tibble(
+    SampleID     = df$SampleID,
+    Tumor        = get_("Tumor"),
+    Fibroblast   = get_("Fib"),               # from EpiScore
+    StromalOther = get_("Endothelial") + get_("Epithelial"),
+    CD8_T        = (get_("CD8mem") + get_("CD8nv")) / totalImm,
+    LymphOther   = (get_("CD4mem") + get_("CD4nv") +
+                    get_("Treg")   + get_("Bmem") + get_("Bnv")) / totalImm
+  ) %>% mutate(across(where(is.numeric), as.numeric))
+}
+
+## ── 4) Tier templates (unchanged design) ────────────────────────────────────
+tier_template <- list(
+  Tier1 = c("age","sex_num","MLH1_num"),
+  Tier2 = c("age","sex_num","MLH1_num","Tumor"),
+  Tier3 = c("age","sex_num","MLH1_num","Tumor",
+            "Fibroblast","StromalOther",
+            "CD8_T","LymphOther")
+)
+trim_tiers <- function(tiers, avail) lapply(tiers, intersect, avail)
+
+## ── 5) Loop over phenotypes (NO ComBat) ─────────────────────────────────────
+for (pheno_tag in names(phenotypes)) {
+  pheno_var <- phenotypes[[pheno_tag]]
+  msg("\n===== ", pheno_var, " =====")
+
+  meta <- read_csv_silent(meta_csv) %>%
+    mutate(
+      SampleID      = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+      any_mets      = as.integer(any_mets),
+      distant       = as.integer(Distant_Mets),
+      ln_only       = as.integer(ln_only),
+      sex_num       = as.integer(sex == "M"),
+      MLH1_num      = as.integer(MLH1 == 1)
+    )
+
+  ## Use saved vectors to tag array version (for reference only)
+  meta <- meta %>%
+    mutate(
+      Array_Version = case_when(
+        SampleID %in% sample_ids_v1 ~ "v1",
+        SampleID %in% sample_ids_v2 ~ "v2",
+        TRUE                        ~ NA_character_
+      )
+    )
+
+  if (any(is.na(meta$Array_Version))) {
+    miss <- meta$SampleID[is.na(meta$Array_Version)]
+    msg("WARNING: ", length(miss), " meta SampleIDs not matched to v1/v2: ",
+        paste(head(miss, 8), collapse = ", "),
+        if (length(miss) > 8) " …" else "")
+  }
+
+  meta$pheno_bin <- dplyr::case_when(
+    pheno_var == "any_mets" ~ meta$any_mets,
+    pheno_var == "distant"  ~ meta$distant,
+    pheno_var == "ln_only"  ~ (meta$ln_only & !meta$distant),
+    TRUE                    ~ NA_integer_
+  )
+  stopifnot(all(meta$pheno_bin %in% 0:1, na.rm = TRUE))
+
+  frac_df  <- collapse_frac(frac_h6)
+  meta_all <- left_join(meta, frac_df, by = "SampleID")
+  ok       <- complete.cases(meta_all[, tier_template$Tier3])
+  meta_f   <- meta_all[ok, , drop = FALSE]
+  M_f      <- M.mat[, meta_f$SampleID, drop = FALSE]
+
+  ## NO ComBat: same-cohort v1/v2 + intersected probes is sufficient
+  M_cb <- M_f
+
+  tier_list <- trim_tiers(tier_template, names(meta_f))
+  fits <- purrr::map(tier_list, function(covs) {
+    # Only numeric covariates with non-zero variance; use stats::sd explicitly
+    is_var <- vapply(
+      meta_f[covs],
+      function(x) is.numeric(x) && is.finite(stats::sd(x, na.rm = TRUE)) && stats::sd(x, na.rm = TRUE) > 0,
+      logical(1)
+    )
+    nz <- covs[is_var]
+
+    form <- if (length(nz) == 0) {
+      ~ pheno_bin
+    } else {
+      as.formula(paste("~ pheno_bin +", paste(nz, collapse = " + ")))
+    }
+    des <- model.matrix(form, meta_f)
+    eBayes(lmFit(M_cb, des), trend = TRUE, robust = TRUE)
+  })
+
+  ## write results under Results root
+  out_dir <- file.path(results_root, glue("results_ewas_{pheno_tag}"), "H6")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(fits, file.path(out_dir, "ewas_fits.rds"))
+  msg("✓  fits saved → ", out_dir)
+}
+
+msg("\n✅ Finished: Any, LN-only, Distant  (HiTIMED-h6, immune-normalised + EpiScore; NO ComBat)")
+```
+
+```{r}
+## ── Build meta + fraction table for proportion models ───────────────────────
+
+meta <- read_csv_silent(meta_csv) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    any_mets = as.integer(any_mets),
+    sex_num  = as.integer(sex == "M")  # 1 = male, 0 = female
+  )
+
+frac_df <- collapse_frac(frac_h6)  # gives Tumor, Fibroblast, CD8_T, etc.
+
+# Join clinical + fractions
+analysis_prop <- meta %>%
+  left_join(frac_df, by = "SampleID")
+
+# Keep only rows with everything we need
+analysis_prop <- analysis_prop %>%
+  dplyr::select(SampleID, any_mets, age, sex_num, Fibroblast, CD8_T) %>%
+  filter(complete.cases(.))
+
+# For readability, rename to match what you wrote
+analysis_prop <- analysis_prop %>%
+  rename(
+    CAF_prop  = Fibroblast,
+    CD8_prop  = CD8_T
+  )
+
+summary(analysis_prop)
+```
+
+```{r}
+## ── Linear models for CD8 and CAF proportions ───────────────────────────────
+
+# CD8 model
+fit_cd8 <- lm(CD8_prop ~ any_mets + age + sex_num, data = analysis_prop)
+
+# CAF model
+fit_caf <- lm(CAF_prop ~ any_mets + age + sex_num, data = analysis_prop)
+
+summary(fit_cd8)
+summary(fit_caf)
+
+library(broom)
+
+cd8_tidy <- broom::tidy(fit_cd8, conf.int = TRUE)
+caf_tidy <- broom::tidy(fit_caf, conf.int = TRUE)
+
+cd8_tidy
+caf_tidy
+
+par(mfrow = c(2, 2))
+plot(fit_cd8)
+plot(fit_caf)
+par(mfrow = c(1, 1))
+
+```
+
+

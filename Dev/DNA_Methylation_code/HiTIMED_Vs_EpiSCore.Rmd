@@ -1,0 +1,464 @@
+---
+title: "Untitled"
+author: "Alos Diallo"
+date: "2026-01-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+## ── 1) LIBRARIES & DATA LOADING ──────────────────────────────────────────────
+library(HiTIMED)
+library(EpiDISH)
+library(tidyverse)
+
+# Use your defined paths
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+beta_rds     <- file.path(results_root, "ewas_cache/beta_comb_qc.rds")
+
+if (!file.exists(beta_rds)) stop("Beta cache not found at: ", beta_rds)
+cache_obj <- readRDS(beta_rds)
+beta_comb <- if (is.list(cache_obj)) cache_obj$beta else cache_obj
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+## ── 2) RUN DECONVOLUTIONS ───────────────────────────────────────────────────
+
+# A) EpiScore (EpiDISH) - Generic 3-component reference
+data(centEpiFibIC.m)
+common_epi <- intersect(rownames(beta_comb), rownames(centEpiFibIC.m))
+
+msg("Running EpiScore (RPC)...")
+out.rpc <- epidish(beta_comb[common_epi, ], centEpiFibIC.m[common_epi, ], method = "RPC")
+# Keeping scale at 0-1 for fractions
+epi_df  <- as.data.frame(out.rpc$estF) %>% rownames_to_column("SampleID")
+
+# B) HiTIMED Level 6 (COAD) - Specific Tumor reference
+msg("Running HiTIMED h=6 (COAD, tumor=TRUE)...")
+hitimed_raw <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) 
+hitimed_df  <- as.data.frame(hitimed_raw) %>% rownames_to_column("SampleID")
+
+# Ensure HiTIMED is on a 0-1 scale (decimal)
+hitimed_numeric <- hitimed_df %>% select(where(is.numeric))
+if (max(hitimed_numeric, na.rm = TRUE) > 1.1) {
+  hitimed_df <- hitimed_df %>% mutate(across(where(is.numeric), ~ .x / 100))
+}
+
+## ── 3) MAPPING & SUMMARY STATISTICS ─────────────────────────────────────────
+
+# We define "Total Epithelial" for HiTIMED as Tumor + Epithelial
+compare_df <- left_join(
+  epi_df %>% select(SampleID, EpiScore_Epi = Epi, EpiScore_Fib = Fib, EpiScore_IC = IC),
+  hitimed_df %>% mutate(HiTIMED_TotalEpi = Tumor + Epithelial) %>% 
+             select(SampleID, HiTIMED_TotalEpi, HiTIMED_Tumor = Tumor, HiTIMED_NormalEpi = Epithelial),
+  by = "SampleID"
+)
+
+# Calculate Summary Stats for both
+summary_stats <- compare_df %>%
+  pivot_longer(cols = -SampleID, names_to = "Metric", values_to = "Val") %>%
+  group_by(Metric) %>%
+  summarise(
+    Mean   = mean(Val),
+    Median = median(Val),
+    SD     = sd(Val),
+    Min    = min(Val),
+    Max    = max(Val),
+    .groups = 'drop'
+  )
+
+print("--- Summary Statistics: Comparison of Proportions ---")
+print(summary_stats)
+
+## ── 4) BOXPLOTS: EPITHELIAL VALIDATION ──────────────────────────────────────
+
+# Long format for plotting
+plot_df <- compare_df %>%
+  select(SampleID, EpiScore_Epi, HiTIMED_TotalEpi) %>%
+  pivot_longer(cols = -SampleID, names_to = "Method", values_to = "Proportion")
+
+ggplot(plot_df, aes(x = Method, y = Proportion, fill = Method)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.3) +
+  theme_bw() +
+  labs(title = "Epithelial Validation: HiTIMED vs. EpiScore",
+       subtitle = "HiTIMED Total Epi = (Tumor + Epithelial) | EpiScore = Epi",
+       y = "Fraction (0 - 1)") +
+  scale_fill_manual(values = c("EpiScore_Epi" = "#4DAF4A", "HiTIMED_TotalEpi" = "#377EB8"))
+
+## ── 5) SCATTER PLOT: CORRELATION ─────────────────────────────────────────────
+
+cor_val <- cor(compare_df$EpiScore_Epi, compare_df$HiTIMED_TotalEpi)
+
+ggplot(compare_df, aes(x = EpiScore_Epi, y = HiTIMED_TotalEpi)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red") +
+  annotate("text", x = 0.2, y = 0.8, label = paste0("R = ", round(cor_val, 3)), size = 5) +
+  theme_minimal() +
+  labs(title = "Correlation of Epithelial Estimates",
+       x = "EpiScore (Epi)",
+       y = "HiTIMED (Tumor + Epithelial)")
+```
+
+
+```{r}
+## ── EWAS & DECONVOLUTION VALIDATION ──────────────────────────────────────────
+# Purpose: Compare HiTIMED (h=6) with EpiScore (centEpiFibIC.m) 
+# Target: Colorectal Cancer (COAD) 
+# Date: 2026-01-26
+## ─────────────────────────────────────────────────────────────────────────────
+
+suppressPackageStartupMessages({
+  library(minfi)
+  library(sesame)
+  library(ENmix)
+  library(matrixStats)
+  library(limma)
+  library(HiTIMED)
+  library(EpiDISH)
+  library(tidyverse)
+  library(glue)
+  library(AnnotationHub)
+  library(ExperimentHub)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+## ── 1) SETTINGS & PATHS ─────────────────────────────────────────────────────
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+cache_dir    <- file.path(results_root, "ewas_cache")
+beta_rds     <- file.path(cache_dir, "beta_comb_qc.rds")
+
+if (!file.exists(beta_rds)) stop("Beta cache not found. Run preprocessing script first.")
+
+## ── 2) LOAD DATA ─────────────────────────────────────────────────────────────
+msg("Loading β-matrix from cache...")
+cache_obj <- readRDS(beta_rds)
+beta_comb <- if (is.list(cache_obj)) cache_obj$beta else cache_obj
+
+## ── 3) RUN DECONVOLUTIONS ───────────────────────────────────────────────────
+
+# A) EpiScore (EpiDISH) - Generic Reference
+data(centEpiFibIC.m)
+common_epi <- intersect(rownames(beta_comb), rownames(centEpiFibIC.m))
+
+msg("Running EpiScore (RPC) for Fibroblasts and Epithelial proportions...")
+out.rpc <- epidish(beta_comb[common_epi, ], centEpiFibIC.m[common_epi, ], method = "RPC")
+# We keep this as 0-1 (fractions)
+epi_df  <- as.data.frame(out.rpc$estF) %>% rownames_to_column("SampleID")
+
+# B) HiTIMED Level 6 (COAD) - Specific Tumor Reference
+msg("Running HiTIMED h=6 (COAD, tumor=TRUE)...")
+hitimed_raw <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) 
+hitimed_df  <- as.data.frame(hitimed_raw) %>% rownames_to_column("SampleID")
+
+# Scale Alignment: Ensure HiTIMED is 0-1 (fractions)
+hitimed_numeric <- hitimed_df %>% select(where(is.numeric))
+if (max(hitimed_numeric, na.rm = TRUE) > 1.1) {
+  msg("Adjusting HiTIMED scale from % to fraction.")
+  hitimed_df <- hitimed_df %>% mutate(across(where(is.numeric), ~ .x / 100))
+}
+
+## ── 4) DATA INTEGRATION & MAPPING ───────────────────────────────────────────
+
+# Create a master comparison frame
+# Critical Step: Summing HiTIMED Tumor + Epithelial to match EpiDISH 'Epi'
+compare_df <- left_join(
+  epi_df %>% select(SampleID, EpiScore_Epi = Epi, EpiScore_Fib = Fib, EpiScore_IC = IC),
+  hitimed_df %>% mutate(HiTIMED_TotalEpi = Tumor + Epithelial) %>% 
+             select(SampleID, HiTIMED_TotalEpi, HiTIMED_Tumor = Tumor, 
+                    HiTIMED_NormalEpi = Epithelial, HiTIMED_Endo = Endothelial),
+  by = "SampleID"
+)
+
+## ── 5) SUMMARY STATISTICS ───────────────────────────────────────────────────
+
+summary_table <- compare_df %>%
+  pivot_longer(cols = -SampleID, names_to = "Cell_Type_Metric", values_to = "Fraction") %>%
+  group_by(Cell_Type_Metric) %>%
+  summarise(
+    n = n(),
+    Mean = mean(Fraction),
+    Median = median(Fraction),
+    SD = sd(Fraction),
+    Min = min(Fraction),
+    Max = max(Fraction),
+    .groups = 'drop'
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+msg("Summary Table Created.")
+print(summary_table)
+write_csv(summary_table, file.path(results_root, "cell_type_comparison_stats.csv"))
+
+## ── 6) FINAL VISUALIZATION ──────────────────────────────────────────────────
+
+# A) Correlation Scatter Plot (The 0.815 Plot)
+cor_val <- cor(compare_df$EpiScore_Epi, compare_df$HiTIMED_TotalEpi)
+
+p1 <- ggplot(compare_df, aes(x = EpiScore_Epi, y = HiTIMED_TotalEpi)) +
+  geom_point(alpha = 0.6, color = "black") +
+  geom_smooth(method = "lm", color = "red", fill = "grey80") +
+  annotate("text", x = min(compare_df$EpiScore_Epi) + 0.05, 
+           y = max(compare_df$HiTIMED_TotalEpi) - 0.05, 
+           label = paste0("R = ", round(cor_val, 3)), size = 6) +
+  theme_bw(base_size = 14) +
+  labs(title = "Correlation of Epithelial Estimates",
+       x = "EpiScore (Epi)",
+       y = "HiTIMED (Tumor + Epithelial)")
+
+# B) Distribution Boxplot
+plot_data <- compare_df %>%
+  select(SampleID, EpiScore_Epi, HiTIMED_TotalEpi) %>%
+  pivot_longer(cols = -SampleID, names_to = "Method", values_to = "Proportion")
+
+p2 <- ggplot(plot_data, aes(x = Method, y = Proportion, fill = Method)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.3) +
+  theme_minimal(base_size = 14) +
+  scale_fill_manual(values = c("EpiScore_Epi" = "#69b3a2", "HiTIMED_TotalEpi" = "#404080")) +
+  labs(title = "Distribution of Epithelial Fractions",
+       y = "Estimated Proportion (0-1)", x = "") +
+  theme(legend.position = "none")
+
+# Display Plots
+print(p1)
+print(p2)
+
+msg("✅ Comparison Analysis Complete. Stats saved to results folder.")
+
+## ── 7) SAVE SUPPLEMENTAL FIGURES ─────────────────────────────────────────────
+
+fig_dir <- file.path(results_root, "Supplemental_Figures")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Helper: consistent PDF saving
+save_pdf <- function(plot, filename, width = 6.5, height = 5.0) {
+  ggsave(
+    filename = file.path(fig_dir, filename),
+    plot = plot,
+    device = cairo_pdf,   # better text embedding
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 300
+  )
+}
+
+save_pdf(p1, "SuppFig_S1_EpiScore_vs_HiTIMED_scatter.pdf", width = 6.5, height = 5.5)
+save_pdf(p2, "SuppFig_S2_EpiScore_vs_HiTIMED_boxplot.pdf", width = 6.5, height = 5.0)
+
+msg("✅ Supplemental PDFs saved to: ", fig_dir)
+```
+
+```{r}
+## ── SUPPLEMENTARY TABLE S1: Complete Cell-Type Proportions ───────────────────
+
+suppressPackageStartupMessages({
+library(AnnotationHub)
+library(ExperimentHub)
+library(HiTIMED)
+library(EpiDISH)
+library(tidyverse)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+## ── 1) LOAD DATA ─────────────────────────────────────────────────────────────
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+beta_rds     <- file.path(results_root, "ewas_cache/beta_comb_qc.rds")
+meta_path    <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+cache_obj <- readRDS(beta_rds)
+beta_comb <- if (is.list(cache_obj)) cache_obj$beta else cache_obj
+
+## ── 2) METADATA ──────────────────────────────────────────────────────────────
+meta_raw <- read_csv(meta_path, show_col_types = FALSE)
+
+meta_DH <- meta_raw %>%
+mutate(
+  SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+  mets_cat = case_when(
+    Distant_Mets == TRUE ~ "Distant Mets",
+    (!is.na(node_stage) & node_stage > 0) | ln_only == TRUE ~ "LN Mets",
+    TRUE ~ "No Mets"
+  ),
+  mets_cat = factor(mets_cat, levels = c("No Mets", "LN Mets", "Distant Mets"))
+) %>%
+filter(SampleID %in% colnames(beta_comb)) %>%
+select(SampleID, mets_cat)
+
+## ── 3) RUN DECONVOLUTIONS ────────────────────────────────────────────────────
+
+# EpiDISH for Fibroblasts
+msg("Running EpiDISH...")
+data(centEpiFibIC.m)
+common_epi <- intersect(rownames(beta_comb), rownames(centEpiFibIC.m))
+out.rpc <- epidish(beta_comb[common_epi, ], centEpiFibIC.m[common_epi, ], method = "RPC")
+fib_df <- as.data.frame(out.rpc$estF) %>%
+rownames_to_column("SampleID") %>%
+mutate(Fib = Fib * 100) %>%
+select(SampleID, Fib)
+
+# HiTIMED h2 for Total Immune (used for normalization)
+msg("Running HiTIMED h2...")
+h2_res <- HiTIMED_deconvolution(beta_comb, "COAD", 2, "tumor")
+h2_df <- as.data.frame(h2_res) %>%
+rownames_to_column("SampleID")
+
+# HiTIMED h3 for aggregated compartments
+msg("Running HiTIMED h3...")
+h3_res <- HiTIMED_deconvolution(beta_comb, "COAD", 3, "tumor")
+h3_df <- as.data.frame(h3_res) %>%
+rownames_to_column("SampleID")
+
+# HiTIMED h4 for Granulocytes, Mononuclear
+msg("Running HiTIMED h4...")
+h4_res <- HiTIMED_deconvolution(beta_comb, "COAD", 4, "tumor")
+h4_df <- as.data.frame(h4_res) %>%
+rownames_to_column("SampleID")
+
+# HiTIMED h6 for granular immune cells
+msg("Running HiTIMED h6...")
+h6_res <- HiTIMED_deconvolution(beta_comb, "COAD", 6, "tumor")
+h6_df <- as.data.frame(h6_res) %>%
+rownames_to_column("SampleID")
+
+## ── 4) COMBINE ALL DATA ──────────────────────────────────────────────────────
+msg("Combining all deconvolution results...")
+
+# Use h6 as base for Tumor, Stromal, Epithelial, Endothelial, and granular immune
+# Add Lymphocyte and Myeloid from h3 (only these two)
+# Add Granulocyte and Mononuclear from h4 (only these two)
+# Add Fib from EpiDISH
+# Add Immune from h2
+
+combined <- meta_DH %>%
+left_join(fib_df, by = "SampleID") %>%
+left_join(h2_df %>% select(SampleID, Immune), by = "SampleID") %>%
+left_join(h3_df %>% select(SampleID, Lymphocyte, Myeloid), by = "SampleID") %>%
+left_join(h4_df %>% select(SampleID, Granulocyte, Mononuclear), by = "SampleID") %>%
+left_join(h6_df, by = "SampleID")
+
+# Verify key columns exist
+msg("Tumor present:", "Tumor" %in% names(combined))
+msg("Stromal present:", "Stromal" %in% names(combined))
+
+# Normalize immune subsets by Total Immune
+immune_cols <- c("Lymphocyte", "Myeloid", "Granulocyte", "Mononuclear",
+               "Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem",
+               "Mono", "DC", "NK", "Bas", "Eos", "Neu")
+
+combined <- combined %>%
+mutate(across(all_of(intersect(immune_cols, names(.))),
+              ~ if_else(Immune > 0 & !is.na(Immune), (.x / Immune) * 100, NA_real_),
+              .names = "{.col}_norm"))
+
+## ── 5) GENERATE SUMMARY TABLE ────────────────────────────────────────────────
+msg("Generating summary statistics...")
+
+# Define cell types
+structural_cells <- c("Tumor", "Stromal", "Epithelial", "Endothelial", "Fib", "Immune")
+aggregated_immune <- c("Lymphocyte_norm", "Myeloid_norm", "Granulocyte_norm", "Mononuclear_norm")
+granular_immune <- c("CD4mem_norm", "CD4nv_norm", "CD8mem_norm", "CD8nv_norm", "Treg_norm",
+                   "Bmem_norm", "Bnv_norm", "NK_norm",
+                   "DC_norm", "Mono_norm",
+                   "Bas_norm", "Eos_norm", "Neu_norm")
+
+all_cells <- c(structural_cells, aggregated_immune, granular_immune)
+all_cells <- intersect(all_cells, names(combined))
+
+msg("Cell types included:")
+print(all_cells)
+
+# Pivot to long format
+long_df <- combined %>%
+pivot_longer(cols = all_of(all_cells), names_to = "Cell", values_to = "Prop") %>%
+filter(!is.na(mets_cat), !is.na(Prop))
+
+# Calculate summary statistics - Median (Min-Max)
+summary_table_clean <- long_df %>%
+group_by(Cell, mets_cat) %>%
+summarise(
+  Median = median(Prop, na.rm = TRUE),
+  Min = min(Prop, na.rm = TRUE),
+  Max = max(Prop, na.rm = TRUE),
+  .groups = "drop"
+) %>%
+mutate(Value = sprintf("%.1f (%.1f-%.1f)", Median, Min, Max)) %>%
+select(Cell, mets_cat, Value)
+
+# Pivot to one column per group
+supp_table_s1 <- summary_table_clean %>%
+pivot_wider(
+  id_cols = Cell,
+  names_from = mets_cat,
+  values_from = Value
+)
+
+# Clean cell names with proper labels including units
+# Logical order: Tumor/Structural first, then Immune total, then immune subsets by lineage
+cell_lookup <- tribble(
+~old_name,          ~clean_name,                          ~order,
+# Tumor and Structural (% of total)
+"Tumor",            "Tumor, % of total",                  1,
+"Stromal",          "Stromal, % of total",                2,
+"Epithelial",       "Epithelial, % of total",             3,
+"Endothelial",      "Endothelial, % of total",            4,
+"Fib",              "Fibroblasts, % of total",            5,
+# Total Immune
+"Immune",           "Immune, % of total",                 6,
+# Immune compartments (% of immune)
+"Lymphocyte_norm",  "Lymphocyte, % of immune",            7,
+"Myeloid_norm",     "Myeloid, % of immune",               8,
+"Granulocyte_norm", "Granulocytes, % of immune",          9,
+"Mononuclear_norm", "Other Mononuclear, % of immune",     10,
+# T-cells (% of immune)
+"CD4mem_norm",      "CD4+ T-cells (memory), % of immune", 11,
+"CD4nv_norm",       "CD4+ T-cells (naive), % of immune",  12,
+"CD8mem_norm",      "CD8+ T-cells (memory), % of immune", 13,
+"CD8nv_norm",       "CD8+ T-cells (naive), % of immune",  14,
+"Treg_norm",        "Regulatory T-cells, % of immune",    15,
+# B-cells (% of immune)
+"Bmem_norm",        "B-cells (memory), % of immune",      16,
+"Bnv_norm",         "B-cells (naive), % of immune",       17,
+# NK cells
+"NK_norm",          "NK cells, % of immune",              18,
+# Myeloid subsets (% of immune)
+"DC_norm",          "Dendritic cells, % of immune",       19,
+"Mono_norm",        "Monocytes, % of immune",             20,
+# Granulocyte subsets (% of immune)
+"Bas_norm",         "Basophils, % of immune",             21,
+"Eos_norm",         "Eosinophils, % of immune",           22,
+"Neu_norm",         "Neutrophils, % of immune",           23
+)
+
+# Apply cell name lookup and reorder
+supp_table_s1 <- supp_table_s1 %>%
+left_join(cell_lookup, by = c("Cell" = "old_name")) %>%
+arrange(order) %>%
+select(
+  `Cell Type` = clean_name,
+  `No Mets`,
+  `LN Mets`,
+  `Distant Mets`
+)
+
+# Rename columns with proper headers (line breaks for Word/Excel)
+colnames(supp_table_s1) <- c(
+"Cell Type",
+"No Mets (n=25)\nMedian (Range)",
+"LN Mets (n=13)\nMedian (Range)",
+"Distant Mets (n=19)\nMedian (Range)"
+)
+
+print(supp_table_s1, n = 25)
+
+# Save
+write_csv(supp_table_s1, file.path(results_root, "Supplementary_Table_S1_CellType_ByMets.csv"))
+msg("✅ Supplementary Table S1 saved!")
+```
+

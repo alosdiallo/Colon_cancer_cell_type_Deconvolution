@@ -1,0 +1,573 @@
+---
+title: "Enrichment Analaysis"
+author: "Alos Diallo"
+date: "2025-10-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Running DMRCate and Saving the results
+```{r}
+###############################################################################
+#  Enrichment analysis for ALL phenotypes using existing CSVs
+#  (no .RData load/save; loops over any / ln / dist)
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(glue)
+  library(GenomicRanges)
+  library(DMRcate)
+  library(data.table)
+  library(minfi)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+# --- CONFIG ---
+results_root <- if (exists("results_root")) results_root else "/Users/adiallo/Desktop/Thesis/Results"
+phenotypes   <- c("any", "ln", "dist")
+DMR_FDR_THRESHOLD <- 0.05
+DMR_MIN_CPGS      <- 3
+
+###############################################################################
+# Function: load_annotation_auto()
+# Dynamically loads Illumina annotation (EPIC or 450K) — no beta matrix required
+###############################################################################
+load_annotation_auto <- function() {
+  suppressPackageStartupMessages(library(minfi))
+  
+  # Try EPIC first (newer platform)
+  if (requireNamespace("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(
+      library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+    )
+    msg("✓ Using Illumina EPIC annotation (hg19).")
+    a <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+    
+  # Fallback to 450k if EPIC not available
+  } else if (requireNamespace("IlluminaHumanMethylation450kanno.ilmn12.hg19", quietly = TRUE)) {
+    suppressPackageStartupMessages(
+      library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+    )
+    msg("✓ Using Illumina 450K annotation (hg19).")
+    a <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+    
+  } else {
+    stop("❌ No Illumina methylation annotation package found. Install EPIC or 450K.")
+  }
+  
+  msg("✓ Loaded annotation with ", nrow(a), " CpGs.")
+  return(a)
+}
+
+# --- Call it once at the start of the script ---
+anno <- load_annotation_auto()
+
+###############################################################################
+# 1) Enrichment plotting function (unchanged, except bigger figure + linewidth)
+###############################################################################
+run_enrichment_analysis <- function(sig_probes,
+                                    universe_probes,
+                                    anno_df,
+                                    output_file,
+                                    plot_title = "",
+                                    plot_subtitle = "") {
+
+  # Filter annotation to only probes in our universe
+  anno_universe <- anno_df %>%
+    dplyr::filter(probeID %in% universe_probes)
+
+  final_universe_probes <- anno_universe$probeID
+  final_sig_probes      <- intersect(sig_probes, final_universe_probes)
+
+  n_sig <- length(final_sig_probes)
+  n_univ <- length(final_universe_probes)
+
+  if (n_sig < 10) {
+    msg("  [WARNING] Too few significant probes (", n_sig, ") for enrichment. Skipping plot.")
+    return(NULL)
+  }
+
+  all_regions <- unique(anno_universe$region)
+
+  enrich_results <- purrr::map_dfr(all_regions, function(current_region) {
+    probes_in_region <- anno_universe %>%
+      dplyr::filter(region == current_region) %>%
+      dplyr::pull(probeID)
+
+    A <- sum(final_sig_probes %in% probes_in_region)
+    C <- n_sig - A
+    B <- length(probes_in_region) - A
+    D <- n_univ - (A + B + C)
+
+    test <- fisher.test(matrix(c(A, C, B, D), nrow = 2, byrow = TRUE))
+
+    tibble(
+      region = current_region,
+      OR     = as.numeric(test$estimate),
+      CI_low = test$conf.int[1],
+      CI_high= test$conf.int[2],
+      p_value = test$p.value
+    )
+  })
+
+  region_order <- c("N Shelf", "N Shore", "CpG Island", "S Shore", "S Shelf", "Open Sea")
+  enrich_results$region <- factor(enrich_results$region, levels = region_order)
+
+  p <- ggplot(enrich_results, aes(x = region, y = OR)) +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "black") +
+    geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.1, linewidth = 0.8, color = "black") +
+    geom_point(size = 3, shape = 18, color = "black") +
+    scale_x_discrete(drop = FALSE) +
+    coord_cartesian(ylim = c(0.25, 2.25)) +
+    labs(y = "Odds ratio", x = "") +
+    theme_classic(base_size = 16) +
+    theme(
+      axis.text.x  = element_text(angle = 0, hjust = 0.5),
+      axis.title.y = element_text(face = "bold"),
+      axis.ticks.x = element_blank(),
+      plot.title   = element_blank(),
+      plot.subtitle= element_blank()
+    )
+
+  ggsave(output_file, p, width = 8, height = 6, dpi = 300)
+  msg("  ✓ Enrichment plot saved → ", output_file)
+  invisible(enrich_results)
+}
+
+###############################################################################
+# 2) Prepare annotation table for island context (unchanged)
+###############################################################################
+anno_clean_df <- as.data.frame(anno) %>%
+  dplyr::select(probeID = Name, region = Relation_to_Island, chr = chr, pos = pos) %>%
+  dplyr::filter(!is.na(region), !is.na(probeID)) %>%
+  dplyr::mutate(region = dplyr::recode(region,
+    "Island"   = "CpG Island",
+    "N_Shore"  = "N Shore",
+    "S_Shore"  = "S Shore",
+    "N_Shelf"  = "N Shelf",
+    "S_Shelf"  = "S Shelf",
+    "OpenSea"  = "Open Sea"
+  )) %>%
+  dplyr::distinct(probeID, .keep_all = TRUE)
+msg("Annotation prepped (", nrow(anno_clean_df), " CpGs retained).")
+
+###############################################################################
+# 3) Build the probe GRanges (with cgID names) ONCE
+#    Prefer myAnno@ranges if present; else build from manifest
+###############################################################################
+if (exists("myAnno") && inherits(myAnno@ranges, "GRanges")) {
+  all_probes_gr <- myAnno@ranges
+  # If names are missing or look like coordinates, (re)map to cgIDs by ±2bp
+  need_map <- !length(names(all_probes_gr)) ||
+              all(grepl("^chr", head(names(all_probes_gr), 50), perl = TRUE))
+  if (need_map) {
+    msg("  [INFO] Mapping probe ranges to cgIDs (±2 bp) using manifest (myAnno present).")
+    gr_df <- as.data.frame(all_probes_gr) %>%
+      dplyr::transmute(chr = as.character(seqnames),
+                       pos = as.numeric(start))
+  } else {
+    msg("  [INFO] Using cgID-named probe ranges from myAnno.")
+  }
+} else {
+  msg("  [INFO] myAnno not available → building probe ranges from manifest.")
+  # Construct GRanges directly from annotation manifest
+  gr_df <- anno_clean_df %>%
+    dplyr::transmute(chr = as.character(chr),
+                     pos = as.numeric(pos),
+                     probeID = probeID)
+  all_probes_gr <- GRanges(seqnames = gr_df$chr,
+                           ranges   = IRanges(start = gr_df$pos, width = 1))
+  names(all_probes_gr) <- gr_df$probeID
+  need_map <- FALSE
+}
+
+# If we need to map cgIDs onto all_probes_gr (names missing / coordinates), do it once
+if (exists("gr_df") && need_map) {
+  anno_lookup <- anno_clean_df %>%
+    dplyr::select(chr, pos, probeID)
+
+  data.table::setDT(anno_lookup)
+  x_dt <- data.table::data.table(chr = gr_df$chr,
+                                 start = gr_df$pos - 2,
+                                 end   = gr_df$pos + 2,
+                                 idx   = seq_len(nrow(gr_df)))
+  y_dt <- data.table::data.table(chr = anno_lookup$chr,
+                                 start = anno_lookup$pos,
+                                 end   = anno_lookup$pos,
+                                 probeID = anno_lookup$probeID)
+  data.table::setkey(x_dt, chr, start, end)
+  data.table::setkey(y_dt, chr, start, end)
+  mapped <- data.table::foverlaps(x_dt, y_dt, type = "any", nomatch = 0L)[order(idx)]
+  mapped_unique <- mapped[!duplicated(idx)]
+  names(all_probes_gr) <- NA_character_
+  names(all_probes_gr)[mapped_unique$idx] <- mapped_unique$probeID
+  keep <- which(!is.na(names(all_probes_gr)))
+  all_probes_gr <- all_probes_gr[keep]
+  msg("  [INFO] Successfully mapped ", length(keep), " probes to cgIDs.")
+}
+
+# Universe for enrichment
+universe_list <- names(all_probes_gr)
+msg("  [INFO] Universe–Annotation overlap: ",
+    length(intersect(universe_list, anno_clean_df$probeID)), " probes shared.")
+
+###############################################################################
+# 4) Helper: read DMR CSV and make GRanges for hyper / hypo selections
+###############################################################################
+dmr_csv_to_gr <- function(csv_path, direction = c("hyper", "hypo")) {
+  direction <- match.arg(direction)
+  if (!file.exists(csv_path)) return(GRanges())
+
+  x <- suppressMessages(readr::read_csv(csv_path, show_col_types = FALSE))
+  if (!nrow(x)) return(GRanges())
+
+  # Apply thresholds & direction
+  x <- x %>%
+    dplyr::filter(
+      no.cpgs >= DMR_MIN_CPGS,
+      min_smoothed_fdr < DMR_FDR_THRESHOLD,
+      if (direction == "hyper") meanmeth.diff > 0 else meanmeth.diff < 0
+    )
+
+  if (!nrow(x)) return(GRanges())
+
+  GRanges(seqnames = x$chr,
+          ranges   = IRanges(start = x$start, end = x$end))
+}
+
+###############################################################################
+# 5) LOOP: run enrichment for each phenotype using ONLY the CSV outputs
+###############################################################################
+for (pheno_tag in phenotypes) {
+  msg("\n==============================")
+  msg(">>> Running enrichment for phenotype: ", pheno_tag)
+
+  dmr_dir  <- file.path(results_root, glue("results_ewas_{pheno_tag}"), "H6", "DMRcate_Tier3")
+  csv_path <- file.path(dmr_dir, "dmrcate_lambda1000_C2_min3cpgs.csv")
+
+  if (!file.exists(csv_path)) {
+    msg("  [WARNING] DMR CSV not found → ", csv_path, " (skipping).")
+    next
+  }
+
+  # Build GRanges from CSV for hyper & hypo
+  gr_hyper <- dmr_csv_to_gr(csv_path, "hyper")
+  gr_hypo  <- dmr_csv_to_gr(csv_path, "hypo")
+
+  # Overlap probes (cgID-named) with phenotype-specific DMRs
+  if (length(gr_hyper)) {
+    ov_hyper <- findOverlaps(all_probes_gr, gr_hyper)
+    probes_hyper <- unique(names(all_probes_gr)[queryHits(ov_hyper)])
+    probes_hyper <- probes_hyper[!is.na(probes_hyper)]
+    msg("  [DEBUG] Hyper probes captured from overlaps: ", length(probes_hyper))
+
+    run_enrichment_analysis(
+      sig_probes      = probes_hyper,
+      universe_probes = universe_list,
+      anno_df         = anno_clean_df,
+      output_file     = file.path(dmr_dir, "enrichment_plot_DMR_HYPER.png"),
+      plot_title      = "Enrichment (Probes in HYPER DMRs)",
+      plot_subtitle   = glue("{pheno_tag} | {length(probes_hyper)} probes")
+    )
+  } else {
+    msg("  [INFO] No hyper DMRs passing thresholds for ", pheno_tag, ".")
+  }
+
+  if (length(gr_hypo)) {
+    ov_hypo <- findOverlaps(all_probes_gr, gr_hypo)
+    probes_hypo <- unique(names(all_probes_gr)[queryHits(ov_hypo)])
+    probes_hypo <- probes_hypo[!is.na(probes_hypo)]
+    msg("  [DEBUG] Hypo probes captured from overlaps: ", length(probes_hypo))
+
+    run_enrichment_analysis(
+      sig_probes      = probes_hypo,
+      universe_probes = universe_list,
+      anno_df         = anno_clean_df,
+      output_file     = file.path(dmr_dir, "enrichment_plot_DMR_HYPO.png"),
+      plot_title      = "Enrichment (Probes in HYPO DMRs)",
+      plot_subtitle   = glue("{pheno_tag} | {length(probes_hypo)} probes")
+    )
+  } else {
+    msg("  [INFO] No hypo DMRs passing thresholds for ", pheno_tag, ".")
+  }
+
+  msg("✓ Enrichment analysis completed for: ", pheno_tag)
+}
+
+msg("\n✓ Enrichment analysis completed for all phenotypes.")
+```
+
+
+Figure 3D:Generating the Genomic context plots
+```{r}
+###############################################################################
+# Combined enrichment plots for all phenotypes (any / ln / dist)
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(glue)
+  library(GenomicRanges)
+  library(DMRcate)
+  library(data.table)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+central_plot_dir <- file.path(results_root, "DMRcate_Tier3")
+dir.create(central_plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+phenotypes <- c("any", "ln", "dist")
+DMR_FDR_THRESHOLD <- 0.05
+DMR_MIN_CPGS <- 3
+
+###############################################################################
+# Helper: read DMR CSV and make GRanges
+###############################################################################
+dmr_csv_to_gr <- function(csv_path, direction = c("hyper", "hypo")) {
+  direction <- match.arg(direction)
+  if (!file.exists(csv_path)) return(GRanges())
+
+  x <- suppressMessages(readr::read_csv(csv_path, show_col_types = FALSE))
+  if (!nrow(x)) return(GRanges())
+
+  x <- x %>%
+    filter(
+      no.cpgs >= DMR_MIN_CPGS,
+      min_smoothed_fdr < DMR_FDR_THRESHOLD,
+      if (direction == "hyper") meanmeth.diff > 0 else meanmeth.diff < 0
+    )
+
+  if (!nrow(x)) return(GRanges())
+
+  GRanges(seqnames = x$chr,
+          ranges   = IRanges(start = x$start, end = x$end))
+}
+
+###############################################################################
+# Combined enrichment plotting function (PDF output for Illustrator)
+###############################################################################
+plot_combined_enrichment <- function(df_hyper, df_hypo, output_file) {
+  df_hyper$type <- "Hyper"
+  df_hypo$type  <- "Hypo"
+  df <- bind_rows(df_hyper, df_hypo)
+
+  y_max <- max(df$CI_high, na.rm = TRUE) + 0.5
+
+  p <- ggplot(df, aes(x = region, y = OR, color = type)) +
+    geom_hline(yintercept = 1, linetype = "dotted", color = "black") +
+    geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.12, linewidth = 1) +
+    geom_point(size = 3, shape = 18) +
+    scale_color_manual(values = c("Hyper" = "red", "Hypo" = "blue")) +
+    coord_cartesian(ylim = c(0, y_max)) +
+    labs(y = "Odds ratio", x = "", color = "") +
+    theme_classic(base_size = 18) +
+    theme(
+      axis.text.x = element_text(size = 14, angle = 0, hjust = 0.5),
+      axis.title.y = element_text(face = "bold"),
+      legend.position = "top"
+    )
+
+  # --- Save as high-resolution PDF for Illustrator ---
+  pdf_file <- sub("\\.png$", ".pdf", output_file)
+  ggsave(pdf_file, p, width = 9, height = 6.5, device = cairo_pdf)
+  msg("  ✓ Combined PDF plot saved → ", pdf_file)
+}
+
+###############################################################################
+# Run for each phenotype
+###############################################################################
+for (pheno_tag in phenotypes) {
+  msg("\n==============================")
+  msg(">>> Running combined enrichment for phenotype:", pheno_tag)
+
+  dmr_dir  <- file.path(results_root, glue("results_ewas_{pheno_tag}/H6/DMRcate_Tier3"))
+  csv_path <- file.path(dmr_dir, "dmrcate_lambda1000_C2_min3cpgs.csv")
+  if (!file.exists(csv_path)) {
+    msg("  [WARNING] No CSV found for ", pheno_tag, " → skipping.")
+    next
+  }
+
+  # Build GRanges for hyper/hypo
+  gr_hyper <- dmr_csv_to_gr(csv_path, "hyper")
+  gr_hypo  <- dmr_csv_to_gr(csv_path, "hypo")
+
+  if (!exists("all_probes_gr") || !exists("anno_clean_df")) {
+    stop("Missing 'all_probes_gr' or 'anno_clean_df' — run mapping first.")
+  }
+
+  universe_list <- names(all_probes_gr)
+
+  run_enrichment <- function(gr, label) {
+    if (!length(gr)) return(NULL)
+    ov <- findOverlaps(all_probes_gr, gr)
+    probes <- unique(names(all_probes_gr)[queryHits(ov)])
+    probes <- probes[!is.na(probes)]
+
+    anno_universe <- anno_clean_df %>% filter(probeID %in% universe_list)
+    all_regions <- unique(anno_universe$region)
+
+    purrr::map_dfr(all_regions, function(current_region) {
+      probes_in_region <- anno_universe %>%
+        filter(region == current_region) %>%
+        pull(probeID)
+
+      A <- sum(probes %in% probes_in_region)
+      C <- length(probes) - A
+      B <- length(probes_in_region) - A
+      D <- length(universe_list) - (A + B + C)
+      test <- fisher.test(matrix(c(A, C, B, D), nrow = 2, byrow = TRUE))
+
+      tibble(
+        region = current_region,
+        OR = as.numeric(test$estimate),
+        CI_low = test$conf.int[1],
+        CI_high = test$conf.int[2],
+        p_value = test$p.value
+      )
+    })
+  }
+
+  df_hyper <- run_enrichment(gr_hyper, "Hyper")
+  df_hypo  <- run_enrichment(gr_hypo,  "Hypo")
+
+  if (is.null(df_hyper) && is.null(df_hypo)) {
+    msg("  [INFO] No DMRs found for ", pheno_tag, ".")
+    next
+  }
+
+  combined_file <- file.path(central_plot_dir, glue("enrichment_combined_{pheno_tag}.png"))
+  plot_combined_enrichment(df_hyper, df_hypo, combined_file)
+}
+
+msg("\n✓ Combined enrichment analysis completed for all phenotypes.")
+```
+
+Gene lists
+```{r}
+###############################################################################
+# Extract gene symbols associated with DMRs for Results section
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(dplyr)
+  library(glue)
+  library(GenomicRanges)
+  library(ChIPseeker)
+  library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+  library(org.Hs.eg.db)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+phenotypes   <- c("any", "ln", "dist")
+DMR_FDR_THRESHOLD <- 0.05
+DMR_MIN_CPGS      <- 3
+
+###############################################################################
+# Helper: read DMR CSV and convert to GRanges
+###############################################################################
+dmr_csv_to_gr <- function(csv_path) {
+  if (!file.exists(csv_path)) return(GRanges())
+
+  x <- suppressMessages(readr::read_csv(csv_path, show_col_types = FALSE))
+  if (!nrow(x)) return(GRanges())
+
+  x <- x %>%
+    filter(no.cpgs >= DMR_MIN_CPGS,
+           min_smoothed_fdr < DMR_FDR_THRESHOLD)
+
+  if (!nrow(x)) return(GRanges())
+
+  GRanges(seqnames = x$chr,
+          ranges   = IRanges(start = x$start, end = x$end),
+          FDR      = x$FDR,
+          meanmeth.diff = x$meanmeth.diff,
+          contrast = NA_character_)
+}
+
+###############################################################################
+# Loop through phenotypes and extract gene symbols
+###############################################################################
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+
+all_annots <- list()
+
+for (pheno_tag in phenotypes) {
+  msg("\n==============================")
+  msg(">>> Annotating DMRs for phenotype:", pheno_tag)
+
+  dmr_dir  <- file.path(results_root, glue("results_ewas_{pheno_tag}/H6/DMRcate_Tier3"))
+  csv_path <- file.path(dmr_dir, "dmrcate_lambda1000_C2_min3cpgs.csv")
+
+  if (!file.exists(csv_path)) {
+    msg("  [WARNING] No CSV found for ", pheno_tag, " → skipping.")
+    next
+  }
+
+  gr <- dmr_csv_to_gr(csv_path)
+  if (length(gr) == 0) {
+    msg("  [INFO] No valid DMRs for ", pheno_tag)
+    next
+  }
+
+  gr$contrast <- pheno_tag
+
+  ann <- annotatePeak(
+    gr,
+    TxDb = txdb,
+    tssRegion = c(-2000, 2000),
+    annoDb = "org.Hs.eg.db"
+  )
+
+  ann_df <- as.data.frame(ann) %>%
+    mutate(
+      SYMBOL = mapIds(
+        org.Hs.eg.db,
+        keys = as.character(geneId),
+        column = "SYMBOL",
+        keytype = "ENTREZID",
+        multiVals = "first"
+      ),
+      contrast = pheno_tag
+    ) %>%
+    dplyr::select(contrast, seqnames, start, end, SYMBOL, annotation, FDR, meanmeth.diff)
+
+  all_annots[[pheno_tag]] <- ann_df
+  msg("  ✓ Annotated", nrow(ann_df), "DMRs for", pheno_tag)
+}
+
+###############################################################################
+# Combine all annotations and save summary
+###############################################################################
+dmr_gene_table <- bind_rows(all_annots) %>%
+  arrange(contrast, FDR)
+
+# Save to CSV for your Results section
+out_dir <- file.path(results_root, "DMRcate_Tier3")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+out_path <- file.path(out_dir, "DMR_gene_annotations_all.csv")
+
+write_csv(dmr_gene_table, out_path)
+msg("\n✓ DMR gene annotation table saved →", out_path)
+
+###############################################################################
+# Optional: show top genes for quick reference
+###############################################################################
+msg("\nTop genes per phenotype (by lowest FDR):")
+dmr_gene_table %>%
+  group_by(contrast) %>%
+  slice_min(FDR, n = 10) %>%
+  dplyr::select(contrast, SYMBOL, annotation, FDR, meanmeth.diff) %>%
+  print(n = 30)
+```
+
+

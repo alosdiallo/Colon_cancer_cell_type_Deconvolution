@@ -1,0 +1,2304 @@
+---
+title: "Validation_Methylation_extra_code"
+author: "Alos Diallo"
+date: "2026-02-09"
+output: html_document
+---
+
+
+
+Validation Single Cell
+```{r}
+options(future.globals.maxSize = 8000 * 1024^2)
+
+###############################################################################
+# atlas_DH_end_to_end_exports_v2.R
+#  - EWAS top-N CpGs → genes
+#  - Atlas label mapping (cl295v11SubFull) → detailtype/supertype (barcode-aligned)
+#  - Subset to T cells / Fibroblasts / Tumor cells
+#  - Export PDFs:
+#       * UMAP_overview.pdf (supertype + detailtype)
+#       * ModuleScore_DHsig1_UMAP.pdf
+#       * FeaturePlots_paged_pXXX.pdf
+#       * DotPlots_by_supertype_pXXX.pdf
+#  - Save enriched atlas RDS
+###############################################################################
+
+## 0) CONFIG (edit paths as needed)
+path_ewas_results   <- "/Users/adiallo/Desktop/Thesis/code"
+h_level             <- "H6"
+tier                <- "Tier3"
+phenotypes          <- c("any","ln","dist")
+top_n_cpgs_list     <- c(25, 50, 100)
+max_n_total         <- max(top_n_cpgs_list)
+n_half              <- floor(max_n_total/2)
+
+atlas_rds           <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/atlas_data.rds"
+out_dir             <- "results_TCGA_validation_heatmaps_V7"
+overview_pdf        <- file.path(out_dir, "UMAP_overview.pdf")
+module_pdf          <- file.path(out_dir, "ModuleScore_DHsig1_UMAP.pdf")
+feature_pdf_prefix  <- file.path(out_dir, "FeaturePlots_paged")      # will create _p001.pdf, _p002.pdf, ...
+dot_pdf_prefix      <- file.path(out_dir, "DotPlots_by_supertype")   # will create _p001.pdf, _p002.pdf, ...
+save_atlas_rds      <- file.path(out_dir, "atlas_with_supertype.rds")
+
+# FeaturePlot / DotPlot pagination controls
+features_per_page   <- 24
+downsample_n        <- 0                  # set >0 (e.g., 80000) to downsample cells for FeaturePlots only
+raster_dpi_vec      <- c(200, 200)        # must be two-length numeric vector
+
+## 1) LIBRARIES
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(dplyr)
+  library(glue)
+  library(ggplot2)
+  library(patchwork)
+  library(grid)
+  library(limma)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+# Larger seed for reproducibility (affects AddModuleScore background bins, etc.)
+set.seed(20250809)
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+# ---- helper: safely set default layer on Assay5 (no-op on others) ----------
+set_default_layer_safe <- function(obj, assay = "RNA", layer = "data") {
+  if (!assay %in% names(obj@assays)) return(obj)
+  aa <- obj[[assay]]
+  if (inherits(aa, "Assay5")) {
+    # Only SeuratObject v5 Assay5 supports DefaultLayer<-
+    try({
+      SeuratObject::DefaultLayer(aa) <- layer
+      obj[[assay]] <- aa
+    }, silent = TRUE)
+  }
+  obj
+}
+
+## 2) CONSOLIDATED LABELS (exact matches to cl295v11SubFull)
+consolidated_labels <- c(
+  "cB2 (B GC-like)" = "B cells",
+  "cE02 (Stem/TA-like/Immature Goblet)" = "Tumor cells",
+  "cE04 (Enterocyte 1)" = "Tumor cells",
+  "cE03 (Stem/TA-like prolif)" = "Tumor cells",
+  "cM01 (Monocyte)" = "Monocytes",
+  "cS28 (GREM1+ CAF)" = "Fibroblasts",
+  "cM02 (Macrophage-like)" = "Macrophages",
+  "cS06 (Endo lymphatic)" = "Endothelial cells",
+  "cP2 (Plasma IgG)" = "Plasma cells",
+  "cS29 (MMP3+ CAF)" = "Fibroblasts",
+  "cMA01 (Mast)" = "Mast cells",
+  "cP1 (Plasma IgA)" = "Plasma cells",
+  "cS33 (Schwann)" = "Schwann cells",
+  "cTNI08 (CD4+ Treg)" = "Treg",
+  "cE06 (Immature Goblet)" = "Tumor cells",
+  "cS04 (Endo)" = "Endothelial cells",
+  "cS17 (Pericyte)" = "Pericytes",
+  "cS30 (CAF CCL8 Fibro-like)" = "Fibroblasts",
+  "cS31 (CAF stem niche Fibro-like)" = "Fibroblasts",
+  "cTNI13 (CD8+ T IL17+)" = "CD8+ T-cells",
+  "cTNI17 (gd-like T)" = "CD8+ T-cells",
+  "cE01 (Stem/TA-like)" = "Tumor cells",
+  "cS27 (CXCL14+ CAF)" = "Fibroblasts",
+  "cTNI01 (CD4+ IL7R+)" = "CD4+ T-cells",
+  "cE05 (Enterocyte 2)" = "Tumor cells",
+  "cB3 (B CD40+ GC-like)" = "B cells",
+  "cM07 (pDC)" = "Dendritic cells",
+  "cB1 (B IGD+IgM+)" = "B cells",
+  "cTNI04 (CD4+ IL7R+CCL5+)" = "CD4+ T-cells",
+  "cS26 (Myofibro)" = "Fibroblasts",
+  "cS13 (Endo venous-like)" = "Endothelial cells",
+  "cTNI18 (gd-like T PDCD1+)" = "T cells",
+  "cTNI21 (PLZF+ T prolif)" = "T cells",
+  "cS08 (Endo arterial-like)" = "Endothelial cells",
+  "cP3 (Plasma IgG prolif)" = "Plasma cells",
+  "cM09 (mregDC)" = "Dendritic cells",
+  "cTNI14 (CD8+ CXCL13+)" = "CD8+ T-cells",
+  "cTNI26 (ILC3)" = "Innate lymphoid cells",
+  "cM10 (Granulocyte)" = "Granulocytes",
+  "cM04 (DC2)" = "Dendritic cells",
+  "cTNI05 (CD4+ IL17+)" = "CD4+ T-cells",
+  "cTNI03 (CD4+ IL7R+HSP+)" = "CD4+ T-cells",
+  "cS05 (Endo venous)" = "Endothelial cells",
+  "cS19 (Pericyte)" = "Pericytes",
+  "cTNI02 (CD4+ IL7R+SELL+)" = "CD4+ T-cells",
+  "cTNI20 (PLZF+ T)" = "T cells",
+  "cTNI10 (CD8+ IL7R+)" = "CD8+ T-cells",
+  "cS09 (Endo)" = "Endothelial cells",
+  "cTNI09 (CD4+ Treg prolif)" = "Treg",
+  "cS16 (Pericyte)" = "Pericytes",
+  "cTNI11 (CD8+GZMK+)" = "CD8+ T-cells",
+  "cS12 (Endo)" = "Endothelial cells",
+  "cE08 (Goblet)" = "Goblet cells",
+  "cTNI06 (CD4+ TFH)" = "TFH cells",
+  "cS32 (Smooth Muscle)" = "Smooth muscle cells",
+  "cS14 (Endo)" = "Endothelial cells",
+  "cS25 (Fibro CCL8+)" = "Fibroblasts",
+  "cS22 (Fibro stem cell niche)" = "Fibroblasts",
+  "cS10 (Endo tip cells)" = "Endothelial cells",
+  "cE11 (Enteroendocrine)" = "Enteroendocrine cells",
+  "cM05 (DC2 C1Q+)" = "Dendritic cells",
+  "cTNI15 (CD8+ CXCL13+ HSP+)" = "CD8+ T-cells",
+  "cTNI07 (CD4+ CXCL13+)" = "CD4+ T-cells",
+  "cTNI16 (CD8+ CXCL13+ prolif)" = "CD8+ T-cells",
+  "cTNI22 (cTNI22)" = "T cells",
+  "cE10 (Tuft)" = "Tuft cells",
+  "cS15 (Pericyte)" = "Pericytes",
+  "cTNI12 (CD8+ IL7R+)" = "CD8+ T-cells",
+  "cS20 (Pericyte prolif)" = "Pericytes",
+  "cS18 (Pericyte)" = "Pericytes",
+  "cS11 (Endo proif)" = "Endothelial cells",
+  "cM06 (DC IL22RA2)" = "Dendritic cells",
+  "cS02 (Endo capillary)" = "Endothelial cells",
+  "cS01 (Endo arterial)" = "Endothelial cells",
+  "cE09 (Best4)" = "Goblet cells",
+  "cS03 (Endo capillary)" = "Endothelial cells",
+  "cS07 (Endo capillary-like)" = "Endothelial cells",
+  "cS24 (Fibro BMP-producing)" = "Fibroblasts",
+  "cM08 (AS-DC)" = "Dendritic cells",
+  "cTNI23 (NK CD16A+)" = "NK cells",
+  "cS21 (Fibro stem cell niche)" = "Fibroblasts",
+  "cTNI24 (NK GZMK+)" = "NK cells",
+  "cM03 (DC1)" = "Dendritic cells",
+  "cE07 (Goblet/Enterocyte)" = "Goblet cells",
+  "cTNI25 (NK XCL1+)" = "NK cells",
+  "cTNI19 (gd-like T prolif)" = "T cells",
+  "cS23 (Fibro BMP-producing)" = "Fibroblasts"
+)
+
+## 3) EWAS → top-N DH probes (balanced hyper/hypo) → genes
+msg(glue("Extracting top-{max_n_total} DH CpGs across phenotypes…"))
+dh_probes <- character()
+for (pheno in phenotypes) {
+  fit_file <- file.path(path_ewas_results, paste0("results_ewas_", pheno),
+                        h_level, "ewas_fits.rds")
+  if (!file.exists(fit_file)) { msg("Skipping: no fits at ", fit_file); next }
+  fits <- readRDS(fit_file)
+  fo   <- fits[[tier]]
+  fit  <- if (inherits(fo, "MArrayLM")) fo else fo$fit
+  tt   <- limma::topTable(fit, coef = "pheno_bin", number = Inf, sort.by = "P") %>% as.data.frame()
+  hyper <- rownames(utils::head(tt[tt$logFC >  0, ], n_half))
+  hypo  <- rownames(utils::head(tt[tt$logFC <  0, ], max_n_total - n_half))
+  dh_probes <- union(dh_probes, c(hyper, hypo))
+}
+msg("Total unique DH CpGs:", length(dh_probes))
+
+msg("Mapping DH probes to genes…")
+anno_df <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+common_probes <- intersect(dh_probes, rownames(anno_df))
+refgenes_chr  <- as.character(anno_df[common_probes, "UCSC_RefGene_Name"])
+genes_first   <- sapply(strsplit(refgenes_chr, ";"), `[`, 1)
+dh_sig_genes  <- sort(unique(genes_first[nzchar(genes_first) & !is.na(genes_first)]))
+msg("Total DH-significant genes:", length(dh_sig_genes))
+
+## 4) LOAD ATLAS & MAP LABELS → detail/super (barcode-aligned)
+msg("Loading atlas…")
+atlas <- readRDS(atlas_rds)
+label_col <- "cl295v11SubFull"
+stopifnot(label_col %in% colnames(atlas@meta.data))
+
+full_labels <- as.character(atlas@meta.data[[label_col]])
+short_codes <- sub(" .*", "", full_labels)
+
+mapped_detail <- ifelse(full_labels %in% names(consolidated_labels),
+                        consolidated_labels[full_labels],
+                        NA_character_)
+
+# Fallbacks for broad buckets if not in dictionary
+fallback_detail <- ifelse(is.na(mapped_detail) & grepl("(CAF|Fibro)", full_labels, ignore.case = TRUE), "Fibroblasts",
+                   ifelse(is.na(mapped_detail) & grepl("^cTNI", short_codes), "T cells",
+                   ifelse(is.na(mapped_detail) & grepl("^cE",   short_codes), "Tumor cells",
+                   NA_character_)))
+
+detailtype <- ifelse(is.na(mapped_detail), fallback_detail, mapped_detail)
+detailtype[is.na(detailtype)] <- full_labels  # last resort: keep original label
+
+collapse_to_super <- function(x) {
+  if (x %in% c("Fibroblasts")) return("Fibroblasts")
+  if (x %in% c("Tumor cells")) return("Tumor cells")
+  if (x %in% c("CD4+ T-cells","CD8+ T-cells","Treg","TFH cells","T cells",
+               "NK cells","Innate lymphoid cells")) return("T cells")
+  return("Other")
+}
+supertype <- vapply(detailtype, collapse_to_super, character(1))
+
+stopifnot(length(detailtype) == ncol(atlas), length(supertype) == ncol(atlas))
+names(detailtype) <- colnames(atlas)
+names(supertype)  <- colnames(atlas)
+
+atlas <- Seurat::AddMetaData(
+  atlas,
+  metadata = data.frame(detailtype = as.character(detailtype),
+                        supertype  = as.character(supertype),
+                        row.names  = colnames(atlas))
+)
+
+msg("Superclass counts:\n")
+print(table(atlas$supertype))
+
+## 5) SUBSET TO TARGET SUPERTYPES; PREP GENES
+keep_types <- c("T cells","Fibroblasts","Tumor cells")
+atlas_sub  <- subset(atlas, subset = supertype %in% keep_types)
+msg("Subset cell count:", ncol(atlas_sub))
+
+DefaultAssay(atlas_sub) <- "RNA"
+atlas_sub <- set_default_layer_safe(atlas_sub, assay = "RNA", layer = "data")
+
+# FIX 1: intersect genes with RNA assay features
+dh_sig_genes_in <- intersect(dh_sig_genes, rownames(atlas_sub[["RNA"]]))
+msg("Genes found in atlas:", length(dh_sig_genes_in))
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+## 6) UMAP OVERVIEW (supertype + detailtype)
+msg("Saving overview PDF → ", overview_pdf)
+pdf(overview_pdf, width = 12, height = 6)
+print(
+  DimPlot(atlas_sub, reduction = "umap", group.by = "supertype",
+          pt.size = 0.25, raster = TRUE) +
+    ggtitle("C295 Atlas UMAP — T cells / Fibroblasts / Tumor cells") +
+    theme(plot.title = element_text(face = "bold"))
+)
+print(
+  DimPlot(atlas_sub, reduction = "umap", group.by = "detailtype",
+          pt.size = 0.2, raster = TRUE) +
+    ggtitle("Detailed types (dictionary + fallbacks)") +
+    theme(plot.title = element_text(face = "bold"))
+)
+dev.off()
+
+###############################################################################
+## 6A) Build gene-level direction (hyper / hypo) from limma logFC
+##     (same fits you already generated; aggregates to gene level)
+###############################################################################
+
+stopifnot(exists("anno_df"), exists("dh_probes"))
+
+# Map probes → first gene (same rule as above)
+probe_genes <- {
+  common_probes <- intersect(dh_probes, rownames(anno_df))
+  refgenes_chr  <- as.character(anno_df[common_probes, "UCSC_RefGene_Name"])
+  genes_first   <- sapply(strsplit(refgenes_chr, ";"), `[`, 1)
+  tibble::tibble(CpG = common_probes, Gene = genes_first) |>
+    dplyr::filter(!is.na(Gene), Gene != "")
+}
+
+# Collect per-probe logFC across phenotypes
+logfc_rows <- list()
+for (pheno in phenotypes) {
+  fit_file <- file.path(path_ewas_results, paste0("results_ewas_", pheno),
+                        h_level, "ewas_fits.rds")
+  if (!file.exists(fit_file)) next
+  fits <- readRDS(fit_file)
+  fo   <- fits[[tier]]
+  fit  <- if (inherits(fo, "MArrayLM")) fo else fo$fit
+  tt   <- limma::topTable(fit, coef = "pheno_bin", number = Inf, sort.by = "P") |>
+          tibble::rownames_to_column("CpG") |>
+          dplyr::select(CpG, logFC)
+  tt_dh <- dplyr::semi_join(tt, tibble::tibble(CpG = dh_probes), by = "CpG") |>
+           dplyr::left_join(probe_genes, by = "CpG") |>
+           dplyr::filter(!is.na(Gene) & Gene != "")
+  tt_dh$phenotype <- pheno
+  logfc_rows[[pheno]] <- tt_dh
+}
+logfc_df <- dplyr::bind_rows(logfc_rows)
+
+# Aggregate to gene-level mean logFC across probes and phenotypes
+gene_delta <- logfc_df |>
+  dplyr::group_by(Gene) |>
+  dplyr::summarise(mean_logFC = mean(logFC, na.rm = TRUE),
+                   n_probes   = dplyr::n()) |>
+  dplyr::ungroup()
+
+# Intersect with RNA assay features for stability
+genes_in_atlas <- intersect(gene_delta$Gene, rownames(atlas[["RNA"]]))
+gene_delta <- dplyr::filter(gene_delta, Gene %in% genes_in_atlas)
+
+# Split into hypo / hyper lists
+hypo_genes  <- gene_delta$Gene[gene_delta$mean_logFC < 0]
+hyper_genes <- gene_delta$Gene[gene_delta$mean_logFC > 0]
+
+msg(glue("Gene-level direction: {length(hypo_genes)} hypo, {length(hyper_genes)} hyper (",
+         "{length(setdiff(gene_delta$Gene, union(hypo_genes, hyper_genes)))} zero)."))
+
+###############################################################################
+## 6B) Score ALL cells + one PDF with: context, net (hyper−hypo), hypo, hyper
+###############################################################################
+
+stopifnot("supertype" %in% colnames(atlas@meta.data))
+DefaultAssay(atlas) <- "RNA"
+atlas <- set_default_layer_safe(atlas, assay = "RNA", layer = "data")
+
+# Safety for empty lists
+if (length(hypo_genes)  == 0) hypo_genes  <- character()
+if (length(hyper_genes) == 0) hyper_genes <- character()
+
+# Compute module scores (Seurat always appends "1")
+if (length(hypo_genes) > 0) {
+  atlas <- AddModuleScore(atlas, features = list(hypo_genes),
+                          name = "DHhypo", nbin = 24, ctrl = 100, assay = "RNA")
+}
+if (length(hyper_genes) > 0) {
+  atlas <- AddModuleScore(atlas, features = list(hyper_genes),
+                          name = "DHhyper", nbin = 24, ctrl = 100, assay = "RNA")
+}
+
+hypo_col  <- if (any(grepl("^DHhypo", colnames(atlas@meta.data))))
+               grep("^DHhypo",  colnames(atlas@meta.data), value = TRUE)[1] else NA_character_
+hyper_col <- if (any(grepl("^DHhyper", colnames(atlas@meta.data))))
+               grep("^DHhyper", colnames(atlas@meta.data), value = TRUE)[1] else NA_character_
+
+# Net score = Hyper - Hypo (NA-safe)
+atlas$net_score <- NA_real_
+if (!is.na(hyper_col) && !is.na(hypo_col)) {
+  atlas$net_score <- atlas@meta.data[[hyper_col]] - atlas@meta.data[[hypo_col]]
+} else if (!is.na(hyper_col)) {
+  atlas$net_score <- atlas@meta.data[[hyper_col]]
+} else if (!is.na(hypo_col)) {
+  atlas$net_score <- -atlas@meta.data[[hypo_col]]
+}
+
+# Output file (single, combined)
+allcells_combo_pdf <- file.path(out_dir, "UMAP_allcells_net_hypo_hyper.pdf")
+
+# Color palettes (colorblind-friendly)
+pal_div <- c("#2c7bb6", "#ffffbf", "#d7191c")                # blue - white - red (net)
+pal_byr  <- c("#2c7bb6", "#fee08b", "#d73027")   # blue → yellow → red
+pal_hypo <- c("#f7fbff", "#6baed6", "#08306b")   # keep if you still want hypo-only
+pal_hyper<- c("#fff5f0", "#fb6a4a", "#67000d")   # keep if you still want hyper-only
+
+msg("Saving ALL-cells combined UMAP (context + net + hypo + hyper) → ", allcells_combo_pdf)
+pdf(allcells_combo_pdf, width = 14, height = 8)
+
+# A) Context: all cells by supertype
+p_ctx <- DimPlot(atlas, reduction = "umap", group.by = "supertype",
+                 pt.size = 0.1, raster = TRUE) +
+  ggtitle("All cell types — supertype") +
+  theme(plot.title = element_text(face = "bold"))
+
+# B) Net (hyper − hypo) with divergent palette
+p_net <- FeaturePlot(atlas, features = "net_score", reduction = "umap",
+                     order = TRUE, pt.size = 0.12, raster = TRUE,
+                     raster.dpi = raster_dpi_vec) +
+  scale_color_gradientn(colors = pal_byr, name = "Net (Hyper − Hypo)") +
+  ggtitle("EWAS gene direction — NET score") +
+  theme(plot.title = element_text(face = "bold"))
+
+# C) Hypo-only
+p_hypo <- if (!is.na(hypo_col)) {
+  FeaturePlot(atlas, features = hypo_col, reduction = "umap",
+              order = TRUE, pt.size = 0.12, raster = TRUE,
+              raster.dpi = raster_dpi_vec) +
+    scale_color_gradientn(colors = pal_hypo, name = "Hypo score") +
+    ggtitle("Hypo-methylated gene set (expression module)") +
+    theme(plot.title = element_text(face = "bold"))
+} else {
+  ggplot() + ggtitle("No hypo gene set") + theme_void()
+}
+
+# D) Hyper-only
+p_hyper <- if (!is.na(hyper_col)) {
+  FeaturePlot(atlas, features = hyper_col, reduction = "umap",
+              order = TRUE, pt.size = 0.12, raster = TRUE,
+              raster.dpi = raster_dpi_vec) +
+    scale_color_gradientn(colors = pal_hyper, name = "Hyper score") +
+    ggtitle("Hyper-methylated gene set (expression module)") +
+    theme(plot.title = element_text(face = "bold"))
+} else {
+  ggplot() + ggtitle("No hyper gene set") + theme_void()
+}
+
+print((p_ctx | p_net) / (p_hypo | p_hyper))
+dev.off()
+
+###############################################################################
+# Bivariate UMAP — raster points, 100k cells, no title, separate legend PDF
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(ggrastr)
+  library(grid)
+  library(scales)
+})
+
+# ---- User settings ----
+plot_n_cells <- 100000      # number of cells to plot
+raster_dpi   <- 150         # point raster resolution
+pt_size      <- 0.2
+seed_plot    <- 20250809
+clip_lo_q    <- 0.05        # quantile clipping for color scale low
+clip_hi_q    <- 0.95        # quantile clipping for color scale high
+out_pdf_bi   <- file.path(out_dir, "UMAP_allcells_bivariate_100k.pdf")
+out_pdf_leg  <- file.path(out_dir, "UMAP_bivariate_legend.pdf")
+# -----------------------
+
+# Get score columns
+hypo_col  <- grep("^DHhypo",  colnames(atlas@meta.data), value = TRUE)[1]
+hyper_col <- grep("^DHhyper", colnames(atlas@meta.data), value = TRUE)[1]
+stopifnot(!is.na(hypo_col), !is.na(hyper_col))
+
+# Build plotting dataframe
+emb <- as.data.frame(atlas@reductions$umap@cell.embeddings)[, 1:2, drop = FALSE]
+colnames(emb) <- c("UMAP_1","UMAP_2")
+emb$hypo  <- atlas@meta.data[[hypo_col]]
+emb$hyper <- atlas@meta.data[[hyper_col]]
+
+# Downsample
+set.seed(seed_plot)
+if (nrow(emb) > plot_n_cells) {
+  emb <- emb[sample.int(nrow(emb), plot_n_cells), ]
+}
+
+# Clip and rescale
+rescale_clip <- function(x, lo_q, hi_q) {
+  lo <- quantile(x, probs = lo_q, na.rm = TRUE)
+  hi <- quantile(x, probs = hi_q, na.rm = TRUE)
+  scales::rescale(pmin(pmax(x, lo), hi), to = c(0, 1), from = c(lo, hi))
+}
+emb$r <- rescale_clip(emb$hyper, clip_lo_q, clip_hi_q)  # red
+emb$b <- rescale_clip(emb$hypo,  clip_lo_q, clip_hi_q)  # blue
+emb$g <- 0
+emb$col_hex <- rgb(emb$r, emb$g, emb$b)
+
+# Legend matrix (for separate export)
+legend_res <- 200
+leg_mat <- array(0, dim = c(legend_res, legend_res, 3))
+red_vals  <- matrix(rep(seq(0, 1, length.out = legend_res), each = legend_res),
+                    nrow = legend_res, byrow = FALSE)
+blue_vals <- matrix(rep(seq(0, 1, length.out = legend_res), times = legend_res),
+                    nrow = legend_res, byrow = TRUE)
+leg_mat[,,1] <- red_vals
+leg_mat[,,3] <- blue_vals
+leg_grob <- grid::rasterGrob(leg_mat, interpolate = TRUE)
+
+# --- Main plot ---
+p_bi <- ggplot(emb, aes(x = UMAP_1, y = UMAP_2)) +
+  ggrastr::geom_point_rast(aes(color = col_hex),
+                           size = pt_size, raster.dpi = raster_dpi, shape = 16) +
+  scale_color_identity() +
+  coord_equal() +
+  labs(x = "UMAP 1", y = "UMAP 2") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")  # no legend, no title
+
+# Save main plot PDF
+pdf(out_pdf_bi, width = 9, height = 7)
+print(p_bi)
+dev.off()
+
+# --- Legend export ---
+pdf(out_pdf_leg, width = 3, height = 3)
+grid::grid.newpage()
+grid::grid.draw(leg_grob)
+grid::grid.text("Hyper ↑ (red)  →", x = unit(0.5, "npc"), y = unit(0.0, "npc"),
+                gp = grid::gpar(cex = 0.8))
+grid::grid.text("Hypo ↑ (blue) ↑", x = unit(0.0, "npc"), y = unit(0.5, "npc"),
+                rot = 90, gp = grid::gpar(cex = 0.8))
+dev.off()
+
+message("✅ Saved main plot: ", out_pdf_bi)
+message("✅ Saved legend: ", out_pdf_leg)
+
+## 10) SAVE ENRICHED ATLAS
+saveRDS(atlas, file = save_atlas_rds)
+msg("✅ Done: overview, module score, FeaturePlots (paged), and DotPlots (paged) exported.")
+```
+
+```{r}
+###############################################################################
+# UMAP figures with readable palettes (blue → yellow → red for NET)
+# - Expects: atlas (Seurat), out_dir (string), raster_dpi_vec (num[2]),
+#            hypo_col, hyper_col (column names in atlas@meta.data),
+#            and atlas$net_score already computed.
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(patchwork)
+  library(RColorBrewer)
+  library(scales)
+  library(ggrastr)
+  library(grid)
+})
+
+# ---------- Sanity checks ----------
+stopifnot(inherits(atlas, "Seurat"))
+stopifnot("net_score" %in% colnames(atlas@meta.data))
+stopifnot(dir.exists(out_dir))
+
+# If these weren’t set earlier, define a conservative default:
+if (!exists("raster_dpi_vec")) raster_dpi_vec <- c(200, 200)
+
+# Try to locate score columns if not provided
+if (!exists("hypo_col") || is.na(hypo_col)) {
+  hypo_col  <- grep("^DHhypo",  colnames(atlas@meta.data), value = TRUE)[1]
+}
+if (!exists("hyper_col") || is.na(hyper_col)) {
+  hyper_col <- grep("^DHhyper", colnames(atlas@meta.data), value = TRUE)[1]
+}
+
+# ---------- Palettes ----------
+# Blue → Yellow → Red for NET (reverse of RdYlBu)
+pal_byr      <- colorRampPalette(rev(brewer.pal(11, "RdYlBu")))(255)
+pal_blue_seq <- colorRampPalette(brewer.pal(9, "Blues"))(255)  # hypo
+pal_red_seq  <- colorRampPalette(brewer.pal(9, "Reds"))(255)   # hyper
+
+# Clip extremes (2–98%) for readable contrast
+clip_limits <- function(x, lo = 0.02, hi = 0.98) {
+  c(quantile(x, lo, na.rm = TRUE), quantile(x, hi, na.rm = TRUE))
+}
+
+# ---------- Panels ----------
+# A) Context by supertype
+p_ctx <- DimPlot(atlas, reduction = "umap", group.by = "supertype",
+                 pt.size = 0.10, raster = TRUE) +
+  ggtitle("All cell types — supertype") +
+  theme_classic(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+# B) NET (hyper − hypo) with blue→yellow→red
+net_limits <- clip_limits(atlas$net_score)
+p_net <- FeaturePlot(atlas, features = "net_score", reduction = "umap",
+                     order = TRUE, pt.size = 0.12, raster = TRUE,
+                     raster.dpi = raster_dpi_vec) +
+  scale_color_gradientn(colors = pal_byr,
+                        limits = net_limits, oob = squish,
+                        name = "Net (Hyper - Hypo)") +
+  ggtitle("EWAS gene direction — NET score") +
+  theme_classic(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+# C) Hypo-only
+if (!is.na(hypo_col)) {
+  hypo_vals   <- atlas@meta.data[[hypo_col]]
+  hypo_limits <- clip_limits(hypo_vals)
+  p_hypo <- FeaturePlot(atlas, features = hypo_col, reduction = "umap",
+                        order = TRUE, pt.size = 0.12, raster = TRUE,
+                        raster.dpi = raster_dpi_vec) +
+    scale_color_gradientn(colors = pal_blue_seq,
+                          limits = hypo_limits, oob = squish,
+                          name = "Hypo score") +
+    ggtitle("Hypo-methylated gene set") +
+    theme_classic(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"))
+} else {
+  p_hypo <- ggplot() + ggtitle("No hypo gene set") + theme_void()
+}
+
+# D) Hyper-only
+if (!is.na(hyper_col)) {
+  hyper_vals   <- atlas@meta.data[[hyper_col]]
+  hyper_limits <- clip_limits(hyper_vals)
+  p_hyper <- FeaturePlot(atlas, features = hyper_col, reduction = "umap",
+                         order = TRUE, pt.size = 0.12, raster = TRUE,
+                         raster.dpi = raster_dpi_vec) +
+    scale_color_gradientn(colors = pal_red_seq,
+                          limits = hyper_limits, oob = squish,
+                          name = "Hyper score") +
+    ggtitle("Hyper-methylated gene set") +
+    theme_classic(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"))
+} else {
+  p_hyper <- ggplot() + ggtitle("No hyper gene set") + theme_void()
+}
+
+# ---------- Save 4-panel figure ----------
+allcells_combo_pdf <- file.path(out_dir, "UMAP_allcells_net_hypo_hyper.pdf")
+pdf(allcells_combo_pdf, width = 14, height = 8)
+print((p_ctx | p_net) / (p_hypo | p_hyper))
+dev.off()
+message("Saved: ", allcells_combo_pdf)
+
+# ---------- NET-only export (clean, paper-ready) ----------
+out_pdf_net_only <- file.path(out_dir, "UMAP_allcells_NET_only.pdf")
+pdf(out_pdf_net_only, width = 9, height = 7, family = "Helvetica")
+print(p_net + theme(legend.position = "right"))
+dev.off()
+message("Saved: ", out_pdf_net_only)
+
+# ---------- OPTIONAL: tuned RGB bivariate composite (kept for comparison) ---
+use_bivariate <- FALSE  # set TRUE if you still want the RGB blend
+
+if (use_bivariate && !is.na(hypo_col) && !is.na(hyper_col)) {
+  plot_n_cells <- 100000
+  raster_dpi   <- 200
+  pt_size      <- 0.20
+  seed_plot    <- 20250809
+  clip_lo_q    <- 0.05
+  clip_hi_q    <- 0.95
+  out_pdf_bi   <- file.path(out_dir, "UMAP_allcells_bivariate_RGB_tuned.pdf")
+  out_pdf_leg  <- file.path(out_dir, "UMAP_bivariate_RGB_legend.pdf")
+
+  emb <- as.data.frame(atlas@reductions$umap@cell.embeddings)[, 1:2, drop = FALSE]
+  colnames(emb) <- c("UMAP_1","UMAP_2")
+  emb$hypo  <- atlas@meta.data[[hypo_col]]
+  emb$hyper <- atlas@meta.data[[hyper_col]]
+
+  set.seed(seed_plot)
+  if (nrow(emb) > plot_n_cells) {
+    emb <- emb[sample.int(nrow(emb), plot_n_cells), ]
+  }
+
+  rescale_clip <- function(x, lo_q, hi_q) {
+    lo <- quantile(x, probs = lo_q, na.rm = TRUE)
+    hi <- quantile(x, probs = hi_q, na.rm = TRUE)
+    scales::rescale(pmin(pmax(x, lo), hi), to = c(0, 1), from = c(lo, hi))
+  }
+
+  emb$r <- rescale_clip(emb$hyper, clip_lo_q, clip_hi_q) ^ 0.9
+  emb$b <- rescale_clip(emb$hypo,  clip_lo_q, clip_hi_q) ^ 0.9
+  emb$g <- 0
+  emb$col_hex <- rgb(emb$r, emb$g, emb$b)
+
+  p_bi <- ggplot(emb, aes(UMAP_1, UMAP_2)) +
+    ggrastr::geom_point_rast(aes(color = col_hex),
+                             size = pt_size, raster.dpi = raster_dpi, shape = 16) +
+    scale_color_identity() +
+    coord_equal() +
+    labs(x = "UMAP 1", y = "UMAP 2") +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "none")
+
+  pdf(out_pdf_bi, width = 9, height = 7, family = "Helvetica")
+  print(p_bi)
+  dev.off()
+  message("Saved: ", out_pdf_bi)
+
+  # ASCII legend (no UTF-8 arrows)
+  legend_res <- 220
+  leg_mat <- array(0, dim = c(legend_res, legend_res, 3))
+  red_vals  <- matrix(rep(seq(0, 1, length.out = legend_res), each = legend_res),
+                      nrow = legend_res, byrow = FALSE)
+  blue_vals <- matrix(rep(seq(0, 1, length.out = legend_res), times = legend_res),
+                      nrow = legend_res, byrow = TRUE)
+  leg_mat[,,1] <- red_vals
+  leg_mat[,,3] <- blue_vals
+  leg_grob <- grid::rasterGrob(leg_mat, interpolate = TRUE)
+
+  pdf(out_pdf_leg, width = 3.2, height = 3.2, family = "Helvetica")
+  grid::grid.newpage()
+  grid::grid.draw(leg_grob)
+  grid::grid.text("Hyper up (red)  ->", x = unit(0.56, "npc"), y = unit(0.05, "npc"),
+                  gp = grid::gpar(cex = 0.8))
+  grid::grid.text("Hypo up (blue) ^", x = unit(0.05, "npc"), y = unit(0.56, "npc"),
+                  rot = 90, gp = grid::gpar(cex = 0.8))
+  dev.off()
+  message("Saved: ", out_pdf_leg)
+}
+```
+
+
+Expanding single gene analysis to include metastasis related genes
+
+```{r}
+###############################################################################
+# HiTIMED h=6 + immune collapse/normalization + merge with PDCD1 Δβ/ΔM (scores)
+# - Uses your cached β-matrix: Results/ewas_cache/beta_comb_qc.rds
+# - Runs HiTIMED_deconvolution(..., tumor_type="COAD", h=6, tissue_type="tumor")
+# - Collapses CD8nv+CD8mem → CD8_total; keeps Treg explicitly
+# - Builds Immune_total from available immune components; normalizes CD8/Treg
+# - Adds Fib via EpiDISH if missing in HiTIMED output
+# - Merges with `scores` (must already exist) to yield `delta_tbl_h6`
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(tibble)
+  library(HiTIMED); library(EpiDISH)
+})
+
+## ---- Paths ------------------------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+beta_rds     <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+
+## ---- Load β from cache ------------------------------------------------------
+beta_obj  <- readRDS(beta_rds)
+beta_comb <- if (is.list(beta_obj) && !is.null(beta_obj$beta)) beta_obj$beta else beta_obj
+stopifnot(is.matrix(beta_comb))
+
+## ---- Align to `scores` samples if `scores` exists ---------------------------
+## Expect `scores` with: SampleID, Region (TSS/Body), BetaCollapsed, Mmean, mets_progression
+if (!exists("scores")) stop("`scores` (PDCD1 TSS/Body collapsed table) must already exist in the session.")
+keep_ids <- intersect(colnames(beta_comb), unique(scores$SampleID))
+if (length(keep_ids) == 0) stop("No overlapping SampleID between beta_comb and scores.")
+beta_comb <- beta_comb[, keep_ids, drop = FALSE]
+
+## ---- Run HiTIMED h=6 (COAD, tumor tissue) ----------------------------------
+frac_h6 <- HiTIMED_deconvolution(
+  tumor_beta  = beta_comb,
+  tumor_type  = "COAD",
+  h           = 6,
+  tissue_type = "tumor"
+) %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID")
+
+## ---- Add Fib via EpiDISH (if not provided by HiTIMED) ----------------------
+if (!"Fib" %in% names(frac_h6)) {
+  data("centEpiFibIC.m", package = "EpiDISH", envir = environment())
+  common <- intersect(rownames(beta_comb), rownames(centEpiFibIC.m))
+  fib_est <- epidish(beta_comb[common, , drop = FALSE],
+                     centEpiFibIC.m[common, , drop = FALSE],
+                     method = "RPC")$estF %>%
+    as.data.frame() %>% rownames_to_column("SampleID") %>% select(SampleID, Fib)
+  frac_h6 <- frac_h6 %>% left_join(fib_est, by = "SampleID")
+}
+
+## ---- Helpers ----------------------------------------------------------------
+present  <- function(df, candidates) intersect(candidates, names(df))
+sum_cols <- function(df, cols) if (length(cols)) rowSums(df[cols], na.rm = TRUE) else rep(0, nrow(df))
+
+## ---- Identify immune components at h=6 --------------------------------------
+# Common h=6 immune components (adjusted defensively)
+cd8_parts <- present(frac_h6, c("CD8nv","CD8mem"))
+cd4_parts <- present(frac_h6, c("CD4nv","CD4mem"))  # Treg handled separately
+b_parts   <- present(frac_h6, c("Bnv","Bmem","Bcell","B"))
+innate    <- present(frac_h6, c("NK","Mono","Monocyte","DC","Neu","Neutrophil","Eos","Eosinophil","Bas","Basophil"))
+treg_col  <- present(frac_h6, c("Treg","Tregs","Regulatory_T"))
+
+# Build totals
+CD8_total <- if (length(cd8_parts)) sum_cols(frac_h6, cd8_parts) else {
+  # graceful fallback if a single CD8 column exists
+  cd8_fallback <- present(frac_h6, c("CD8T","CD8"))
+  if (length(cd8_fallback)) frac_h6[[cd8_fallback[1]]] else rep(NA_real_, nrow(frac_h6))
+}
+CD4_total_noTreg <- if (length(cd4_parts)) sum_cols(frac_h6, cd4_parts) else rep(0, nrow(frac_h6))
+Treg_vals        <- if (length(treg_col)) frac_h6[[treg_col[1]]] else rep(NA_real_, nrow(frac_h6))
+
+# Immune_total = CD8_total + CD4_total_noTreg + Treg + B + innate
+Immune_total <- CD8_total +
+                CD4_total_noTreg +
+                ifelse(is.na(Treg_vals), 0, Treg_vals) +
+                sum_cols(frac_h6, b_parts) +
+                sum_cols(frac_h6, innate)
+Immune_total[!is.finite(Immune_total) | Immune_total <= 1e-6] <- NA_real_
+
+## ---- StromalOther (optional covariate) --------------------------------------
+stromal_cols <- present(frac_h6, c("Endothelial","Epithelial"))
+StromalOther <- if (length(stromal_cols)) rowSums(frac_h6[stromal_cols], na.rm = TRUE) else rep(NA_real_, nrow(frac_h6))
+
+## ---- Normalized fractions ---------------------------------------------------
+frac_h6_norm <- frac_h6 %>%
+  mutate(
+    CD8_total     = CD8_total,
+    CD4_total     = CD4_total_noTreg + ifelse(is.na(Treg_vals), 0, Treg_vals),
+    Treg          = Treg_vals,
+    Immune_total  = Immune_total,
+    CD8_total_norm = CD8_total / Immune_total,
+    Treg_norm      = Treg      / Immune_total,
+    StromalOther   = StromalOther
+  ) %>%
+  select(SampleID, CD8_total, Treg, Immune_total,
+         CD8_total_norm, Treg_norm, StromalOther, Fib, everything())
+
+## ---- Build Δβ / ΔM from `scores` and merge ---------------------------------
+delta_tbl_h6 <- scores %>%
+  select(SampleID, Region, BetaCollapsed, Mmean, mets_progression) %>%
+  pivot_wider(names_from = Region, values_from = c(BetaCollapsed, Mmean)) %>%
+  mutate(
+    Delta_Beta = BetaCollapsed_Body - BetaCollapsed_TSS,
+    Delta_M    = Mmean_Body        - Mmean_TSS
+  ) %>%
+  left_join(frac_h6_norm, by = "SampleID")
+
+## ---- Sanity outputs ---------------------------------------------------------
+cat("\n[HiTIMED h=6] Detected immune parts:\n",
+    "  CD8 parts: ", paste(if(length(cd8_parts)) cd8_parts else "(none; used fallback if available)", collapse="+"), "\n",
+    "  CD4 parts (no Treg): ", paste(if(length(cd4_parts)) cd4_parts else "(none)", collapse="+"), "\n",
+    "  Treg col: ", if(length(treg_col)) treg_col[1] else "(none)", "\n",
+    "  B parts: ", paste(if(length(b_parts)) b_parts else "(none)", collapse="+"), "\n",
+    "  Innate: ", paste(if(length(innate)) innate else "(none)", collapse=", "), "\n\n", sep = "")
+
+print(delta_tbl_h6 %>%
+        select(SampleID, mets_progression,
+               Delta_Beta, Delta_M,
+               CD8_total_norm, Treg_norm, Fib, StromalOther) %>%
+        head(12))
+
+# Result: delta_tbl_h6 (merged table ready for correlations/plots/models)
+
+###############################################################################
+# PDCD1 Δβ (Body – TSS) vs CD8 (HiTIMED h=6) — clean plot, no grid, no color by mets
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(rlang)
+})
+
+# ---- Helper: find the h=6 fractions table -----------------------------------
+get_frac_h6 <- function() {
+  if (exists("fractions_h6", inherits = TRUE)) return(get("fractions_h6", inherits = TRUE))
+  if (exists("frac_h6",     inherits = TRUE)) return(get("frac_h6",     inherits = TRUE))
+  if (exists("frac_6",      inherits = TRUE)) return(get("frac_6",      inherits = TRUE))
+  if (exists("HIT_DH",      inherits = TRUE)) {
+    HIT <- get("HIT_DH", inherits = TRUE)
+    if (is.list(HIT) && !is.null(HIT[["h6"]])) return(HIT[["h6"]])
+  }
+  stop("Could not find fractions table. Expected one of: fractions_h6, frac_h6, frac_6, or HIT_DH[['h6']].")
+}
+
+frac_raw <- get_frac_h6()
+
+if (!"SampleID" %in% names(frac_raw)) {
+  if (!is.null(rownames(frac_raw)) && all(nzchar(rownames(frac_raw)))) {
+    frac_raw <- tibble::rownames_to_column(as.data.frame(frac_raw), "SampleID")
+  } else {
+    stop("Fractions table has no 'SampleID' column and no usable rownames.")
+  }
+}
+
+# ---- Normalize immune features ----------------------------------------------
+immune_candidates <- c(
+  "Bas","Eos","Neu","Mono","DC","NK",
+  "Bnv","Bmem","CD4nv","CD4mem","Treg",
+  "CD8nv","CD8mem"
+)
+present_immune <- intersect(immune_candidates, names(frac_raw))
+
+frac_h6_norm <- frac_raw %>%
+  mutate(
+    CD8_total     = CD8nv + CD8mem,
+    Immune_total  = rowSums(across(all_of(present_immune)), na.rm = TRUE),
+    CD8_total_norm = if_else(Immune_total > 0, CD8_total / Immune_total, NA_real_),
+    Treg_norm      = if ("Treg" %in% names(.)) if_else(Immune_total > 0, Treg / Immune_total, NA_real_) else NA_real_,
+    StromalOther   = (if ("Endothelial" %in% names(.)) Endothelial else 0) +
+                     (if ("Epithelial"  %in% names(.)) Epithelial  else 0)
+  )
+
+frac_keep <- frac_h6_norm %>%
+  select(SampleID, CD8_total_norm, Treg_norm,
+         Fib = dplyr::any_of("Fib"),
+         StromalOther)
+
+# ---- Build Δβ table ---------------------------------------------------------
+scores_df <- get("scores", inherits = TRUE)
+
+delta_tbl_h6 <- scores_df %>%
+  select(SampleID, Region, BetaCollapsed, mets_progression) %>%
+  pivot_wider(names_from = Region, values_from = BetaCollapsed) %>%
+  mutate(Delta_Beta = (Body %||% NA_real_) - (TSS %||% NA_real_)) %>%
+  left_join(frac_keep, by = "SampleID") %>%
+  filter(!is.na(Delta_Beta), !is.na(CD8_total_norm))
+
+# ---- Linear model -----------------------------------------------------------
+covars <- c("CD8_total_norm",
+            if ("mets_progression" %in% names(delta_tbl_h6)) "mets_progression",
+            if ("Fib"             %in% names(delta_tbl_h6)) "Fib",
+            if ("StromalOther"    %in% names(delta_tbl_h6)) "StromalOther")
+
+form <- as.formula(paste("Delta_Beta ~", paste(covars, collapse = " + ")))
+fit  <- lm(form, data = delta_tbl_h6)
+print(summary(fit))
+
+cd8_term <- summary(fit)$coefficients[rownames(summary(fit)$coefficients) %in% "CD8_total_norm", , drop = FALSE]
+cd8_lab  <- if (nrow(cd8_term) == 1) {
+  paste0("LM slope (CD8_norm) = ", signif(cd8_term[1, "Estimate"], 3),
+         ", p = ", signif(cd8_term[1, "Pr(>|t|)"], 3))
+} else {
+  "LM fitted"
+}
+
+# ---- Plot Δβ vs CD8 (no color by mets, no grid) ------------------------------
+p <- ggplot(delta_tbl_h6, aes(x = CD8_total_norm, y = Delta_Beta)) +
+  geom_point(size = 2, alpha = 0.85, color = "#1f78b4") +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  labs(x = "CD8 fraction (HiTIMED h=6, normalized by total immune)",
+       y = expression(Delta*beta~"(Body – TSS)"),
+       title = "PDCD1: Δβ vs CD8 infiltration",
+       subtitle = cd8_lab) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# ---- Save -------------------------------------------------------------------
+out_dir <- "/Users/adiallo/Desktop/Thesis/Results/PDCD1_analysis"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+ggsave(file.path(out_dir, "PDCD1_DeltaBeta_vs_CD8norm_h6_LM_clean.pdf"),
+       p, width = 6.2, height = 5.0)
+```
+
+```{r}
+###############################################################################
+# gene_region_beta_plots_clean.R
+# Purpose: Clean per-gene plots for Illustrator
+# - β-values (TSS vs Body) across metastasis groups
+# - No titles, no stats labels, no facet strip backgrounds, no grid lines
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(glue)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(ggplot2)
+})
+
+## ---- Inputs -----------------------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "GeneRegionSummaries_clean")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+beta_rds     <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+meta_csv     <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+genes_of_interest <- c(
+  "PDCD1",
+  "SLIT2", "SOCS1", "COL11A1", "TCF8", "INHBB",
+  "WNT7A", "WNT6", "ROBO1", "LCP1", "EPHB1", "ADAMTS18"
+)
+
+## ---- Load β-matrix + meta ---------------------------------------------------
+beta_comb <- {
+  obj <- readRDS(beta_rds)
+  if (is.list(obj) && !is.null(obj$beta)) obj$beta else obj
+}
+meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    mets_progression = case_when(
+      Distant_Mets == 1 ~ "Distant Mets",
+      ln_only == 1      ~ "LN-only Mets",
+      TRUE              ~ "No Mets"
+    ),
+    mets_progression = factor(mets_progression,
+                              levels = c("No Mets","LN-only Mets","Distant Mets"))
+  ) %>% select(SampleID, mets_progression)
+
+common_ids <- intersect(colnames(beta_comb), meta$SampleID)
+stopifnot(length(common_ids) > 0)
+beta_comb <- beta_comb[, common_ids, drop = FALSE]
+meta      <- filter(meta, SampleID %in% common_ids)
+
+## ---- Annotation helper ------------------------------------------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>% as.data.frame()
+
+get_gene_cpgs <- function(gene_symbol, beta_mat, anno_df){
+  df <- anno_df %>%
+    filter(UCSC_RefGene_Name == gene_symbol,
+           UCSC_RefGene_Group %in% c("TSS200","TSS1500","Body")) %>%
+    select(Name, UCSC_RefGene_Group) %>%
+    filter(Name %in% rownames(beta_mat))
+  list(
+    tss  = df %>% filter(UCSC_RefGene_Group %in% c("TSS200","TSS1500")) %>% pull(Name),
+    body = df %>% filter(UCSC_RefGene_Group == "Body") %>% pull(Name)
+  )
+}
+
+## ---- Transform + collapse ---------------------------------------------------
+to_m <- function(b) log2((b + 1e-6) / (1 - b + 1e-6))  # safe logit2
+
+collapse_region <- function(cpgs, beta_mat, label){
+  if (!length(cpgs)) return(NULL)
+  B <- beta_mat[cpgs, , drop = FALSE]
+  M <- t(apply(B, 1, to_m))
+  tibble(
+    SampleID      = colnames(B),
+    Region        = label,
+    BetaCollapsed = colMeans(B, na.rm = TRUE),
+    Mmean         = colMeans(M, na.rm = TRUE)
+  )
+}
+
+## ---- Core function: one gene -> clean plot ---------------------------------
+analyze_gene_clean <- function(gene_symbol, beta_mat, meta_df, anno_df, out_dir){
+  cpgs <- get_gene_cpgs(gene_symbol, beta_mat, anno_df)
+  if (!length(cpgs$tss) && !length(cpgs$body)) {
+    message("Skipping ", gene_symbol, ": no TSS or Body CpGs present in matrix.")
+    return(NULL)
+  }
+  df_tss  <- collapse_region(cpgs$tss,  beta_mat, "TSS")
+  df_body <- collapse_region(cpgs$body, beta_mat, "Body")
+  scores <- bind_rows(df_tss, df_body) %>%
+    left_join(meta_df, by = "SampleID") %>%
+    filter(!is.na(mets_progression))
+
+  plot_df <- scores %>% select(SampleID, Region, BetaCollapsed, mets_progression)
+
+p <- ggplot(plot_df, aes(x = Region, y = BetaCollapsed, fill = Region)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.75, color = "gray30") +
+  geom_jitter(aes(group = SampleID), width = 0.15, size = 0.8, alpha = 0.6) +
+  facet_wrap(~ mets_progression) +
+  { if (!is.null(lab_df)) geom_text(data = lab_df, aes(x = 1.5, y = y, label = label),
+                                    size = 3.2, vjust = 0, inherit.aes = FALSE) } +
+  scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Genomic Position (Region)",
+    y = "β-value (mean across CpGs per region)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),                # remove grids
+    panel.border = element_rect(color = "black", fill = NA), # keep box outline
+    strip.background = element_blank(),          # remove grey facet boxes
+    axis.line = element_line(color = "black"),   # keep axis lines
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    legend.position = "none"
+  )
+
+  ggsave(file.path(out_dir, glue("{gene_symbol}_TSSvsBody_betaPlot_clean.pdf")),
+         p, width = 6.5, height = 4.8, device = cairo_pdf)
+}
+
+## ---- Run over all genes -----------------------------------------------------
+purrr::walk(genes_of_interest, ~ analyze_gene_clean(.x, beta_comb, meta, anno, out_dir))
+
+cat("✓ Saved cleaned per-gene PDF plots to:\n  ", out_dir, "\n")
+
+###############################################################################
+# All genes combined plot, broken out by metastasis status, with p-value stars
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(ggpubr); library(purrr)
+})
+
+# Build one big data frame for all genes
+all_plot_df <- purrr::map_dfr(genes_of_interest, function(gene_symbol) {
+  cpgs <- get_gene_cpgs(gene_symbol, beta_comb, anno)
+  df_tss  <- collapse_region(cpgs$tss,  beta_comb, "TSS")
+  df_body <- collapse_region(cpgs$body, beta_comb, "Body")
+  bind_rows(df_tss, df_body) %>%
+    mutate(Gene = gene_symbol)
+})
+
+all_plot_df <- all_plot_df %>%
+  left_join(meta, by = "SampleID") %>%
+  filter(!is.na(mets_progression))
+
+# Comparisons for TSS vs Body
+comparisons <- list(c("TSS", "Body"))
+
+# ---- Corrected Combined Plot: Faceted by Gene + Metastasis Group ----
+p_all_genes_mets <- ggplot(all_plot_df,
+                           aes(x = Region, y = BetaCollapsed, fill = Region)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.6, color = "gray30") +
+  geom_jitter(width = 0.15, size = 0.7, alpha = 0.5) +
+  stat_compare_means(comparisons = comparisons, method = "wilcox.test",
+                     paired = TRUE, label = "p.signif",
+                     hide.ns = TRUE, size = 5) +
+  # Facet by both metastasis status and gene to ensure correct comparisons
+  facet_wrap(~ mets_progression + Gene, nrow = 3) + 
+  scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Genomic Region",
+    y = "β-value (mean across CpGs per region)",
+    fill = "Genomic Region"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    panel.border = element_rect(color = "gray80", fill = NA),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    strip.background = element_rect(fill = "gray90", color = NA),
+    strip.text = element_text(face = "bold", size = 8),
+    legend.position = "none"
+  )
+
+ggsave(file.path(out_dir, "AllGenes_TSSvsBody_Faceted_withPstars.pdf"),
+       p_all_genes_mets, width = 10, height = 8, device = cairo_pdf)
+```
+
+Testing if markers exist
+```{r}
+###############################################################################
+# exhaustion_gene_check.R
+# Purpose: Check which exhaustion genes have annotated CpGs in EPIC array
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(readr); library(stringr); library(tidyr)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+## ---- Inputs -----------------------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+beta_rds     <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+
+genes_of_interest <- c(
+  "PDCD1",     # PD-1
+  "HAVCR2",    # TIM-3
+  "CTLA4",     # CTLA-4
+  "TIGIT",     # TIGIT
+  "LAG3",      # LAG-3
+  "VSIR",      # VISTA
+  "LAYN",      # LAYN
+  "TOX", "TOX2", "TOX3", "TOX4",   # TOX family
+  "CCT6A", "TUBA1B",
+  "CXCL13",
+  "TCF7"       # TCF-1
+)
+
+## ---- Load beta to get CpG universe -----------------------------------------
+beta_comb <- {
+  obj <- readRDS(beta_rds)
+  if (is.list(obj) && !is.null(obj$beta)) obj$beta else obj
+}
+all_cpgs <- rownames(beta_comb)
+
+## ---- Load + preprocess annotation ------------------------------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>%
+  as.data.frame() %>%
+  # Expand multi-gene entries
+  separate_rows(UCSC_RefGene_Name, sep = ";") %>%
+  # Expand multi-group entries (e.g., "TSS200;TSS200")
+  separate_rows(UCSC_RefGene_Group, sep = ";")
+
+## ---- Check each gene --------------------------------------------------------
+check_results <- lapply(genes_of_interest, function(g) {
+  df <- anno %>%
+    filter(UCSC_RefGene_Name == g,
+           UCSC_RefGene_Group %in% c("TSS200","TSS1500","Body"),
+           Name %in% all_cpgs)
+
+  tibble(
+    Gene    = g,
+    n_total = nrow(df),
+    n_TSS   = sum(df$UCSC_RefGene_Group %in% c("TSS200","TSS1500")),
+    n_Body  = sum(df$UCSC_RefGene_Group == "Body")
+  )
+}) %>% bind_rows()
+
+print(check_results)
+
+## ---- Save to CSV for reference ----------------------------------------------
+out_csv <- file.path(results_root, "ExhaustionGenes_CpGcheck.csv")
+write_csv(check_results, out_csv)
+cat("✓ Saved check results to:", out_csv, "\n")
+```
+
+Looking for exhaustion genes
+```{r}
+###############################################################################
+# exhaustion_gene_region_plots.R
+# Purpose: Generate clean per-gene plots for exhaustion markers
+# - β-values (TSS vs Body) across metastasis groups
+# - No titles, no stats labels, no facet strip backgrounds, no grid lines
+# - Ensures correct matching of gene names in annotation
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(glue)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(ggplot2); library(ggpubr); library(purrr)
+})
+
+## ---- Inputs -----------------------------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+out_dir      <- file.path(results_root, "ExhaustionGenePlots_clean")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+beta_rds     <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
+meta_csv     <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+# Exhaustion gene set
+genes_of_interest <- c(
+  "PDCD1", "HAVCR2", "CTLA4", "TIGIT", "LAG3", "VSIR",
+  "LAYN", "TOX", "TOX2", "TOX3", "TOX4",
+  "CXCL13", "TCF7",
+  "CCT6A", "TUBA1B"
+)
+
+## ---- Load β-matrix + meta ---------------------------------------------------
+beta_comb <- {
+  obj <- readRDS(beta_rds)
+  if (is.list(obj) && !is.null(obj$beta)) obj$beta else obj
+}
+meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    mets_progression = case_when(
+      Distant_Mets == 1 ~ "Distant Mets",
+      ln_only == 1      ~ "LN-only Mets",
+      TRUE              ~ "No Mets"
+    ),
+    mets_progression = factor(mets_progression,
+                              levels = c("No Mets","LN-only Mets","Distant Mets"))
+  ) %>% dplyr::select(SampleID, mets_progression)
+
+common_ids <- intersect(colnames(beta_comb), meta$SampleID)
+stopifnot(length(common_ids) > 0)
+beta_comb <- beta_comb[, common_ids, drop = FALSE]
+meta      <- filter(meta, SampleID %in% common_ids)
+
+## ---- Annotation helper ------------------------------------------------------
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>%
+  as.data.frame() %>%
+  separate_rows(UCSC_RefGene_Name, sep = ";") %>%
+  separate_rows(UCSC_RefGene_Group, sep = ";")
+
+get_gene_cpgs <- function(gene_symbol, beta_mat, anno_df){
+  df <- anno_df %>%
+    filter(UCSC_RefGene_Name == gene_symbol,
+           UCSC_RefGene_Group %in% c("TSS200","TSS1500","Body")) %>%
+    filter(Name %in% rownames(beta_mat))
+  list(
+    tss  = df %>% filter(UCSC_RefGene_Group %in% c("TSS200","TSS1500")) %>% pull(Name),
+    body = df %>% filter(UCSC_RefGene_Group == "Body") %>% pull(Name)
+  )
+}
+
+## ---- Transform + collapse ---------------------------------------------------
+to_m <- function(b) log2((b + 1e-6) / (1 - b + 1e-6))  # safe logit2
+
+collapse_region <- function(cpgs, beta_mat, label){
+  if (!length(cpgs)) return(NULL)
+  B <- beta_mat[cpgs, , drop = FALSE]
+  M <- t(apply(B, 1, to_m))
+  tibble(
+    SampleID      = colnames(B),
+    Region        = label,
+    BetaCollapsed = colMeans(B, na.rm = TRUE),
+    Mmean         = colMeans(M, na.rm = TRUE)
+  )
+}
+
+## ---- Core function: one gene -> clean plot ---------------------------------
+analyze_gene_clean <- function(gene_symbol, beta_mat, meta_df, anno_df, out_dir){
+  cpgs <- get_gene_cpgs(gene_symbol, beta_mat, anno_df)
+  if (!length(cpgs$tss) && !length(cpgs$body)) {
+    message("Skipping ", gene_symbol, ": no TSS or Body CpGs present in matrix.")
+    return(NULL)
+  }
+  df_tss  <- collapse_region(cpgs$tss,  beta_mat, "TSS")
+  df_body <- collapse_region(cpgs$body, beta_mat, "Body")
+  scores <- bind_rows(df_tss, df_body) %>%
+    left_join(meta_df, by = "SampleID") %>%
+    filter(!is.na(mets_progression))
+
+  plot_df <- scores %>% dplyr::select(SampleID, Region, BetaCollapsed, mets_progression)
+
+  p <- ggplot(plot_df, aes(x = Region, y = BetaCollapsed, fill = Region)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.75, color = "gray30") +
+    geom_jitter(aes(group = SampleID), width = 0.15, size = 0.8, alpha = 0.6) +
+    facet_wrap(~ mets_progression) +
+    scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+      x = "Genomic Position (Region)",
+      y = "β-value (mean across CpGs per region)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA),
+      strip.background = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.text.x = element_text(angle = 0, hjust = 0.5),
+      legend.position = "none"
+    )
+
+  ggsave(file.path(out_dir, glue("{gene_symbol}_TSSvsBody_betaPlot_clean.pdf")),
+         p, width = 6.5, height = 4.8, device = cairo_pdf)
+}
+
+## ---- Run over all genes -----------------------------------------------------
+walk(genes_of_interest, ~ analyze_gene_clean(.x, beta_comb, meta, anno, out_dir))
+
+cat("✓ Saved cleaned per-gene PDF plots to:\n  ", out_dir, "\n")
+
+###############################################################################
+# Combined exhaustion panel plot
+###############################################################################
+
+all_plot_df <- map_dfr(genes_of_interest, function(gene_symbol) {
+  cpgs <- get_gene_cpgs(gene_symbol, beta_comb, anno)
+  df_tss  <- collapse_region(cpgs$tss,  beta_comb, "TSS")
+  df_body <- collapse_region(cpgs$body, beta_comb, "Body")
+  bind_rows(df_tss, df_body) %>%
+    mutate(Gene = gene_symbol)
+})
+
+all_plot_df <- all_plot_df %>%
+  left_join(meta, by = "SampleID") %>%
+  filter(!is.na(mets_progression))
+
+comparisons <- list(c("TSS", "Body"))
+
+p_all_genes_mets <- ggplot(all_plot_df,
+                           aes(x = Region, y = BetaCollapsed, fill = Region)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.6, color = "gray30") +
+  geom_jitter(width = 0.15, size = 0.7, alpha = 0.5) +
+  stat_compare_means(comparisons = comparisons, method = "wilcox.test",
+                     paired = TRUE, label = "p.signif",
+                     hide.ns = TRUE, size = 5) +
+  facet_wrap(~ mets_progression + Gene, nrow = 3) + 
+  scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Genomic Region",
+    y = "β-value (mean across CpGs per region)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    panel.border = element_rect(color = "gray80", fill = NA),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    strip.background = element_rect(fill = "gray90", color = NA),
+    strip.text = element_text(face = "bold", size = 8),
+    legend.position = "none"
+  )
+
+ggsave(file.path(out_dir, "AllExhaustionGenes_TSSvsBody_Faceted_withPstars.pdf"),
+       p_all_genes_mets, width = 12, height = 9, device = cairo_pdf)
+
+cat("✓ Saved combined exhaustion gene panel plot to:\n  ", out_dir, "\n")
+```
+
+Differential expression analysis using MAST on the single cell data
+```{r}
+# ---
+# SCRIPT: Harmony Integration and MAST DE Analysis (Mets vs. Non-Mets)
+# ---
+#
+# PURPOSE:
+# This script performs a full single-cell analysis workflow:
+# 1. Loads and harmonizes Seurat data.
+# 2. Merges patient-level covariates (age, sex, MLH1).
+# 3. Runs Harmony to correct for patient-specific batch effects for visualization.
+# 4. Saves a corrected UMAP plot to verify the integration.
+# 5. Performs differential gene expression analysis using MAST, statistically
+#    controlling for patient effects and other specified covariates.
+# ---
+
+# --- 1. Load Libraries ---
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(harmony)
+  library(MAST)
+  library(data.table)
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+})
+
+# --- 2. Define Inputs, Outputs, and Parameters ---
+seurat_object_file <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Single_cell/Single_cell_samples/Single Cell/combined_data.rds"
+analysis_outputs <- "/Users/adiallo/Desktop/Thesis/Results"
+
+tumor_atlas_labels <- c(
+  "cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)",
+  "cE03 (Stem/TA-like prolif)", "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)",
+  "cE06 (Immature Goblet)", "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)",
+  "cE09 (Best4)", "cE10 (Tuft)", "cE11 (Enteroendocrine)"
+)
+
+# --- 3. Load Data ---
+message(paste("Loading Seurat object from:", seurat_object_file))
+srt <- readRDS(file = seurat_object_file)
+message("...Data loaded successfully.")
+
+# --- 4. Create Patient Metadata Lookup Table ---
+# This table is now filled with your provided data.
+patient_info_df <- tibble::tribble(
+  ~patient_id, ~age, ~sex_char, ~MLH1_num,
+  "3",   76, "M", 1,
+  "106", 93, "F", 0,
+  "11",  61, "F", 1,
+  "116", 64, "M", 0,
+  "13",  90, "F", 1,
+  "18",  52, "M", 1,
+  "40",  71, "F", 0,
+  "46",  81, "M", 1,
+  "72",  80, "M", 0,
+  "86",  59, "F", 1
+) %>%
+  mutate(sex_num = ifelse(sex_char == "M", 1, 0)) # Create numeric sex variable
+
+# --- 5. Data Harmonization & Merging ---
+message("[INFO] Harmonizing metadata columns and merging patient info...")
+srt$atlas_label <- srt$predicted.id
+srt$patient_id <- gsub("^patient_", "", srt$orig.ident)
+srt$mets <- ifelse(tolower(srt$dataset_origin) == "metastasis", 1, 0)
+
+# Merge the hard-coded patient info into the Seurat metadata
+srt@meta.data <- srt@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  left_join(patient_info_df, by = "patient_id") %>%
+  tibble::column_to_rownames("cell_id")
+message("...Harmonization and merging complete.")
+
+
+# --- 6. Harmony Integration & Visualization ---
+message("[HARMONY] Starting integration workflow...")
+srt <- NormalizeData(srt, verbose = FALSE)
+srt <- FindVariableFeatures(srt, verbose = FALSE)
+srt <- ScaleData(srt, verbose = FALSE)
+srt <- RunPCA(srt, verbose = FALSE)
+srt <- RunHarmony(srt, group.by.vars = "patient_id", reduction.save = "harmony", verbose = FALSE)
+srt <- RunUMAP(srt, reduction = "harmony", dims = 1:30, verbose = FALSE)
+
+# Create and save a diagnostic UMAP plot
+message("[HARMONY] Creating and saving diagnostic UMAP plot...")
+umap_coords <- as.data.frame(srt@reductions$umap@cell.embeddings)
+x_col <- colnames(umap_coords)[1]
+y_col <- colnames(umap_coords)[2]
+plot_df <- cbind(umap_coords, srt@meta.data)
+set.seed(123)
+shuffled_df <- plot_df[sample(nrow(plot_df)), ]
+
+p_corrected <- ggplot(shuffled_df, aes(x = .data[[x_col]], y = .data[[y_col]], color = patient_id)) +
+  geom_point(size = 0.5, alpha = 0.8) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  theme_classic() +
+  ggtitle("Corrected UMAP (Shuffled, Colored by Patient)")
+
+output_dir_plots <- file.path(analysis_outputs, "UMAP_Plots")
+dir.create(output_dir_plots, showWarnings = FALSE, recursive = TRUE)
+ggsave(file.path(output_dir_plots, "UMAP_Corrected_by_Patient.pdf"), p_corrected, width = 8, height = 6)
+message(paste("...Corrected UMAP saved to:", output_dir_plots))
+
+
+# --- 7. Differential Expression with MAST (on original data) ---
+message("[MAST] Preparing data for Tumor cell subtypes defined by the atlas.")
+cells_focus <- WhichCells(srt, expression = atlas_label %in% tumor_atlas_labels)
+
+if (length(cells_focus) < 100) {
+  stop(paste("Fewer than 100 cells found for the specified tumor atlas labels - stopping analysis."))
+}
+
+expr <- GetAssayData(srt, slot = "data", assay = "RNA")[, cells_focus, drop = FALSE]
+meta <- srt@meta.data[cells_focus, , drop = FALSE]
+meta$mets <- factor(meta$mets, levels = c(0, 1), labels = c("No_Mets", "Mets"))
+
+min_detect_frac <- 0.05
+min_detect_abs  <- 50
+detect_counts <- Matrix::rowSums(expr > 0)
+min_detect <- max(min_detect_abs, ceiling(min_detect_frac * ncol(expr)))
+keep_genes <- names(which(detect_counts >= min_detect))
+expr <- expr[keep_genes, , drop = FALSE]
+message(sprintf("[MAST] Testing %d genes in %d cells.", length(keep_genes), length(cells_focus)))
+
+sca <- FromMatrix(
+  exprsArray = as.matrix(expr),
+  cData      = data.frame(row.names = rownames(meta), meta)
+)
+
+colData(sca)$cngeneson <- scale(colSums(assay(sca) > 0))
+
+message("[MAST] Scaling available QC covariates...")
+# **UPDATED**: Added age, sex_num, and MLH1_num to the list of potential covariates
+optional_covariates <- c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score", "age", "sex_num", "MLH1_num")
+found_covariates <- c() 
+
+for (var in optional_covariates) {
+  if (var %in% colnames(colData(sca))) {
+    if (is.numeric(colData(sca)[[var]]) && var(colData(sca)[[var]], na.rm = TRUE) > 0) {
+      colData(sca)[[var]] <- scale(colData(sca)[[var]])
+      found_covariates <- c(found_covariates, var)
+      message(sprintf("  - Found and scaled '%s'.", var))
+    } else {
+      message(sprintf("  - [Warning] %s found but has zero variance or is non-numeric — skipping.", var))
+    }
+  } else {
+    message(sprintf("  - [Warning] %s not found in metadata — skipping.", var))
+  }
+}
+
+message("[MAST] Building model formula...")
+colData(sca)$patient_id <- factor(colData(sca)$patient_id)
+
+use_patient_block <- FALSE
+if (nlevels(colData(sca)$patient_id) > 1) {
+  use_patient_block <- TRUE
+  message("[MAST] More than one patient found. Including patient_id as a blocking factor.")
+  contrasts(colData(sca)$patient_id) <- contr.sum(nlevels(colData(sca)$patient_id))
+} else {
+  message("[MAST] [Warning] Only one patient found. Analysis will proceed WITHOUT correcting for patient-specific effects.")
+}
+
+base_formula_str <- "~mets"
+if (use_patient_block) {
+  base_formula_str <- paste(base_formula_str, "+ patient_id")
+}
+base_formula_str <- paste(base_formula_str, "+ cngeneson")
+
+final_formula_str <- base_formula_str
+if (length(found_covariates) > 0) {
+  final_formula_str <- paste(base_formula_str, "+", paste(found_covariates, collapse = " + "))
+}
+fml <- as.formula(final_formula_str)
+message(sprintf("[MAST] Using model formula: %s", final_formula_str))
+
+fit <- zlm(formula = fml, sca = sca, method = "bayesglm", ebayes = TRUE)
+
+message("[MAST] Extracting results using the likelihood-ratio test...")
+summary_cond <- summary(fit, doLRT = 'metsMets')
+summary_dt <- summary_cond$datatable
+
+fc_hurdle <- merge(
+  summary_dt[contrast == 'metsMets' & component == 'H', .(primerid, `Pr(>Chisq)`)],
+  summary_dt[contrast == 'metsMets' & component == 'logFC', .(primerid, coef)],
+  by = 'primerid'
+)
+
+colnames(fc_hurdle) <- c("gene", "p_value", "log2FC")
+res_final <- fc_hurdle %>%
+  as_tibble() %>%
+  mutate(FDR = p.adjust(p_value, method = "fdr")) %>%
+  arrange(FDR, p_value) %>%
+  relocate(gene)
+
+output_dir_de <- file.path(analysis_outputs, "DE_MAST_Mets_vs_NonMets")
+dir.create(output_dir_de, showWarnings = FALSE, recursive = TRUE)
+
+file_out <- file.path(output_dir_de, "DEGs_Tumor_Cells_from_Atlas.csv")
+write_csv(res_final, file_out)
+
+top_up   <- res_final %>% filter(FDR < 0.05, log2FC > 0.25)
+top_down <- res_final %>% filter(FDR < 0.05, log2FC < -0.25)
+
+message("\n-------------------------------------------------")
+message("✅ WORKFLOW COMPLETE")
+message("-------------------------------------------------")
+message(sprintf(
+  "Cell Types Analyzed: Tumor Cells (defined by atlas labels)\nDifferentially Expressed Genes (FDR < 0.05 & |log2FC| > 0.25):\n  - Upregulated in Mets: %d\n  - Downregulated in Mets: %d\n\nResults saved to:\n%s",
+  nrow(top_up), nrow(top_down), file_out
+))
+message("-------------------------------------------------\n")
+```
+
+Still using mast but a mixed effects model in place of the other one. 
+```{r}
+# ---
+# SCRIPT: MAST Mixed-Effects Model DE Analysis (Mets vs. Non-Mets)
+# ---
+#
+# PURPOSE:
+# This script uses MAST's mixed-effects modeling capabilities to perform
+# differential expression analysis. It treats each patient as a random effect
+# to properly account for the non-independence of cells from the same
+# individual, which corrects for pseudoreplication bias.
+# ---
+
+# --- 1. Load Libraries ---
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(harmony)
+  library(MAST)
+  library(data.table)
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+})
+
+# --- 2. Define Inputs, Outputs, and Parameters ---
+seurat_object_file <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Single_cell/Single_cell_samples/Single Cell/combined_data.rds"
+analysis_outputs <- "/Users/adiallo/Desktop/Thesis/Results"
+
+tumor_atlas_labels <- c(
+  "cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)",
+  "cE03 (Stem/TA-like prolif)", "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)",
+  "cE06 (Immature Goblet)", "cE07 (Goblet/Enterocyte)", "cE08 (Goblet)",
+  "cE09 (Best4)", "cE10 (Tuft)", "cE11 (Enteroendocrine)"
+)
+
+# --- 3. Create Patient Metadata Lookup Table ---
+patient_info_df <- tibble::tribble(
+  ~patient_id, ~age, ~sex_char, ~MLH1_num,
+  "3",   76, "M", 1,
+  "106", 93, "F", 0,
+  "11",  61, "F", 1,
+  "116", 64, "M", 0,
+  "13",  90, "F", 1,
+  "18",  52, "M", 1,
+  "40",  71, "F", 0,
+  "46",  81, "M", 1,
+  "72",  80, "M", 0,
+  "86",  59, "F", 1
+) %>%
+  mutate(sex_num = ifelse(sex_char == "M", 1, 0))
+
+# --- 4. Load and Prepare Seurat Object ---
+message(paste("Loading Seurat object from:", seurat_object_file))
+srt <- readRDS(file = seurat_object_file)
+message("...Data loaded successfully.")
+
+# --- 5. Data Harmonization & Merging ---
+message("[INFO] Harmonizing metadata columns and merging patient info...")
+srt$atlas_label <- srt$predicted.id
+srt$patient_id <- gsub("^patient_", "", srt$orig.ident)
+srt$mets <- ifelse(tolower(srt$dataset_origin) == "metastasis", 1, 0)
+
+srt@meta.data <- srt@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  left_join(patient_info_df, by = "patient_id") %>%
+  tibble::column_to_rownames("cell_id")
+message("...Harmonization and merging complete.")
+
+# --- 6. Data Preparation for MAST ---
+# This section is modified to run on the desired cell types and prepare the sca object.
+message("[MAST] Preparing data for Tumor cell subtypes defined by the atlas.")
+cells_focus <- WhichCells(srt, expression = atlas_label %in% tumor_atlas_labels)
+
+if (length(cells_focus) < 100) {
+  stop(paste("Fewer than 100 cells found for the specified tumor atlas labels - stopping analysis."))
+}
+
+# NOTE: For MAST, we use the log-normalized 'data' slot
+expr <- GetAssayData(srt, slot = "data", assay = "RNA")[, cells_focus, drop = FALSE]
+meta <- srt@meta.data[cells_focus, , drop = FALSE]
+meta$mets <- factor(meta$mets, levels = c(0, 1), labels = c("No_Mets", "Mets"))
+
+min_detect_frac <- 0.05
+min_detect_abs  <- 50
+detect_counts <- Matrix::rowSums(expr > 0)
+min_detect <- max(min_detect_abs, ceiling(min_detect_frac * ncol(expr)))
+keep_genes <- names(which(detect_counts >= min_detect))
+expr <- expr[keep_genes, , drop = FALSE]
+message(sprintf("[MAST] Testing %d genes in %d cells.", length(keep_genes), length(cells_focus)))
+
+sca <- FromMatrix(
+  exprsArray = as.matrix(expr),
+  cData      = data.frame(row.names = rownames(meta), meta)
+)
+
+colData(sca)$cngeneson <- scale(colSums(assay(sca) > 0))
+
+message("[MAST] Scaling available QC covariates...")
+optional_covariates <- c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score", "age", "sex_num", "MLH1_num")
+found_covariates <- c() 
+
+for (var in optional_covariates) {
+  if (var %in% colnames(colData(sca))) {
+    if (is.numeric(colData(sca)[[var]]) && var(colData(sca)[[var]], na.rm = TRUE) > 0) {
+      colData(sca)[[var]] <- scale(colData(sca)[[var]])
+      found_covariates <- c(found_covariates, var)
+      message(sprintf("  - Found and scaled '%s'.", var))
+    }
+  }
+}
+
+
+# --- 7. Fit the MAST Mixed-Effects Model ---
+# WARNING: This method can be extremely slow and memory-intensive.
+message("[MAST] Building and fitting mixed-effects model (this will take a long time)...")
+
+# Create a vector of the fixed-effect terms (the variables we are testing or correcting for)
+fixed_effects <- c("mets", "cngeneson", found_covariates)
+
+# Assemble the final formula with a random effect for patient_id: `(1|patient_id)`
+# This term tells the model that cells from the same patient are related.
+final_formula_str <- paste("~", paste(fixed_effects, collapse = " + "), "+ (1|patient_id)")
+fml <- as.formula(final_formula_str)
+message(sprintf("[MAST] Using mixed-effects model formula: %s", final_formula_str))
+
+# Fit the model using the 'glmer' engine, which is required for mixed models in MAST.
+fit <- zlm(formula = fml, 
+           sca = sca, 
+           method = 'glmer', 
+           ebayes = FALSE,
+           fitArgsD = list(nAGQ = 0)) # A setting for faster (but less precise) estimation
+
+# --- 8. Extract and Process Results ---
+message("[MAST] Extracting results using the likelihood-ratio test...")
+summary_cond <- summary(fit, doLRT = 'metsMets') # Test the 'mets' fixed effect
+summary_dt <- summary_cond$datatable
+
+fc_hurdle <- merge(
+  summary_dt[contrast == 'metsMets' & component == 'H', .(primerid, `Pr(>Chisq)`)],
+  summary_dt[contrast == 'metsMets' & component == 'logFC', .(primerid, coef)],
+  by = 'primerid'
+)
+
+colnames(fc_hurdle) <- c("gene", "p_value", "log2FC")
+res_final <- fc_hurdle %>%
+  as_tibble() %>%
+  mutate(FDR = p.adjust(p_value, method = "fdr")) %>%
+  arrange(FDR, p_value) %>%
+  relocate(gene)
+
+# --- 9. Save Output ---
+output_dir_de <- file.path(analysis_outputs, "DE_MAST_MixedModel_Mets_vs_NonMets")
+dir.create(output_dir_de, showWarnings = FALSE, recursive = TRUE)
+
+file_out <- file.path(output_dir_de, "DEGs_MAST_MixedModel_Tumor_Cells.csv")
+write_csv(res_final, file_out)
+
+top_up   <- res_final %>% filter(FDR < 0.05, log2FC > 0.25)
+top_down <- res_final %>% filter(FDR < 0.05, log2FC < -0.25)
+
+message("\n-------------------------------------------------")
+message("✅ MAST MIXED-MODEL WORKFLOW COMPLETE")
+message("-------------------------------------------------")
+message(sprintf(
+  "Cell Types Analyzed: Tumor Cells\nDifferentially Expressed Genes (FDR < 0.05 & |log2FC| > 0.25):\n  - Upregulated in Mets: %d\n  - Downregulated in Mets: %d\n\nResults saved to:\n%s",
+  nrow(top_up), nrow(top_down), file_out
+))
+message("-------------------------------------------------\n")
+```
+
+```{r}
+# ---
+# SCRIPT: Heatmap of Top Differentially Expressed Genes
+# ---
+
+# --- 1. Load Libraries ---
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(pheatmap)
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(Matrix)
+})
+
+# --- 2. Load and Prepare Data ---
+analysis_outputs <- "/Users/adiallo/Desktop/Thesis/Results"
+mast_results_file <- file.path(analysis_outputs, "DE_MAST_MixedModel_Mets_vs_NonMets", "DEGs_MAST_MixedModel_Tumor_Cells.csv")
+res_final <- readr::read_csv(mast_results_file)
+
+# This assumes the 'sca' (SingleCellAssay) and 'srt' (full Seurat object)
+# are available in your R environment from the previous script.
+
+# --- 3. Select the Top Genes for Plotting ---
+significant_genes_df <- res_final %>% filter(FDR < 0.05)
+top_up <- significant_genes_df %>% arrange(desc(log2FC)) %>% head(25)
+top_down <- significant_genes_df %>% arrange(log2FC) %>% head(25)
+genes_to_plot <- bind_rows(top_up, top_down) %>% pull(gene)
+
+# --- 4. Create a Pseudobulk Matrix of Average Expression ---
+log_norm_counts <- assay(sca)[genes_to_plot, ]
+cell_metadata <- as.data.frame(colData(sca))
+counts_t <- t(as.matrix(log_norm_counts))
+pseudobulk_avg_t <- aggregate(counts_t, by = list(patient = cell_metadata$patient_id), FUN = mean)
+pseudobulk_avg <- t(pseudobulk_avg_t[, -1])
+colnames(pseudobulk_avg) <- pseudobulk_avg_t$patient
+plot_data <- t(scale(t(pseudobulk_avg)))
+
+# --- 5. Prepare Annotations and Plot Heatmap ---
+# **CORRECTED SECTION**: Build the annotation directly from the full Seurat object
+# to ensure all patient data is correct.
+annotation_df <- srt@meta.data %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  dplyr::select(patient_id, mets, sex_num) %>%
+  remove_rownames() %>%
+  column_to_rownames("patient_id")
+
+# Reorder the annotation rows to match the column order of the heatmap data
+annotation_df <- annotation_df[colnames(plot_data), , drop = FALSE]
+
+# Create readable character columns for the plot's legend
+annotation_df$Metastasis <- ifelse(annotation_df$mets == 1, "Mets", "No Mets")
+annotation_df$Sex <- ifelse(annotation_df$sex_num == 1, "M", "F")
+annotation_df$mets <- NULL
+annotation_df$sex_num <- NULL
+
+# Define the output file path
+output_dir_plots <- file.path(analysis_outputs, "Final_Plots")
+dir.create(output_dir_plots, showWarnings = FALSE, recursive = TRUE)
+heatmap_file <- file.path(output_dir_plots, "Top50_DEG_Heatmap_Corrected.pdf")
+
+# Generate the heatmap object
+heatmap_plot <- pheatmap(plot_data,
+                         annotation_col = annotation_df,
+                         cluster_rows = TRUE,
+                         cluster_cols = TRUE,
+                         show_colnames = FALSE,
+                         main = "Top 50 DEGs (Mets vs. No Mets)",
+                         silent = TRUE)
+
+# Save to a cairo PDF
+cairo_pdf(heatmap_file, width = 8, height = 10)
+print(heatmap_plot)
+dev.off()
+
+message(paste("...Corrected heatmap saved to:", heatmap_file))
+```
+
+```{r}
+# ---
+# SCRIPT: UMAP Feature Plot for Individual Overlapping Genes
+# ---
+
+# --- 1. Load Libraries ---
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+})
+
+# --- 2. Define Your High-Confidence Genes ---
+# The genes that overlapped between your MAST DEG and DMG lists
+genes_to_plot <- c("CCDC60", "PRMT6", "RASGRP2")
+
+# --- 3. Generate the Feature Plot ---
+# This will create a grid of UMAPs, one for each gene.
+# 'order = TRUE' ensures that cells with higher expression are plotted on top.
+feature_plot_panel <- FeaturePlot(
+  object = srt,
+  features = genes_to_plot,
+  pt.size = 0.5,
+  order = TRUE,
+  combine = TRUE # This will arrange the plots into a single grid
+) &
+  scale_color_viridis_c() # Apply a colorblind-friendly palette to all plots
+
+# --- 4. Save the Plot to a PDF ---
+output_dir_plots <- file.path(analysis_outputs, "Final_Plots")
+dir.create(output_dir_plots, showWarnings = FALSE, recursive = TRUE)
+plot_file <- file.path(output_dir_plots, "FeaturePlot_Overlapping_Genes.pdf")
+
+ggsave(plot_file, feature_plot_panel, width = 12, height = 4)
+
+message(paste("...Feature plot panel saved to:", plot_file))
+
+# Print the plot to the screen
+print(feature_plot_panel)
+```
+
+
+Psudobulk Analysis using DESeq
+```{r}
+# ---
+# SCRIPT: Pseudobulk DE Analysis on ALL CELL TYPES
+# ---
+#
+# PURPOSE:
+# This script performs a pseudobulk analysis by aggregating counts from ALL cells
+# within each patient to create a single sample. This approach mirrors a bulk
+# tissue analysis. It then uses DESeq2 to find DEGs associated with metastasis
+# status while controlling for patient-level covariates.
+# ---
+
+# --- 1. Load Libraries ---
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(Matrix)
+  library(DESeq2)
+})
+
+# --- 2. Define Inputs and Outputs ---
+seurat_object_file <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Single_cell/Single_cell_samples/Single Cell/combined_data.rds"
+analysis_outputs <- "/Users/adiallo/Desktop/Thesis/Results"
+
+# --- 3. Create Patient Metadata Lookup Table ---
+patient_info_df <- tibble::tribble(
+  ~patient_id, ~age, ~sex_char, ~MLH1_num,
+  "3",   76, "M", 1,
+  "106", 93, "F", 0,
+  "11",  61, "F", 1,
+  "116", 64, "M", 0,
+  "13",  90, "F", 1,
+  "18",  52, "M", 1,
+  "40",  71, "F", 0,
+  "46",  81, "M", 1,
+  "72",  80, "M", 0,
+  "86",  59, "F", 1
+) %>%
+  mutate(sex_num = ifelse(sex_char == "M", 1, 0))
+
+# --- 4. Load and Prepare Seurat Object ---
+message(paste("Loading Seurat object from:", seurat_object_file))
+srt <- readRDS(file = seurat_object_file)
+
+message("[INFO] Harmonizing metadata columns and merging patient info...")
+srt$patient_id <- gsub("^patient_", "", srt$orig.ident)
+srt$mets <- ifelse(tolower(srt$dataset_origin) == "metastasis", 1, 0)
+
+srt@meta.data <- srt@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  left_join(patient_info_df, by = "patient_id") %>%
+  tibble::column_to_rownames("cell_id")
+message("...Data preparation complete.")
+
+# --- 5. Aggregate Counts to Pseudobulk Level (ALL CELLS) ---
+message("[PSEUDOBULK] Aggregating counts from ALL cells to patient level...")
+
+# Get the raw counts from the RNA assay for the ENTIRE object
+raw_counts <- GetAssayData(srt, slot = "counts", assay = "RNA")
+
+# Get the corresponding metadata
+cell_metadata <- srt@meta.data
+
+# Aggregate counts by patient_id
+counts_t <- t(raw_counts)
+pseudobulk_t <- rowsum(counts_t, group = cell_metadata$patient_id, reorder = TRUE)
+pseudobulk_counts <- t(pseudobulk_t)
+
+message("...Aggregation complete.")
+
+# --- 6. Prepare Metadata for DESeq2 ---
+# Create a metadata data frame with one unique row per patient
+patient_metadata <- cell_metadata %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  select(patient_id, mets, age, sex_num, MLH1_num) %>%
+  remove_rownames() %>%
+  column_to_rownames("patient_id")
+
+# Ensure the column order of the counts matrix matches the row order of the metadata
+pseudobulk_counts <- pseudobulk_counts[, rownames(patient_metadata)]
+
+# --- 7. Run DESeq2 ---
+message("[DESeq2] Running differential expression analysis...")
+
+dds <- DESeqDataSetFromMatrix(countData = round(pseudobulk_counts),
+                              colData = patient_metadata,
+                              design = ~ age + sex_num + MLH1_num + mets)
+dds$mets <- factor(dds$mets, levels = c("0", "1"))
+dds$mets <- relevel(dds$mets, ref = "0")
+dds <- DESeq(dds)
+res <- results(dds, name="mets_1_vs_0")
+res <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  as_tibble() %>%
+  arrange(padj)
+
+message("...DESeq2 analysis complete.")
+
+# --- 8. Save Output ---
+output_dir_de <- file.path(analysis_outputs, "DE_Pseudobulk_All_Cells")
+dir.create(output_dir_de, showWarnings = FALSE, recursive = TRUE)
+
+file_out <- file.path(output_dir_de, "DEGs_Pseudobulk_All_Cells.csv")
+write_csv(res, file_out)
+
+top_hits <- res %>% filter(padj < 0.05)
+
+message("\n-------------------------------------------------")
+message("✅ PSEUDOBULK WORKFLOW COMPLETE")
+message("-------------------------------------------------")
+message(sprintf(
+  "Analysis of: ALL Cells (aggregated by patient)\nDifferentially Expressed Genes (FDR < 0.05):\n  - Found %d significant genes.\n\nResults saved to:\n%s",
+  nrow(top_hits), file_out
+))
+message("-------------------------------------------------\n")
+```
+
+```{r}
+# ---
+# SCRIPT: Heatmap of Overlapping Genes
+# ---
+#
+# PURPOSE:
+# Generate and save a publication-quality heatmap as a PDF, showing the
+# expression pattern of genes that overlap between methylation and
+# expression analyses. The heatmap is annotated by metastasis and sex.
+# ---
+
+# --- 1. Load Libraries ---
+suppressPackageStartupMessages({
+  library(pheatmap)
+  library(DESeq2)
+  library(dplyr)
+  library(tibble)
+  library(readr)
+})
+
+# --- 2. Define Paths and Gene Lists ---
+analysis_outputs <- "/Users/adiallo/Desktop/Thesis/Results"
+degs_results_file <- file.path(analysis_outputs, "DE_Pseudobulk_All_Cells", "DEGs_Pseudobulk_All_Cells.csv")
+degs_df <- readr::read_csv(degs_results_file)
+
+degs_list <- degs_df %>% filter(padj < 0.05) %>% pull(gene)
+
+any_mets_dmgs <- c("CAPN13", "JMJD8", "CA10", "LINC00424", "GALNT14", "ADRA2C", "ANK1", "FER1L6-AS2", "SLIT2", "ABL1", "PAK1", "C10orf11", "CCDC60", "PTPRM", "HLA-DOA", "LOC644145", "H2AFY2", "TFAP2B", "C8orf33", "KCNQ2", "ATP7B", "DSCR3", "SNORA39", "SPTBN4")
+ln_mets_dmgs <- c("CENPB", "GPR1-AS", "ZMYM2", "FAM126A", "ABCA7", "LOC100190940", "GOLT1A")
+distant_mets_dmgs <- c("MARK1", "BSN", "FNDC4", "FAM150B", "HLA-L", "ELOVL5", "EPHB1", "FAM69B", "COL5A1", "TNXB", "LRRC14B", "TMEM87B", "RASA3", "SOCS1", "MAPK4", "ADRA1D", "GALNT9", "SLC38A3", "NAT8L", "PVALB", "C12orf68", "PRDM8", "GPR123", "ZDHHC22", "LHX4", "C3orf50", "BAI3", "C14orf39", "NXN", "SLC1A2", "RASGRP2", "TCHH", "KLF7", "CORO2B", "LINC01152", "CSMD2", "SHC4", "NRN1", "TET1", "ABR", "RGS7", "ZDBF2", "FLJ44817", "BRSK2", "BNC2", "C1orf65", "FAM163A", "LMO2", "ZNF382", "ISM1", "MIXL1", "GRHL3", "KIF1A", "GABRB2", "DTX1", "CHST1", "ECE2", "HTR4", "GRK5", "DPYSL4", "STMN2", "INHBB", "NEUROG1", "S1PR1", "CDYL", "SNCAIP", "SLC30A3", "LOC387763", "SLC30A10", "C3orf55", "MLN", "MCC", "TMOD1", "NTF3", "WNT1", "TACR1", "WNT5A", "AP3B2", "PRMT6", "TFPT", "FGR", "OTX2-AS1", "3-Mar", "4-Mar", "FJX1", "MIR548H4", "BEND6", "ZNF775", "STXBP5L", "NAV2", "SOX14", "PRPH", "LMF1", "NEURL", "ADAMTS19-AS1", "KREMEN2", "GRIN2C", "CR2", "SAMD11", "PITX2", "MACROD1", "STMN3", "MFSD2B", "EPHB6", "CNIH2", "TRPM1", "CACNB4", "ALDH1A3", "NRP2", "WSCD1", "SIX3", "SESN1", "CCDC42B", "PRPF31", "UQCC")
+
+# --- 3. Generate and Save Heatmap ---
+message("Generating heatmap...")
+
+# Get all unique overlapping genes
+all_dmgs <- unique(c(any_mets_dmgs, ln_mets_dmgs, distant_mets_dmgs))
+overlapping_genes <- intersect(degs_list, all_dmgs)
+
+if (length(overlapping_genes) > 0) {
+  # This assumes 'dds' is your DESeq2 object from the previous analysis
+  vst_counts <- varianceStabilizingTransformation(dds, blind = FALSE)
+  plot_data <- assay(vst_counts)[overlapping_genes, , drop = FALSE]
+
+  # Z-score scale the data by row (gene)
+  plot_data <- t(scale(t(plot_data)))
+
+  # Create an annotation data frame for the heatmap columns
+  annotation_df <- as.data.frame(colData(dds)[, c("mets", "sex_num")])
+  annotation_df$Metastasis <- ifelse(annotation_df$mets == 1, "Mets", "No Mets")
+  annotation_df$Sex <- ifelse(annotation_df$sex_num == 1, "M", "F")
+  annotation_df$mets <- NULL
+  annotation_df$sex_num <- NULL
+
+  # Create the heatmap object
+  heatmap_plot <- pheatmap(plot_data,
+                           annotation_col = annotation_df,
+                           cluster_rows = TRUE,
+                           cluster_cols = TRUE,
+                           show_colnames = FALSE,
+                           main = "Expression of Overlapping Genes (All Cells Pseudobulk)",
+                           silent = TRUE)
+
+  # Define output path and save the plot to a PDF
+  output_dir_plots <- file.path(analysis_outputs, "Final_Plots")
+  dir.create(output_dir_plots, showWarnings = FALSE, recursive = TRUE)
+  heatmap_file <- file.path(output_dir_plots, "Overlap_Heatmap.pdf")
+  
+  cairo_pdf(heatmap_file, width = 8, height = 6)
+  print(heatmap_plot)
+  dev.off()
+  
+  message(paste("...Heatmap saved to:", heatmap_file))
+  
+} else {
+  message("No overlapping genes found between DEGs and DMGs. Skipping heatmap.")
+}
+
+```
+
+```{r}
+# ---
+# SCRIPT: UMAP Feature Plot for Differentially Methylated Genes (DMGs)
+# ---
+
+# --- 1. Load Libraries ---
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+})
+
+# --- 2. Load Your Processed Seurat Object ---
+# This should be the 'srt' object that has already had Harmony run on it.
+# If it's not in your environment, load it:
+# srt <- readRDS("path/to/your/harmony_processed_seurat_object.rds")
+
+# --- 3. Create 'cell_class' Metadata Column ---
+# This mapping creates the broad cell type categories from your detailed atlas labels.
+message("Creating 'cell_class' metadata column...")
+label_to_class <- c("cE01 (Stem/TA-like)"="Tumor cells", "cE02 (Stem/TA-like/Immature Goblet)"="Tumor cells", "cE03 (Stem/TA-like prolif)"="Tumor cells", "cE04 (Enterocyte 1)"="Tumor cells", "cE05 (Enterocyte 2)"="Tumor cells", "cE06 (Immature Goblet)"="Tumor cells", "cE07 (Goblet/Enterocyte)"="Tumor cells", "cE08 (Goblet)"="Tumor cells", "cE09 (Best4)"="Tumor cells", "cE10 (Tuft)"="Tumor cells", "cE11 (Enteroendocrine)"="Tumor cells", "cS25 (Fibro CCL8+)"="Fibroblasts", "cS26 (Myofibro)"="Fibroblasts", "cS27 (CXCL14+ CAF)"="Fibroblasts", "cS28 (GREM1+ CAF)"="Fibroblasts", "cS29 (MMP3+ CAF)"="Fibroblasts", "cS30 (CAF CCL8 Fibro-like)"="Fibroblasts", "cS21 (Fibro stem cell niche)"="Fibroblasts", "cS22 (Fibro stem cell niche)"="Fibroblasts", "cS23 (Fibro BMP-producing)"="Fibroblasts", "cS24 (Fibro BMP-producing)"="Fibroblasts", "cS31 (CAF stem niche Fibro-like)"="Fibroblasts", "cTNI10 (CD8+ IL7R+)"="CD8+ T-cells", "cTNI11 (CD8+GZMK+)"="CD8+ T-cells", "cTNI12 (CD8+ IL7R+)"="CD8+ T-cells", "cTNI13 (CD8+ T IL17+)"="CD8+ T-cells", "cTNI14 (CD8+ CXCL13+)"="CD8+ T-cells", "cTNI15 (CD8+ CXCL13+ HSP+)"="CD8+ T-cells", "cTNI16 (CD8+ CXCL13+ prolif)"="CD8+ T-cells", "cM02 (Macrophage-like)"="Macrophages", "cM01 (Monocyte)"="Macrophages", "cTNI01 (CD4+ IL7R+)"="CD4+ T-cells", "cTNI02 (CD4+ IL7R+SELL+)"="CD4+ T-cells","cTNI03 (CD4+ IL7R+HSP+)"="CD4+ T-cells","cTNI04 (CD4+ IL7R+CCL5+)"="CD4+ T-cells","cTNI05 (CD4+ IL17+)"="CD4+ T-cells","cTNI06 (CD4+ TFH)"="TFH cells","cTNI07 (CD4+ CXCL13+)"="CD4+ T-cells","cTNI08 (CD4+ Treg)"="Treg","cTNI09 (CD4+ Treg prolif)"="Treg")
+
+srt$cell_class <- unname(label_to_class[srt$predicted.id])
+srt$cell_class[is.na(srt$cell_class)] <- "Other" # Assign 'Other' to any unmapped labels
+message("...Done.")
+
+# --- 4. Define Your Full List of Differentially Methylated Genes ---
+any_mets_dmgs <- c("CAPN13", "JMJD8", "CA10", "LINC00424", "GALNT14", "ADRA2C", "ANK1", "FER1L6-AS2", "SLIT2", "ABL1", "PAK1", "C10orf11", "CCDC60", "PTPRM", "HLA-DOA", "LOC644145", "H2AFY2", "TFAP2B", "C8orf33", "KCNQ2", "ATP7B", "DSCR3", "SNORA39", "SPTBN4")
+ln_mets_dmgs <- c("CENPB", "GPR1-AS", "ZMYM2", "FAM126A", "ABCA7", "LOC100190940", "GOLT1A")
+distant_mets_dmgs <- c("MARK1", "BSN", "FNDC4", "FAM150B", "HLA-L", "ELOVL5", "EPHB1", "FAM69B", "COL5A1", "TNXB", "LRRC14B", "TMEM87B", "RASA3", "SOCS1", "MAPK4", "ADRA1D", "GALNT9", "SLC38A3", "NAT8L", "PVALB", "C12orf68", "PRDM8", "GPR123", "ZDHHC22", "LHX4", "C3orf50", "BAI3", "C14orf39", "NXN", "SLC1A2", "RASGRP2", "TCHH", "KLF7", "CORO2B", "LINC01152", "CSMD2", "SHC4", "NRN1", "TET1", "ABR", "RGS7", "ZDBF2", "FLJ44817", "BRSK2", "BNC2", "C1orf65", "FAM163A", "LMO2", "ZNF382", "ISM1", "MIXL1", "GRHL3", "KIF1A", "GABRB2", "DTX1", "CHST1", "ECE2", "HTR4", "GRK5", "DPYSL4", "STMN2", "INHBB", "NEUROG1", "S1PR1", "CDYL", "SNCAIP", "SLC30A3", "LOC387763", "SLC30A10", "C3orf55", "MLN", "MCC", "TMOD1", "NTF3", "WNT1", "TACR1", "WNT5A", "AP3B2", "PRMT6", "TFPT", "FGR", "OTX2-AS1", "3-Mar", "4-Mar", "FJX1", "MIR548H4", "BEND6", "ZNF775", "STXBP5L", "NAV2", "SOX14", "PRPH", "LMF1", "NEURL", "ADAMTS19-AS1", "KREMEN2", "GRIN2C", "CR2", "SAMD11", "PITX2", "MACROD1", "STMN3", "MFSD2B", "EPHB6", "CNIH2", "TRPM1", "CACNB4", "ALDH1A3", "NRP2", "WSCD1", "SIX3", "SESN1", "CCDC42B", "PRPF31", "UQCC")
+
+all_dmgs_list <- unique(c(any_mets_dmgs, ln_mets_dmgs, distant_mets_dmgs))
+
+# --- 5. Calculate the Module Score ---
+srt <- AddModuleScore(
+  object = srt,
+  features = list(all_dmgs_list),
+  name = 'DMG_Score'
+)
+
+# --- 6. Generate the Feature Plot ---
+p_score <- FeaturePlot(
+  object = srt,
+  features = 'DMG_Score1',
+  pt.size = 0.5,
+  order = TRUE,
+  min.cutoff = 'q10',
+  max.cutoff = 'q90'
+) +
+  ggtitle("Expression of DMG Signature") +
+  scale_color_viridis_c()
+
+# For comparison, plot the cell types
+p_clusters <- DimPlot(srt, group.by = "cell_class") + ggtitle("Cell Types")
+
+# Display the two plots side-by-side
+print(p_clusters + p_score)
+```
+
+Venn Diagram
+```{r}
+###############################################################################
+# DH vs TCGA EWAS validation — Venn-only (with 450k harmonization)
+# Discovery: DH p < 1e-3 (nominal)
+# Replication: TCGA one-sided p < 0.05 in DH-implied direction
+# - DH fits (Tier3):
+#   /Users/adiallo/Desktop/Thesis/code/results_ewas_any/H6/ewas_fits.rds
+#   /Users/adiallo/Desktop/Thesis/code/results_ewas_ln/H6/ewas_fits.rds
+#   /Users/adiallo/Desktop/Thesis/code/results_ewas_dist/H6/ewas_fits.rds
+# - TCGA fits (Tier3):
+#   results_tcga_tier3/{any_mets, ln_only, distant}/fit.rds
+# - Output: results_validation_DH_vs_TCGA/venn_only/venn_{dh}_{tcga}.pdf
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(limma); library(dplyr); library(tibble); library(readr); library(glue)
+  library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+})
+
+# Ensure VennDiagram is installed/loaded (for Venn-only output)
+if (!requireNamespace("VennDiagram", quietly = TRUE)) {
+  install.packages("VennDiagram", repos = "https://cloud.r-project.org")
+}
+library(VennDiagram); library(grid)
+
+## --- CONFIG ------------------------------------------------------------------
+dh_root   <- "/Users/adiallo/Desktop/Thesis/Results"
+tcga_root <- "results_tcga_tier3"
+out_dir   <- "results_validation_DH_vs_TCGA"
+venn_dir  <- file.path(out_dir, "venn_only")
+dir.create(venn_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Corrected mapping
+pheno_map <- tibble::tribble(
+  ~dh_tag, ~tcga_tag,   ~pretty,
+  "any",   "any_mets",  "Any metastasis",
+  "ln",    "ln_only",   "LN-only",
+  "dist",  "distant",   "Distant"
+)
+
+# Thresholds
+DH_P_CUT            <- 1e-3   # DH discovery threshold (nominal p)
+TCGA_P_ONE_SIDED    <- 0.05   # TCGA replication threshold (one-sided)
+
+## --- Helpers -----------------------------------------------------------------
+msg <- \(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+`%||%` <- function(a,b) if (is.null(a)) b else a
+
+top_table_robust <- function(fit) {
+  cols <- colnames(fit$coefficients)
+  coef_to_use <- if ("pheno_bin" %in% cols) "pheno_bin" else tail(cols, 1)
+  limma::topTable(fit, coef = coef_to_use, number = Inf, sort.by = "P")
+}
+
+load_dh <- function(dh_tag) {
+  f <- file.path(dh_root, glue("results_ewas_{dh_tag}"), "H6", "ewas_fits.rds")
+  if (!file.exists(f)) stop("Missing DH fit: ", f, call. = FALSE)
+  fits <- readRDS(f)
+  fit  <- fits$Tier3 %||% fits[[3]]
+  tt   <- top_table_robust(fit)
+  tibble::rownames_to_column(as.data.frame(tt), "CpG") %>%
+    transmute(CpG, logFC_dh = logFC, P_dh = P.Value, adjP_dh = adj.P.Val)
+}
+
+load_tcga <- function(tcga_tag) {
+  f <- file.path(tcga_root, tcga_tag, "fit.rds")
+  if (!file.exists(f)) stop("Missing TCGA fit: ", f, call. = FALSE)
+  obj <- readRDS(f)
+  fit <- if (inherits(obj, "MArrayLM")) obj else obj$fit
+  tt  <- top_table_robust(fit)
+  tibble::rownames_to_column(as.data.frame(tt), "CpG") %>%
+    transmute(CpG, logFC_tcga = logFC, P_tcga = P.Value, adjP_tcga = adj.P.Val)
+}
+
+# Convert TCGA two-sided p to one-sided p in the direction predicted by DH
+p_one_sided_in_DH_direction <- function(p_two, sign_tcga, sign_dh) {
+  same <- sign_tcga == sign_dh
+  p1   <- ifelse(same, p_two/2, 1 - p_two/2)  # conservative one-sided from two-sided
+  p1
+}
+
+draw_pair_venn <- function(setA, setB, labels, main_title) {
+  grid::grid.newpage()
+  v <- VennDiagram::draw.pairwise.venn(
+    area1       = length(setA),
+    area2       = length(setB),
+    cross.area  = length(intersect(setA, setB)),
+    category    = labels,
+    fill        = c("#6baed6", "#fd8d3c"),
+    alpha       = c(0.5, 0.5),
+    lty         = "blank",
+    cat.cex     = 1.2,
+    cex         = 1.5,
+    main        = main_title
+  )
+  grid::grid.draw(v)
+}
+
+## --- 450k probe universe (platform harmonization) ----------------------------
+anno450k  <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+cpgs_450k <- rownames(anno450k)
+
+## --- Generate Venn-only PDFs -------------------------------------------------
+for (i in seq_len(nrow(pheno_map))) {
+  dh_tag   <- pheno_map$dh_tag[i]
+  tcga_tag <- pheno_map$tcga_tag[i]
+  pretty   <- pheno_map$pretty[i]
+
+  msg(glue("— {pretty} — loading & harmonizing"))
+  dh   <- load_dh(dh_tag)     %>% filter(CpG %in% cpgs_450k)
+  tcga <- load_tcga(tcga_tag) %>% filter(CpG %in% cpgs_450k)
+
+  # DH discovery set: nominal p < 1e-3
+  dh$sign_dh <- sign(dh$logFC_dh)
+  dh_disc_all <- dh %>% filter(P_dh < DH_P_CUT)
+
+  # Compute TCGA one-sided p in DH direction (for CpGs present in both)
+  both <- inner_join(
+    dh_disc_all %>% dplyr::select(CpG, sign_dh),
+    tcga %>% dplyr::select(CpG, logFC_tcga, P_tcga),
+    by = "CpG"
+  ) %>%
+    mutate(
+      sign_tcga = sign(logFC_tcga),
+      p1_tcga   = p_one_sided_in_DH_direction(P_tcga, sign_tcga, sign_dh)
+    )
+
+  # TCGA replication set = CpGs with one-sided p < 0.05 in DH direction
+  tcga_rep_all <- both %>% filter(p1_tcga < TCGA_P_ONE_SIDED)
+
+  # Direction-specific subsets (hyper/hypo defined by DH sign)
+  dh_hyper <- dh_disc_all %>% filter(sign_dh > 0)
+  dh_hypo  <- dh_disc_all %>% filter(sign_dh < 0)
+
+  tcga_rep_hyper <- both %>% filter(sign_dh > 0, p1_tcga < TCGA_P_ONE_SIDED)
+  tcga_rep_hypo  <- both %>% filter(sign_dh < 0, p1_tcga < TCGA_P_ONE_SIDED)
+
+  # Prepare sets for Venns
+  set_dh_all   <- dh_disc_all$CpG
+  set_tcga_all <- tcga_rep_all$CpG
+
+  set_dh_hyper   <- dh_hyper$CpG
+  set_tcga_hyper <- tcga_rep_hyper$CpG
+
+  set_dh_hypo   <- dh_hypo$CpG
+  set_tcga_hypo <- tcga_rep_hypo$CpG
+
+  # PDF (3 pages): All / Hyper / Hypo
+  pdf_file <- file.path(venn_dir, glue("venn_{dh_tag}_{tcga_tag}.pdf"))
+  pdf(pdf_file, width = 6.5, height = 5.5)
+
+  # 1) All significant (DH nominal vs TCGA one-sided replication)
+  draw_pair_venn(
+    set_dh_all, set_tcga_all,
+    labels = c("DH (p<1e-3)", "TCGA (one-sided p<0.05)"),
+    main_title = glue("{pretty}: All (DH nominal, TCGA one-sided)")
+  )
+
+  # 2) Hyper only (DH>0; TCGA same direction one-sided)
+  draw_pair_venn(
+    set_dh_hyper, set_tcga_hyper,
+    labels = c("DH hyper (p<1e-3)", "TCGA hyper (one-sided p<0.05)"),
+    main_title = glue("{pretty}: Hyper only (direction-aware)")
+  )
+
+  # 3) Hypo only (DH<0; TCGA same direction one-sided)
+  draw_pair_venn(
+    set_dh_hypo, set_tcga_hypo,
+    labels = c("DH hypo (p<1e-3)", "TCGA hypo (one-sided p<0.05)"),
+    main_title = glue("{pretty}: Hypo only (direction-aware)")
+  )
+
+  dev.off()
+  msg("✓ Wrote Venn PDF: ", pdf_file)
+}
+
+msg("Done. Venn-only PDFs are in: ", normalizePath(venn_dir))
+```
+
+

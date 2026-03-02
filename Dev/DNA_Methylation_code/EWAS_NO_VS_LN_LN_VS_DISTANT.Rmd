@@ -229,6 +229,127 @@ for (comp_tag in names(comparisons)) {
 msg("\n✅ Finished: Pairwise comparisons (HiTIMED-h6, immune-normalised + EpiScore; NO ComBat)")
 ```
 
+```{r}
+###############################################################################
+#  volcano_plots_pairwise.R
+###############################################################################
+suppressPackageStartupMessages({
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+  library(ggrastr)
+  library(dplyr)
+  library(glue)
+  library(tibble)
+  library(rlang)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+## -------- central output root ----------------------------------------------
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+
+## -------- UPDATED: pairwise directories based on your EWAS script -----------
+phen_dirs <- c(
+  No_vs_LN   = file.path(results_root, "results_ewas_No_vs_LN"),
+  LN_vs_Dist = file.path(results_root, "results_ewas_LN_vs_Dist")
+)
+
+phen_labels <- c(
+  No_vs_LN   = "No Metastasis vs. LN Only",
+  LN_vs_Dist = "LN Only vs. Distant Metastasis"
+)
+
+## -------- probe → primary gene symbol map ----------------------------------
+# (Keeping your mapping logic as is)
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+ucsc_raw <- anno$UCSC_RefGene_Name
+ucsc_map <- ifelse(!is.na(ucsc_raw) & ucsc_raw != "", sub(";.*$", "", ucsc_raw), NA_character_)
+gencode_raw <- anno$GencodeBasicV12_NAME
+gencode_map <- vapply(gencode_raw, function(raw) {
+  if (is.na(raw) || raw == "") NA_character_ else tail(strsplit(raw, ";")[[1]], 1)
+}, FUN.VALUE = character(1))
+probe2gene <- ifelse(!is.na(ucsc_map), ucsc_map,
+                     ifelse(!is.na(gencode_map), gencode_map, NA_character_))
+names(probe2gene) <- anno$Name
+
+## -------- custom ggplot2 volcano function ----------------------
+make_volcano_gg <- function(tt, lfc_cut = 0.2, p_cut = 1e-3, top_n = 15, gene_map, title_label = "") {
+  df <- tt %>%
+    rownames_to_column("CpG") %>%
+    mutate(
+      Gene    = coalesce(na_if(gene_map[CpG], ""), CpG),
+      negLogP = -log10(P.Value),
+      Signif  = factor(dplyr::case_when(
+        logFC >=  lfc_cut & P.Value < p_cut ~ "Hyper",
+        logFC <= -lfc_cut & P.Value < p_cut ~ "Hypo",
+        TRUE                                ~ "NS"
+      ), levels = c("Hyper", "Hypo", "NS"))
+    )
+
+  df_ns  <- dplyr::filter(df, Signif == "NS")
+  df_sig <- dplyr::filter(df, Signif != "NS")
+  top_hits <- df_sig %>% arrange(P.Value) %>% slice_head(n = top_n)
+
+  ggplot(mapping = aes(x = logFC, y = negLogP, color = Signif)) +
+    geom_point_rast(data = df_ns, size = 1.2, alpha = 0.5, raster.dpi = 300) +
+    geom_point(data = df_sig, size = 1.6, alpha = 0.8) +
+    scale_color_manual(values = c(Hyper="firebrick", Hypo="dodgerblue", NS="grey65")) +
+    geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = "dashed", linewidth = 0.5) +
+    geom_hline(yintercept = -log10(p_cut), linetype = "dashed", linewidth = 0.5) +
+    geom_text_repel(data = top_hits,
+                    aes(label = Gene),
+                    size = 3, max.overlaps = Inf, family = "Helvetica",
+                    box.padding = 0.5, min.segment.length = 0) +
+    labs(title = title_label,
+         x = expression(Log[2]~"Fold Change"),
+         y = expression(-Log[10]~italic(P))) +
+    theme_minimal(base_size = 12, base_family = "Helvetica") +
+    theme(panel.grid.minor = element_blank())
+}
+
+## -------- main loop ------------------------------------
+for (ph_tag in names(phen_dirs)) {
+  ph_dir   <- phen_dirs[[ph_tag]]
+  fit_file <- file.path(ph_dir, "H6", "ewas_fits.rds")
+  
+  if (!file.exists(fit_file)) {
+    warning(glue("File not found: {fit_file}"))
+    next
+  }
+
+  fits     <- readRDS(fit_file)
+  plot_dir <- file.path(ph_dir, "H6", "plots_volcano_gg")
+  dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+  for (tier_nm in names(fits)) {
+    # Extract fit object
+    fit_obj <- if (inherits(fits[[tier_nm]], "MArrayLM")) fits[[tier_nm]] else fits[[tier_nm]]$fit
+
+    # Pull results for the binary phenotype
+    tt <- limma::topTable(fit_obj, coef = "pheno_bin", number = Inf,
+                          p.value = 1, adjust.method = "none")
+
+    # Generate Plot
+    volcano <- make_volcano_gg(tt, 
+                               gene_map = probe2gene, 
+                               top_n = 15, 
+                               title_label = glue("{phen_labels[ph_tag]} ({tier_nm})"))
+
+    # Save PDF
+    ggsave(
+      filename = file.path(plot_dir, glue("{ph_tag}_{tier_nm}_volcano.pdf")),
+      plot     = volcano,
+      device   = cairo_pdf,
+      width    = 6, height = 5
+    )
+  }
+}
+
+message("✅ All pairwise volcano plots saved.")
+```
+
+
+
 Generate results list
 ```{r}
 ###############################################################################

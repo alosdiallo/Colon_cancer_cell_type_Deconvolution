@@ -5,294 +5,6 @@ output: html_notebook
 
 Note: All Heatmaps migrated over to Production_Heatmaps
 
-Main EWAS
-```{r}
-# ewas_metastasis_h6_normImmune.R     · 2025-07-18
-# Single HiTIMED h = 6 → immune-fraction normalisation + EpiScore
-# Phenotypes: any_mets · ln_only · distant
-
-## ── USER SETTINGS ───────────────────────────────────────────────────────────
-idat_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
-idat_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
-meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
-
-phenotypes          <- c(any  = "any_mets",
-                         ln   = "ln_only",
-                         dist = "distant")
-variance_percentile <- 0.90  # 0 ⇒ keep all CpGs
-
-## NEW: centralize outputs/caches here
-results_root <- "/Users/adiallo/Desktop/Thesis/Results"
-
-msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
-
-suppressPackageStartupMessages({
-  library(minfi)
-  library(sesame)
-  library(ENmix)
-  library(matrixStats)
-  library(limma)
-  library(sva)
-  library(HiTIMED)
-  library(EpiDISH)
-  library(tidyverse)
-  library(glue)
-})
-
-read_csv_silent <- function(file, ...) {
-  if (utils::packageVersion("readr") >= "2.0.0") {
-    readr::read_csv(file, show_col_types = FALSE, ...)
-  } else {
-    suppressMessages(readr::read_csv(file, ...))
-  }
-}
-
-## ── 1) β-matrix (cached) ────────────────────────────────────────────────────
-## NEW: cache under Results
-cache_dir <- file.path(results_root, "ewas_cache")
-dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
-beta_rds  <- file.path(cache_dir, "beta_comb_qc.rds")
-## NEW: keep sample-origin manifests
-manifest_csv <- file.path(cache_dir, "sample_manifest_v1_v2.csv")
-
-read_pp <- function(path, tag) {
-  rg  <- read.metharray.exp(path, recursive = TRUE, extended = TRUE, force = TRUE)
-  bet <- getBeta(preprocessNoob(rg, dyeMethod = "single"))
-  if (tag == "v2") bet <- betasCollapseToPfx(bet)
-  bad <- ENmix::QCinfo(rg)$badCpG
-  bet <- bet[ setdiff(rownames(bet), bad), , drop = FALSE]
-  bet
-}
-
-## NEW: we’ll save sample IDs per platform so we can label Array_Version later
-if (!file.exists(beta_rds)) {
-  msg("Reading / normalising IDATs …")
-  beta1 <- read_pp(idat_v1, "v1")
-  beta2 <- read_pp(idat_v2, "v2")
-
-  sample_ids_v1 <- colnames(beta1)
-  sample_ids_v2 <- colnames(beta2)
-
-  common    <- intersect(rownames(beta1), rownames(beta2))
-  beta_comb <- cbind(beta1[common, , drop = FALSE],
-                     beta2[common, , drop = FALSE])
-
-  saveRDS(list(beta = beta_comb,
-               sample_ids_v1 = sample_ids_v1,
-               sample_ids_v2 = sample_ids_v2),
-          beta_rds)
-
-  ## write a small manifest for sanity/debug
-  tibble(
-    SampleID = c(sample_ids_v1, sample_ids_v2),
-    Array_Version = c(rep("v1", length(sample_ids_v1)),
-                      rep("v2", length(sample_ids_v2)))
-  ) %>%
-    distinct() %>%
-    write_csv(manifest_csv)
-
-  msg("β-matrix cached.")
-} else {
-  cache_obj <- readRDS(beta_rds)
-  if (is.list(cache_obj) && !is.null(cache_obj$beta)) {
-    beta_comb     <- cache_obj$beta
-    sample_ids_v1 <- cache_obj$sample_ids_v1
-    sample_ids_v2 <- cache_obj$sample_ids_v2
-  } else {
-    ## backward compat if the RDS used to be only the matrix
-    beta_comb     <- cache_obj
-    sample_ids_v1 <- character(0)
-    sample_ids_v2 <- character(0)
-  }
-  msg("β-matrix loaded from cache.")
-}
-
-##--- Remove sex linked probes--##
-get_annotation_for <- function(beta_mat) {
-  # Prefer EPIC; fallback to 450k
-  if (requireNamespace("IlluminaHumanMethylationEPICanno.ilm10b4.hg19", quietly = TRUE)) {
-    suppressPackageStartupMessages(
-      library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-    )
-    a <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-  } else if (requireNamespace("IlluminaHumanMethylation450kanno.ilmn12.hg19", quietly = TRUE)) {
-    suppressPackageStartupMessages(
-      library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-    )
-    a <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-  } else {
-    stop("Install an Illumina methylation annotation package (EPIC or 450k).")
-  }
-  # Keep rows that exist in your beta matrix
-  a[rownames(a) %in% rownames(beta_mat), , drop = FALSE]
-}
-
-anno <- get_annotation_for(beta_comb)
-
-# Try multiple possible chromosome fields across annotation versions
-chr_vec <- NULL
-if ("chr" %in% colnames(anno))       chr_vec <- anno$chr
-if (is.null(chr_vec) && "CHR" %in% colnames(anno)) chr_vec <- anno$CHR
-if (is.null(chr_vec) && "seqnames" %in% colnames(anno)) chr_vec <- as.character(anno$seqnames)
-
-if (is.null(chr_vec)) stop("Could not find chromosome column in annotation.")
-
-is_sex_chr <- chr_vec %in% c("chrX","chrY","X","Y")
-sex_probes <- rownames(anno)[is_sex_chr]
-
-n_before <- nrow(beta_comb)
-if (length(sex_probes) > 0) {
-  beta_comb <- beta_comb[setdiff(rownames(beta_comb), sex_probes), , drop = FALSE]
-}
-msg(length(sex_probes), " chrX/chrY probes removed; ",
-    n_before, " → ", nrow(beta_comb), " CpGs remain.")
-
-## ── Variance filter ─────────────────────────────────────────────────────────
-M.mat <- log2(beta_comb / (1 - beta_comb) + 1e-6)
-if (variance_percentile > 0) {
-  var_thr   <- quantile(rowVars(M.mat, TRUE), variance_percentile)
-  keep      <- rowVars(M.mat, TRUE) > var_thr
-  beta_comb <- beta_comb[keep, , drop = FALSE]
-  M.mat     <- M.mat[keep, , drop = FALSE]
-  msg(sum(keep), " CpGs kept (top ",
-      100 * (1 - variance_percentile), "% var).")
-}
-
-## ── 2a) Define & run EpiScore for fibroblasts ────────────────────────────────
-data(centEpiFibIC.m)  # built-in colon-fibroblast reference
-
-run_episcore <- function(beta) {
-  common <- intersect(rownames(beta), rownames(centEpiFibIC.m))
-  est    <- epidish(beta[common, ],
-                    centEpiFibIC.m[common, ],
-                    method = "RPC")$estF
-  as.data.frame(est) * 100    # columns = Epi, Fib, IC
-}
-
-msg("Running EpiScore (RPC) for fibroblast …")
-fib_scores <- run_episcore(beta_comb) %>%
-  rownames_to_column("SampleID")
-# fib_scores has SampleID, Epi, Fib, IC
-
-## ── 2b) HiTIMED deconvolution (h = 6) ────────────────────────────────────────
-msg("Running HiTIMED  h = 6 …")
-frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) %>%
-  as.data.frame() %>%
-  rownames_to_column("SampleID") %>%
-  left_join(fib_scores, by = "SampleID")
-# now frac_h6 includes a "Fib" column (from EpiScore)
-
-## ── 3) Collapse / normalise fractions ───────────────────────────────────────
-collapse_frac <- function(df) {
-  get_ <- function(x) if (x %in% names(df)) df[[x]] else 0
-  
-  imm_cols <- c("CD8mem","CD8nv","CD4mem","CD4nv",
-                "Treg","Bmem","Bnv","DC","Mono","NK")
-  totalImm <- rowSums(df[imm_cols], na.rm = TRUE)
-  totalImm[totalImm == 0] <- NA
-  
-  tibble(
-    SampleID     = df$SampleID,
-    Tumor        = get_("Tumor"),
-    Fibroblast   = get_("Fib"),       # now uses EpiScore Fib
-    StromalOther = get_("Endothelial") + get_("Epithelial"),
-    CD8_T        = (get_("CD8mem") + get_("CD8nv")) / totalImm,
-    LymphOther   = (get_("CD4mem") + get_("CD4nv") +
-                    get_("Treg")   + get_("Bmem") + get_("Bnv")) / totalImm
-  ) %>% mutate(across(where(is.numeric), as.numeric))
-}
-
-## ── 4) Tier templates ───────────────────────────────────────────────────────
-tier_template <- list(
-  Tier1 = c("age","sex_num","MLH1_num"),
-  Tier2 = c("age","sex_num","MLH1_num","Tumor"),
-  Tier3 = c("age","sex_num","MLH1_num","Tumor",
-            "Fibroblast","StromalOther",
-            "CD8_T","LymphOther")
-)
-trim_tiers <- function(tiers, avail) lapply(tiers, intersect, avail)
-
-## ── 5) Loop over phenotypes ────────────────────────────────────────────────
-for (pheno_tag in names(phenotypes)) {
-  pheno_var <- phenotypes[[pheno_tag]]
-  msg("\n===== ", pheno_var, " =====")
-  
-  meta <- read_csv_silent(meta_csv) %>%
-    mutate(
-      SampleID      = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
-      any_mets      = as.integer(any_mets),
-      distant       = as.integer(Distant_Mets),
-      ln_only       = as.integer(ln_only),
-      sex_num       = as.integer(sex == "M"),
-      MLH1_num      = as.integer(MLH1 == 1)
-    )
-
-  ## NEW: assign Array_Version using the vectors we saved at read time
-  meta <- meta %>%
-    mutate(
-      Array_Version = case_when(
-        SampleID %in% sample_ids_v1 ~ "v1",
-        SampleID %in% sample_ids_v2 ~ "v2",
-        TRUE                        ~ NA_character_
-      )
-    )
-
-  ## NEW: warn if any SampleID in meta not found in either list
-  if (any(is.na(meta$Array_Version))) {
-    miss <- meta$SampleID[is.na(meta$Array_Version)]
-    msg("WARNING: ", length(miss), " meta SampleIDs not matched to v1/v2: ",
-        paste(head(miss, 8), collapse = ", "),
-        if (length(miss) > 8) " …" else "")
-  }
-  
-  meta$pheno_bin <- dplyr::case_when(
-    pheno_var == "any_mets" ~ meta$any_mets,
-    pheno_var == "distant"  ~ meta$distant,
-    pheno_var == "ln_only"  ~ (meta$ln_only & !meta$distant),
-    TRUE                    ~ NA_integer_
-  )
-  stopifnot(all(meta$pheno_bin %in% 0:1, na.rm = TRUE))
-  
-  frac_df  <- collapse_frac(frac_h6)
-  meta_all <- left_join(meta, frac_df, by = "SampleID")
-  ok       <- complete.cases(meta_all[, tier_template$Tier3])
-  meta_f   <- meta_all[ok, ]
-  M_f      <- M.mat[, meta_f$SampleID, drop = FALSE]
-  
-  ## ComBat if both platforms are present after filtering
-  if (length(unique(na.omit(meta_f$Array_Version))) > 1) {
-    mod_cb <- model.matrix(~ age + sex_num + MLH1_num + pheno_bin, meta_f)
-    M_cb   <- ComBat(M_f,
-                     batch       = factor(meta_f$Array_Version),
-                     mod         = mod_cb,
-                     par.prior   = TRUE,
-                     prior.plots = FALSE)
-  } else {
-    M_cb <- M_f
-  }
-  
-  tier_list <- trim_tiers(tier_template, names(meta_f))
-  fits <- purrr::map(tier_list, function(covs) {
-    nz   <- covs[sapply(meta_f[covs], sd, TRUE) > 0]
-    form <- if (length(nz) == 0) {
-      ~ pheno_bin
-    } else {
-      as.formula(paste("~ pheno_bin +", paste(nz, collapse = " + ")))
-    }
-    des <- model.matrix(form, meta_f)
-    eBayes(lmFit(M_cb, des), trend = TRUE, robust = TRUE)
-  })
-  
-  ## NEW: write results under Results root
-  out_dir <- file.path(results_root, glue("results_ewas_{pheno_tag}"), "H6")
-  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  saveRDS(fits, file.path(out_dir, "ewas_fits.rds"))
-  msg("✓  fits saved → ", out_dir)
-}
-
-msg("\n✅ Finished: Any, LN-only, Distant  (HiTIMED-h6, immune-normalised + EpiScore)")
-```
-
 Without Combat:
 ```{r}
 # ewas_metastasis_h6_normImmune.R     · 2025-07-18
@@ -565,7 +277,7 @@ for (pheno_tag in names(phenotypes)) {
 msg("\n✅ Finished: Any, LN-only, Distant  (HiTIMED-h6, immune-normalised + EpiScore; NO ComBat)")
 ```
 
-Venn Diagram
+Venn Diagram -- No longer included in paper
 ```{r}
 ################################################################################
 # venn_diagram_progression.R  —  EWAS-based (no ANOVA object needed)
@@ -687,7 +399,7 @@ msg("\n✅ Done.")
 
 
 
-Volcano plots for figures:
+Figure 3A: Volcano plots for figures
 ```{r}
 ###############################################################################
 #  volcano_plots_gg_all_tiers.R  –  publication-ready volcano plots (Tiers 1–3)
@@ -976,8 +688,6 @@ msg("\n✅ All summary tables created successfully.")
 ```
 
 
-
-
 Obtaining information from the results
 ```{r}
 suppressPackageStartupMessages({
@@ -1137,7 +847,7 @@ if (file.exists(out_csv)) {
 }
 ```
 
-Genomic Regions plot for figure
+Figure 3C: Genomic Regions plot for figure
 ```{r}
 ## ── SETUP: Load Libraries ─────────────────────────────────────────────────────
 suppressPackageStartupMessages({
@@ -1314,9 +1024,10 @@ ggsave(file.path(plot_dir, "plot_legend.pdf"),
        plot = legend_plot, device = cairo_pdf, width = 4, height = 2, dpi = 300)
 
 # Optional on-screen preview
-# print(plot_hyper); print(plot_hypo); print(legend_plot)
+ print(plot_hyper); print(plot_hypo); print(legend_plot)
 ```
 
+Figure 3C:Same as plot above but has statistics
 ```{r}
 # FINAL SCRIPT WITH DEBUGGING in the plotting function.
 # Please run this and share the console output.
@@ -1393,6 +1104,7 @@ run_enrichment_test <- function(dmp_df, background_df) {
     dplyr::select(Phenotype, Status, test_result) %>%
     tidyr::unnest(test_result)
 }
+
 
 ################################################################################
 ### --- DEBUGGING VERSION of create_summary_plot_with_stats --- ###
@@ -1485,7 +1197,420 @@ ggsave(file.path(plot_dir, "hypomethylated_plot_debug.pdf"), plot_hypo_nolegend,
 ggsave(file.path(plot_dir, "plot_legend.pdf"), cowplot::ggdraw(legend), device = cairo_pdf, width = 4, height = 2, dpi = 300)
 ```
 
+```{r}
+################################################################################
+# Genomic Context Enrichment Analysis - Weighted by Probe Type
+################################################################################
 
+## ── SETUP: Load Libraries ─────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(limma); library(dplyr); library(ggplot2); library(patchwork)
+  library(annotatr); library(GenomicRanges); library(purrr)
+  library(cowplot); library(glue); library(forcats)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+## ── 0) PATHS ──────────────────────────────────────────────────────────────────
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+plot_dir     <- file.path(results_root, "plots", "location_summary_weighted") # Updated folder name
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+## ── 1) SETTINGS AND CUSTOM COLORS ─────────────────────────────────────────────
+phenotypes_to_run <- c("Any Mets" = "any", "LN Only"  = "ln", "Distant"  = "dist")
+p_value_cutoff <- 0.001
+location_colors <- c(
+  "CGI"         = "#E3777A", "CGI Shore"   = "#B3E7FF", "CGI Shelf"   = "#F08F00",
+  "Promoter"    = "#B4A0C9", "Open Sea"    = "#768692"
+)
+location_categories <- c("CGI", "CGI Shore", "CGI Shelf", "Promoter", "Open Sea")
+
+## ── 2) ANALYSIS FUNCTIONS ─────────────────────────────────────────────────────
+map_to_location <- function(df) {
+  df %>%
+    dplyr::mutate(Location = case_when(
+      grepl("islands", annot.type, ignore.case = TRUE)   ~ "CGI",
+      grepl("shores",  annot.type, ignore.case = TRUE)   ~ "CGI Shore",
+      grepl("shelves", annot.type, ignore.case = TRUE)   ~ "CGI Shelf",
+      grepl("promoters", annot.type, ignore.case = TRUE) ~ "Promoter",
+      TRUE ~ "Open Sea"
+    )) %>%
+    dplyr::mutate(Location = factor(Location, levels = location_categories))
+}
+
+analyze_phenotype <- function(pheno_long_name, pheno_short_name) {
+  message("\nProcessing: ", pheno_long_name)
+  fit_file <- file.path(results_root, glue("results_ewas_{pheno_short_name}"), "H6", "ewas_fits.rds")
+  if (!file.exists(fit_file)) return(NULL)
+  fits      <- readRDS(fit_file)
+  fit_model <- if (inherits(fits$Tier3, "MArrayLM")) fits$Tier3 else fits$Tier3$fit
+  dmp_results <- topTable(fit_model, coef = "pheno_bin", number = Inf)
+  top_hits <- dmp_results %>% dplyr::filter(P.Value < p_value_cutoff) %>% tibble::rownames_to_column("CpG_ID")
+  if (nrow(top_hits) == 0) return(NULL)
+  sites_df <- locations_df %>% dplyr::filter(CpG_ID %in% top_hits$CpG_ID)
+  sites_gr <- makeGRangesFromDataFrame(sites_df, keep.extra.columns = TRUE)
+  annotated <- annotate_regions(sites_gr, annotations, ignore.strand = TRUE, quiet = TRUE)
+  as.data.frame(annotated) %>%
+    map_to_location() %>%
+    dplyr::left_join(top_hits, by = "CpG_ID") %>%
+    dplyr::mutate(Phenotype = pheno_long_name, Status = ifelse(logFC > 0, "Hypermethylated", "Hypomethylated"))
+}
+
+## ── WEIGHTED ENRICHMENT TEST (OPTION 3) ──────────────────────────────────────
+run_enrichment_weighted <- function(dmp_df, background_df, anno_df) {
+  
+  message("\nRunning weighted chi-square tests accounting for probe type...")
+  
+  # Add probe type to DMPs
+  dmp_with_type <- dmp_df %>%
+    dplyr::left_join(anno_df %>% dplyr::select(CpG_ID, Type), by = "CpG_ID")
+  
+  # Add probe type to background
+  background_with_type <- background_df %>%
+    dplyr::left_join(anno_df %>% dplyr::select(CpG_ID, Type), by = "CpG_ID")
+  
+  # Calculate proportion of Type I vs Type II in the background
+  type_props <- background_with_type %>%
+    dplyr::count(Type) %>%
+    dplyr::mutate(type_weight = n / sum(n))
+  
+  message("Background probe type distribution:")
+  print(type_props)
+  
+  # Get location distribution for each probe type separately
+  background_by_type <- background_with_type %>%
+    dplyr::group_by(Type, Location) %>%
+    dplyr::summarise(n = n(), .groups = "drop") %>%
+    dplyr::group_by(Type) %>%
+    dplyr::mutate(prop_within_type = n / sum(n)) %>%
+    dplyr::left_join(type_props, by = "Type")
+  
+  # Calculate weighted expected proportions across locations
+  # This accounts for the fact that Type I and Type II have different genomic distributions
+  expected_props <- background_by_type %>%
+    dplyr::group_by(Location) %>%
+    dplyr::summarise(weighted_prop = sum(prop_within_type * type_weight), .groups = "drop") %>%
+    dplyr::arrange(factor(Location, levels = location_categories))
+  
+  message("\nWeighted expected proportions by location:")
+  print(expected_props)
+  
+  # Test each Phenotype × Status combination against weighted background
+  dmp_with_type %>%
+    dplyr::group_by(Phenotype, Status) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(test_result = map(data, function(subset_df) {
+      
+      # Count DMPs by location
+      observed_counts <- subset_df %>%
+        dplyr::count(Location) %>%
+        dplyr::right_join(tibble(Location = location_categories), by = "Location") %>%
+        dplyr::mutate(n = ifelse(is.na(n), 0, n)) %>%
+        dplyr::arrange(factor(Location, levels = location_categories)) %>%
+        dplyr::pull(n)
+      
+      # Also get probe type distribution in this DMP set
+      type_dist <- subset_df %>%
+        dplyr::count(Type) %>%
+        dplyr::mutate(prop = n / sum(n))
+      
+      # Chi-square test against weighted expected proportions
+      test <- chisq.test(
+        x = observed_counts, 
+        p = expected_props$weighted_prop,
+        simulate.p.value = TRUE, B = 100000
+      )
+      
+      tibble(
+        P = test$p.value,
+        n_DMPs = sum(observed_counts),
+        pct_TypeI = ifelse("I" %in% type_dist$Type, 
+                           type_dist$prop[type_dist$Type == "I"] * 100, 0),
+        pct_TypeII = ifelse("II" %in% type_dist$Type, 
+                            type_dist$prop[type_dist$Type == "II"] * 100, 0)
+      )
+    })) %>%
+    dplyr::select(Phenotype, Status, test_result) %>%
+    tidyr::unnest(test_result)
+}
+
+create_summary_plot_with_stats <- function(data, plot_status, colors, background_df, stats_df) {
+  
+  message(glue("\n--- Creating plot for Status: {plot_status} ---"))
+  
+  plot_data <- bind_rows(data, background_df) %>%
+    dplyr::filter(Status == plot_status | Phenotype == "All CpGs") %>%
+    dplyr::mutate(Phenotype = factor(Phenotype, levels = c("All CpGs", names(phenotypes_to_run))))
+
+  # Filter stats to current status and P < 0.05
+  stars_to_add <- stats_df %>%
+    dplyr::filter(Status == plot_status, P < 0.05)
+
+  if (nrow(stars_to_add) > 0) {
+    stars_to_add <- stars_to_add %>%
+      dplyr::mutate(
+        stars = case_when(P < 0.001 ~ "***",
+                          P < 0.01  ~ "**",
+                          TRUE      ~ "*"),
+        Phenotype = factor(Phenotype, levels = c("All CpGs", names(phenotypes_to_run))),
+        y = 1.05
+      )
+  }
+
+  p <- ggplot(plot_data, aes(x = Phenotype, fill = Location)) +
+    geom_bar(position = "fill", stat = "count", width = 0.8) +
+    scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+    scale_fill_manual(values = colors, name = "Genomic Location") +
+    labs(x = NULL, y = NULL, title = plot_status) +
+    theme_classic(base_size = 14, base_family = "Helvetica") +
+    theme(legend.position = "right", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  if (nrow(stars_to_add) > 0) {
+    p <- p + geom_text(
+      data = stars_to_add,
+      aes(x = Phenotype, y = y, label = stars),
+      inherit.aes = FALSE,
+      size = 8, vjust = 0
+    )
+  }
+  return(p)
+}
+
+## ── 3) RUN PIPELINE ──────────────────────────────────────────────────────────
+message("Building annotation database…")
+annotations <- build_annotations("hg19", c("hg19_cpgs", "hg19_cpgshores", 
+                                           "hg19_cpgshelves", "hg19_genes_promoters"))
+
+message("Loading EPIC annotation (including probe types)…")
+epic_anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# Create probe type lookup table
+anno_df <- as.data.frame(epic_anno) %>%
+  tibble::rownames_to_column("CpG_ID") %>%
+  dplyr::select(CpG_ID, Type)
+
+message(glue("Loaded annotation for {nrow(anno_df)} probes"))
+
+# Get all probe locations (including both Type I and Type II)
+locations_df <- getLocations(IlluminaHumanMethylationEPICanno.ilm10b4.hg19) %>%
+  as.data.frame() %>% 
+  tibble::rownames_to_column("CpG_ID") %>%
+  dplyr::select(CpG_ID, chr = seqnames, start, end) %>% 
+  distinct(CpG_ID, .keep_all = TRUE)
+
+message(glue("Using all {nrow(locations_df)} probes for genomic context analysis (Type I + Type II)"))
+
+# Run analysis
+all_annotated_hits <- map2_dfr(names(phenotypes_to_run), phenotypes_to_run, analyze_phenotype)
+
+# Create background distribution (includes all probes)
+# Need to preserve CpG_ID through the annotation process
+locations_gr <- makeGRangesFromDataFrame(locations_df, keep.extra.columns = TRUE)
+
+background_annotated <- annotate_regions(
+  locations_gr, 
+  annotations, 
+  ignore.strand = TRUE, 
+  quiet = TRUE
+)
+
+# Convert to dataframe and map locations, preserving CpG_ID
+background_mapped <- as.data.frame(background_annotated) %>%
+  map_to_location()
+
+# The CpG_ID should now be preserved from locations_gr
+# Check what columns we have
+message("Background columns after annotation:")
+message(paste(names(background_mapped), collapse = ", "))
+
+# If CpG_ID is not present, we need to extract it differently
+# The seqnames column from the GRanges might contain the CpG_ID
+if (!"CpG_ID" %in% names(background_mapped)) {
+  # Try to get CpG_ID from the original locations_df by matching coordinates
+  background_mapped <- background_mapped %>%
+    dplyr::mutate(
+      chr = as.character(seqnames),
+      coord_start = start,
+      coord_end = end
+    ) %>%
+    dplyr::left_join(
+      locations_df %>% dplyr::select(CpG_ID, chr, start, end),
+      by = c("chr" = "chr", "coord_start" = "start", "coord_end" = "end")
+    )
+}
+
+# Verify CpG_ID is now present
+if (!"CpG_ID" %in% names(background_mapped)) {
+  stop("Failed to preserve CpG_ID in background_mapped. Check annotation process.")
+}
+
+message(glue("Background mapped: {nrow(background_mapped)} annotations"))
+
+# Run WEIGHTED enrichment tests
+enrichment_stats <- run_enrichment_weighted(all_annotated_hits, background_mapped, anno_df)
+
+# Save results
+write.csv(enrichment_stats, 
+          file.path(plot_dir, "enrichment_stats_weighted.csv"), 
+          row.names = FALSE)
+
+message("\n=== Enrichment statistics (weighted for probe type) ===")
+print(enrichment_stats)
+
+## ── 4) PLOTS & SAVE ──────────────────────────────────────────────────────────
+background_for_plot <- background_mapped %>%
+  transmute(Phenotype = "All CpGs", Status = NA_character_, Location) %>%
+  bind_rows(mutate(., Status = "Hypermethylated"), mutate(., Status = "Hypomethylated"))
+
+plot_hyper <- create_summary_plot_with_stats(all_annotated_hits, "Hypermethylated", 
+                                             location_colors, background_for_plot, enrichment_stats)
+plot_hypo  <- create_summary_plot_with_stats(all_annotated_hits, "Hypomethylated", 
+                                             location_colors, background_for_plot, enrichment_stats)
+
+legend <- cowplot::get_legend(plot_hyper)
+plot_hyper_nolegend <- plot_hyper + theme(legend.position = "none")
+plot_hypo_nolegend  <- plot_hypo  + theme(legend.position = "none")
+
+ggsave(file.path(plot_dir, "hypermethylated_plot_weighted.pdf"), 
+       plot_hyper_nolegend, device = cairo_pdf, width = 4.5, height = 4.5, dpi = 300)
+ggsave(file.path(plot_dir, "hypomethylated_plot_weighted.pdf"), 
+       plot_hypo_nolegend,  device = cairo_pdf, width = 4.5, height = 4.5, dpi = 300)
+ggsave(file.path(plot_dir, "plot_legend.pdf"), 
+       cowplot::ggdraw(legend), device = cairo_pdf, width = 4, height = 2, dpi = 300)
+
+message("\n✅ Analysis complete! Weighted genomic context enrichment saved to:")
+message(plot_dir)
+message("\nResults account for probe type (Type I vs Type II) distribution differences.")
+```
+
+
+VIF calculation:
+```{r}
+## ── VIF ANALYSIS FOR EWAS COVARIATES ─────────────────────────────────────────
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(car)
+  library(HiTIMED)
+  library(EpiDISH)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "]", ..., "\n")
+
+## ── 1) LOAD DATA ─────────────────────────────────────────────────────────────
+results_root <- "/Users/adiallo/Desktop/Thesis/Results"
+meta_csv     <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+beta_rds     <- file.path(results_root, "ewas_cache/beta_comb_qc.rds")
+
+# Load beta matrix
+cache_obj <- readRDS(beta_rds)
+beta_comb <- if (is.list(cache_obj)) cache_obj$beta else cache_obj
+
+# Load metadata
+meta <- read_csv(meta_csv, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    sex_num  = as.integer(sex == "M"),
+    MLH1_num = as.integer(MLH1 == 1)
+  )
+
+## ── 2) RUN DECONVOLUTIONS (matching EWAS) ────────────────────────────────────
+
+# EpiScore for fibroblasts
+msg("Running EpiScore (RPC) for fibroblast...")
+data(centEpiFibIC.m)
+common_epi <- intersect(rownames(beta_comb), rownames(centEpiFibIC.m))
+fib_scores <- epidish(beta_comb[common_epi, ], centEpiFibIC.m[common_epi, ], method = "RPC")$estF
+fib_df <- as.data.frame(fib_scores * 100) %>%
+  rownames_to_column("SampleID")
+
+# HiTIMED h=6
+msg("Running HiTIMED h=6...")
+frac_h6 <- HiTIMED_deconvolution(beta_comb, "COAD", h = 6) %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  left_join(fib_df, by = "SampleID")
+
+## ── 3) COLLAPSE FRACTIONS (exactly as in EWAS) ───────────────────────────────
+
+collapse_frac <- function(df) {
+  get_ <- function(x) if (x %in% names(df)) df[[x]] else 0
+  imm_cols <- c("CD8mem","CD8nv","CD4mem","CD4nv","Treg","Bmem","Bnv","DC","Mono","NK")
+  totalImm <- rowSums(df[imm_cols], na.rm = TRUE)
+  totalImm[totalImm == 0] <- NA
+  
+  tibble(
+    SampleID     = df$SampleID,
+    Tumor        = get_("Tumor"),
+    Fibroblast   = get_("Fib"),
+    StromalOther = get_("Endothelial") + get_("Epithelial"),
+    CD8_T        = (get_("CD8mem") + get_("CD8nv")) / totalImm,
+    LymphOther   = (get_("CD4mem") + get_("CD4nv") + get_("Treg") + get_("Bmem") + get_("Bnv")) / totalImm
+  ) %>% 
+    mutate(across(where(is.numeric), as.numeric))
+}
+
+frac_df <- collapse_frac(frac_h6)
+
+## ── 4) MERGE AND PREPARE FOR VIF ─────────────────────────────────────────────
+
+vif_data <- meta %>%
+  left_join(frac_df, by = "SampleID") %>%
+  filter(complete.cases(age, sex_num, MLH1_num, Tumor, Fibroblast, StromalOther, CD8_T, LymphOther))
+
+msg(paste("Samples with complete data:", nrow(vif_data)))
+
+## ── 5) CALCULATE VIF (Tier 3 model) ──────────────────────────────────────────
+msg("Calculating VIF for Tier 3 model covariates...")
+
+# Fit model with dummy outcome (VIF only depends on predictors)
+vif_data$dummy <- rnorm(nrow(vif_data))
+
+# Tier 3 model: age + sex_num + MLH1_num + Tumor + Fibroblast + StromalOther + CD8_T + LymphOther
+vif_model <- lm(dummy ~ age + sex_num + MLH1_num + Tumor + Fibroblast + StromalOther + CD8_T + LymphOther, 
+                data = vif_data)
+
+vif_results <- car::vif(vif_model)
+
+## ── 6) CREATE VIF TABLE ──────────────────────────────────────────────────────
+msg("Creating VIF table...")
+
+vif_table <- tibble(
+  Covariate = names(vif_results),
+  VIF = as.numeric(vif_results)
+) %>%
+  mutate(
+    Covariate = case_when(
+      Covariate == "age" ~ "Age",
+      Covariate == "sex_num" ~ "Sex",
+      Covariate == "MLH1_num" ~ "MLH1 Status",
+      Covariate == "Tumor" ~ "Tumor",
+      Covariate == "Fibroblast" ~ "Fibroblasts",
+      Covariate == "StromalOther" ~ "Stromal (Epithelial + Endothelial)",
+      Covariate == "CD8_T" ~ "CD8+ T-cells, % of immune",
+      Covariate == "LymphOther" ~ "Other Lymphocytes, % of immune",
+      TRUE ~ Covariate
+    ),
+    VIF = round(VIF, 2)
+  ) %>%
+  arrange(desc(VIF))
+
+print(vif_table)
+
+## ── 7) SUMMARY ───────────────────────────────────────────────────────────────
+cat("\n=== VIF SUMMARY ===\n")
+cat(paste("Max VIF:", max(vif_table$VIF), "\n"))
+cat(paste("Covariates with VIF > 5:", sum(vif_table$VIF > 5), "\n"))
+cat(paste("Covariates with VIF > 10:", sum(vif_table$VIF > 10), "\n"))
+
+## ── 8) SAVE ──────────────────────────────────────────────────────────────────
+write_csv(vif_table, file.path(results_root, "Supplementary_Table_VIF.csv"))
+msg("✅ VIF table saved!")
+```
+
+
+
+
+Below is not used for the paper
 
 Clustering + Use this UMAP for the paper
 ```{r}

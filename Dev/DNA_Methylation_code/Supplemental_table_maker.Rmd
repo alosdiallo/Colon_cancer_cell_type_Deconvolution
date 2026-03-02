@@ -1,0 +1,215 @@
+---
+title: "Supplemental_table_1_maker"
+author: "Alos Diallo"
+date: "2026-02-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Cell type proportion table
+```{r cars}
+library(dplyr)
+library(gt)
+
+cell_table <- tibble::tribble(
+  ~`Cell Type`, ~`No Mets (n=25)\nMedian (Range)`, ~`LN Mets (n=13)\nMedian (Range)`, ~`Distant Mets (n=19)\nMedian (Range)`,
+
+  "Tumor, % of total", "49.0 (17.4-82.2)", "46.5 (25.7-62.4)", "48.7 (14.7-77.3)",
+  "Stromal, % of total", "7.2 (1.6-21.5)", "7.4 (2.6-15.2)", "10.1 (4.3-30.0)",
+  "Epithelial, % of total", "8.8 (0.0-21.2)", "9.0 (0.1-14.7)", "7.1 (0.0-11.9)",
+  "Endothelial, % of total", "5.0 (0.0-25.2)", "8.6 (0.9-13.6)", "9.6 (1.5-29.7)",
+  "Fibroblasts, % of total", "18.7 (0.0-34.6)", "19.9 (6.7-29.9)", "25.1 (7.4-38.3)",
+  "Immune, % of total", "30.1 (2.9-55.3)", "26.6 (15.2-53.9)", "25.0 (7.9-62.6)",
+  "Lymphocyte, % of immune", "63.7 (23.7-85.8)", "67.0 (40.2-83.8)", "58.7 (17.2-79.8)",
+  "Myeloid, % of immune", "36.3 (14.2-76.3)", "33.0 (16.2-59.8)", "41.3 (20.2-82.8)",
+  "Granulocytes, % of immune", "4.7 (0.0-51.4)", "4.2 (0.0-32.3)", "4.6 (0.0-49.4)",
+  "Other Mononuclear, % of immune", "28.6 (0.0-47.9)", "26.2 (15.6-35.2)", "34.7 (16.2-60.4)",
+  "CD4+ T-cells (memory), % of immune", "3.4 (0.0-31.9)", "2.9 (0.0-15.6)", "0.2 (0.0-28.5)",
+  "CD4+ T-cells (naive), % of immune", "0.0 (0.0-0.0)", "0.0 (0.0-0.9)", "0.0 (0.0-0.0)",
+  "CD8+ T-cells (memory), % of immune", "3.8 (0.0-23.7)", "3.7 (0.0-22.5)", "4.5 (0.0-16.1)",
+  "CD8+ T-cells (naive), % of immune", "0.0 (0.0-5.8)", "0.0 (0.0-6.2)", "0.0 (0.0-2.2)",
+  "Regulatory T-cells, % of immune", "10.1 (0.0-34.7)", "13.5 (4.3-34.0)", "11.8 (0.0-27.9)",
+  "B-cells (memory), % of immune", "21.7 (7.2-40.4)", "23.9 (13.5-31.8)", "20.8 (0.0-29.2)",
+  "B-cells (naive), % of immune", "0.0 (0.0-32.3)", "0.0 (0.0-13.1)", "0.0 (0.0-2.3)",
+  "NK cells, % of immune", "13.7 (6.0-21.9)", "12.0 (9.6-20.1)", "10.3 (2.8-28.5)",
+  "Dendritic cells, % of immune", "28.6 (0.0-47.9)", "26.2 (15.6-35.2)", "32.8 (16.2-45.6)",
+  "Monocytes, % of immune", "0.0 (0.0-3.0)", "0.0 (0.0-1.9)", "0.0 (0.0-43.9)",
+  "Basophils, % of immune", "0.6 (0.0-5.1)", "0.1 (0.0-4.0)", "0.2 (0.0-10.2)",
+  "Eosinophils, % of immune", "1.5 (0.0-6.6)", "2.0 (0.0-7.5)", "1.7 (0.0-6.5)",
+  "Neutrophils, % of immune", "1.5 (0.0-43.8)", "1.3 (0.0-24.5)", "2.1 (0.0-41.8)"
+)
+```
+```{r}
+library(webshot2)
+cell_table %>%
+  gt() %>%
+  tab_header(
+    title = "Cell-Type Composition Across Metastatic Groups",
+    subtitle = "Median (Range)"
+  ) %>%
+  cols_align(
+    align = "center",
+    columns = -`Cell Type`
+  ) %>%
+  cols_width(
+    `Cell Type` ~ px(320)
+  ) %>%
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 16,
+    heading.subtitle.font.size = 13
+  )
+
+
+gt_object <- cell_table %>%
+  gt() %>%
+  tab_header(
+    title = "Cell-Type Composition Across Metastatic Groups",
+    subtitle = "Median (Range)"
+  )
+
+gt_object <- gt_object %>%
+  tab_options(
+    table_body.hlines.style = "none",
+    table_body.border.bottom.style = "none"
+  )
+
+gtsave(
+  gt_object,
+  "Table1_Cell_Composition.pdf"
+)
+```
+Making the Methylation transcription table
+```{r}
+library(tidyverse)
+library(gt)
+
+## 1) Paste your table text here exactly as-is
+txt <- "
+CpG\tGene\trho\tp_value\tFDR\tDirection
+cg07420190\tMARK1\t-0.4\t2.38E-12\t2.24E-10\tNegative
+cg16468914\tSLC38A3\t-0.393\t5.93E-12\t2.79E-10\tNegative
+cg17296441\tSTMN3\t-0.377\t5.22E-11\t1.64E-09\tNegative
+cg11438011\tHTR4\t-0.351\t1.20E-09\t2.82E-08\tNegative
+cg12964144\tWSCD1\t-0.347\t1.88E-09\t3.54E-08\tNegative
+cg01939681\tGABRB2\t-0.336\t6.62E-09\t1.04E-07\tNegative
+cg17014009\tCACNB4\t-0.329\t1.30E-08\t1.74E-07\tNegative
+cg12825070\tHTR4\t-0.3\t2.49E-07\t2.93E-06\tNegative
+cg16428251\tSOX14\t-0.29\t6.72E-07\t7.02E-06\tNegative
+cg04747322\tSNCAIP\t-0.287\t8.96E-07\t8.43E-06\tNegative
+cg08249424\tCDYL\t-0.283\t1.20E-06\t1.03E-05\tNegative
+cg11070056\tPRMT6\t-0.276\t2.29E-06\t1.79E-05\tNegative
+cg02858402\tGOLT1A\t-0.252\t1.72E-05\t1.24E-04\tNegative
+cg14378848\tELOVL5\t-0.244\t3.12E-05\t2.10E-04\tNegative
+cg05421688\tFAM163A\t-0.232\t8.09E-05\t5.01E-04\tNegative
+cg10030636\tNAT8L\t-0.208\t4.20E-04\t2.32E-03\tNegative
+cg00144186\tFJX1\t-0.196\t8.98E-04\t4.22E-03\tNegative
+cg03998871\tELOVL5\t-0.187\t1.55E-03\t6.79E-03\tNegative
+cg07150925\tBSN\t-0.175\t3.07E-03\t1.20E-02\tNegative
+cg06822120\tNAT8L\t-0.173\t3.43E-03\t1.28E-02\tNegative
+cg17074542\tAP3B2\t-0.173\t3.54E-03\t1.28E-02\tNegative
+cg16405012\tNTF3\t-0.162\t6.16E-03\t2.15E-02\tNegative
+cg01625368\tLMO2\t-0.155\t8.87E-03\t2.98E-02\tNegative
+cg23306526\tSIX3\t0.231\t8.53E-05\t5.01E-04\tPositive
+cg14382750\tTMOD1\t0.201\t6.43E-04\t3.36E-03\tPositive
+cg13389209\tCOL5A1\t0.197\t8.29E-04\t4.10E-03\tPositive
+cg26695758\tTNXB\t0.186\t1.62E-03\t6.79E-03\tPositive
+cg09786098\tKREMEN2\t0.186\t1.66E-03\t6.79E-03\tPositive
+cg12691739\tCA10\t0.147\t1.33E-02\t4.32E-02\tPositive
+"
+
+## 2) Parse into a dataframe (handles scientific notation)
+cpg_tbl <- readr::read_tsv(I(txt), show_col_types = FALSE) %>%
+  mutate(
+    rho     = as.numeric(rho),
+    p_value = as.numeric(p_value),
+    FDR     = as.numeric(FDR),
+    Direction = factor(Direction, levels = c("Negative", "Positive"))
+  ) %>%
+  arrange(FDR, desc(abs(rho)))
+
+## 3) Build a clean gt table
+gt_cpg <- cpg_tbl %>%
+  gt() %>%
+  tab_header(
+    title = "Supplemental Table: CpG–Trait Associations",
+    subtitle = "Ranked by FDR"
+  ) %>%
+  fmt_number(columns = rho, decimals = 3) %>%
+  fmt_scientific(columns = c(p_value, FDR), decimals = 2) %>%
+  cols_label(
+    CpG = "CpG",
+    Gene = "Gene",
+    rho = html("&rho;"),
+    p_value = "P-value",
+    FDR = "FDR",
+    Direction = "Direction"
+  ) %>%
+  cols_align(align = "center", columns = c(rho, p_value, FDR, Direction)) %>%
+  cols_align(align = "left", columns = c(CpG, Gene)) %>%
+  tab_options(
+    table.font.size = 11,
+    data_row.padding = px(3),
+    table_body.hlines.style = "none"   # no row lines (like your last table)
+  )
+
+## 4) Save outputs
+out_dir <- file.path(results_root, "Supplemental_Tables")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+gtsave(gt_cpg, file.path(out_dir, "SuppTable_CpG_Associations.pdf"))
+write_csv(cpg_tbl, file.path(out_dir, "SuppTable_CpG_Associations.csv"))
+```
+
+
+Making the VIF table
+```{r}
+library(tidyverse)
+library(gt)
+
+## 1) Paste the VIF text here
+txt_vif <- "
+Covariate\tVIF
+Stromal (Epithelial + Endothelial)\t2.91
+Fibroblasts\t2.64
+Other Lymphocytes, % of immune\t2.12
+CD8+ T-cells, % of immune\t1.71
+Tumor\t1.62
+Age\t1.59
+MLH1 Status\t1.5
+Sex\t1.09
+"
+
+## 2) Parse + clean
+vif_tbl <- readr::read_tsv(I(txt_vif), show_col_types = FALSE) %>%
+  mutate(VIF = as.numeric(VIF)) %>%
+  arrange(desc(VIF))
+
+## 3) Build table
+gt_vif <- vif_tbl %>%
+  gt() %>%
+  tab_header(
+    title = "Supplemental Table: Variance Inflation Factors (VIF)",
+    subtitle = "Model covariates ranked by VIF"
+  ) %>%
+  fmt_number(columns = VIF, decimals = 2) %>%
+  cols_align(align = "left", columns = Covariate) %>%
+  cols_align(align = "center", columns = VIF) %>%
+  tab_options(
+    table.font.size = 11,
+    data_row.padding = px(3),
+    table_body.hlines.style = "none"
+  )
+
+## 4) Save outputs
+out_dir <- file.path(results_root, "Supplemental_Tables")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+gtsave(gt_vif, file.path(out_dir, "SuppTable_VIF.pdf"))
+write_csv(vif_tbl, file.path(out_dir, "SuppTable_VIF.csv"))
+```
+

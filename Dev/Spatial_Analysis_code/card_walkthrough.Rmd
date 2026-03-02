@@ -1,0 +1,220 @@
+---
+title: "CARD_Walkthrough"
+author: "Alos Diallo"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(devtools)
+BiocManager::install("TOAST")
+devtools::install_github('xuranw/MuSiC')
+devtools::install_github('YMa-lab/CARD')
+
+
+```
+
+1: In install.packages(...) :
+  installation of package ‘RcppTOML’ had non-zero exit status
+2: In install.packages(...) :
+  installation of package ‘reticulate’ had non-zero exit status
+3: In install.packages(...) :
+  installation of package ‘basilisk’ ha
+
+```{r}
+library(Seurat)
+library(zellkonverter)
+library(SingleCellExperiment)
+library(CARD)
+
+# --- STEP 1: LOAD REFERENCE (Your Atlas) ---
+atlas <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/atlas_data.rds")
+
+# We need two things from the Atlas:
+# 1. The Count Matrix (Raw counts preferred for deconvolution)
+# 2. The Metadata (containing cell type labels)
+
+# Check if 'counts' exists, otherwise use 'data'
+sc_count <- GetAssayData(atlas, assay = "RNA", slot = "counts")
+
+sc_meta <- atlas@meta.data
+
+# --- STEP 2: LOAD SPATIAL DATA (From .h5ad) ---
+# Direct load - no need for intermediate TIFFs or Seurat objects
+sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/127.h5ad")
+
+# Extract Spatial Counts
+spatial_counts <- assay(sce, "X")
+
+# Extract Coordinates (x and y) from the .h5ad metadata
+# Note: Based on your previous script, we look in colData
+spatial_coords <- as.data.frame(colData(sce)[, c("array_col", "array_row")])
+colnames(spatial_coords) <- c("x", "y")
+
+# Ensure coordinates are numeric
+spatial_coords$x <- as.numeric(spatial_coords$x)
+spatial_coords$y <- as.numeric(spatial_coords$y)
+
+# --- STEP 3: RUN CARD ---
+
+# Important: Update 'ct.varname' below to match the column in your atlas 
+# that holds the cell types (e.g., "celltype", "annotation", or "cl295v11SubFull")
+
+CARD_obj <- createCARDObject(
+    sc_count = sc_count,
+    sc_meta = sc_meta,
+    spatial_count = spatial_counts,
+    spatial_location = spatial_coords,
+    ct.varname = "cl295v11SubFull", # I used the column name from your previous script
+    ct.select = unique(sc_meta$cl295v11SubFull), 
+    sample.varname = "orig.ident", 
+    minCountGene = 100,
+    minCountSpot = 5
+) 
+
+# Run the deconvolution
+CARD_obj <- CARD_deconvolution(CARD_obj)
+
+# --- STEP 4: VISUALIZE ---
+# Visualize the proportion of a specific cell type
+# Replace 'Tumor' with an actual cell type from your data
+# CARD.visualize.prop(
+#   proportion = CARD_obj@Proportion_CARD,
+#   spatial_location = CARD_obj@spatial_location, 
+#   ct.visualize = "Tumor", 
+#   colors = c("lightblue","red"), 
+#   pointSize = 3
+# )
+```
+
+```{r}
+# Extract the results matrix (Rows = Spots, Cols = Cell Types)
+prop_matrix <- CARD_obj@Proportion_CARD
+
+# Automatically find all columns containing "CD8"
+cd8_cols <- grep("CD8", colnames(prop_matrix), value = TRUE)
+
+# Print them to verify (Comparing against your list)
+print(cd8_cols)
+# Should catch: cTNI11, cTNI10, cTNI13, cTNI16, cTNI14, cTNI12, cTNI15
+```
+
+```{r}
+# Create a copy of the results
+broad_prop_matrix <- prop_matrix
+
+# 1. Calculate Total CD8 by summing the specific columns row-wise
+broad_prop_matrix <- as.data.frame(broad_prop_matrix)
+broad_prop_matrix$CD8_Total <- rowSums(broad_prop_matrix[, cd8_cols])
+
+# 2. (Optional) Remove the old fine-grained columns if you want a clean matrix
+# broad_prop_matrix <- broad_prop_matrix[, !colnames(broad_prop_matrix) %in% cd8_cols]
+```
+
+
+```{r}
+# Extract the new consolidated vector
+cd8_proportions <- broad_prop_matrix$CD8_Total
+
+# 1. Define the CD8 columns (if not already in memory)
+# This grabs every column with "CD8" in the name
+cd8_cols <- grep("CD8", colnames(CARD_obj@Proportion_CARD), value = TRUE)
+
+# 2. Calculate the Sum
+# We use drop=FALSE to ensure row names are preserved
+cd8_sum <- rowSums(CARD_obj@Proportion_CARD[, cd8_cols])
+
+# 3. Add this new "CD8_Total" column back to the CARD object's matrix
+# This method ensures the new column has the correct Spot IDs
+CARD_obj@Proportion_CARD <- cbind(CARD_obj@Proportion_CARD, CD8_Total = cd8_sum)
+
+# 4. Visualize
+# Now we can ask CARD to visualize "CD8_Total" by name, which is safer
+plot_data <- cbind(CARD_obj@spatial_location, 
+                   CD8_Total = CARD_obj@Proportion_CARD[, "CD8_Total"])
+
+# 2. Plot with ggplot2
+ggplot(plot_data, aes(x = x, y = y, color = CD8_Total)) + 
+  geom_point(size = 3) +
+  scale_color_gradientn(colors = c("lightblue", "red")) +
+  theme_void() + # Removes axes and background for a cleaner spatial look
+  labs(title = "Total CD8+ T-Cell Proportion", color = "Proportion") +
+  coord_fixed() # Ensures the tissue shape isn't distorted
+
+
+
+```
+```{r}
+library(ggplot2)
+
+# 1. Prepare CARD Data
+# We extract the specific column for CD8_Total
+card_values <- CARD_obj@Proportion_CARD[, "CD8_Total"]
+
+# 2. Input HiTIMED result for Sample 127
+# Converting percentage (2.32) to proportion (0.0232) to match CARD
+hitimed_pct <- 2.329332851
+hitimed_prop <- hitimed_pct / 100 
+
+# 3. Create Plotting Data
+plot_df <- data.frame(
+  Proportion = card_values,
+  Method = "CARD (Spatial)"
+)
+
+# 4. Generate the Comparison Boxplot
+ggplot(plot_df, aes(x = Method, y = Proportion)) +
+  # A. The Boxplot (Spatial Distribution)
+  geom_boxplot(fill = "#E69F00", alpha = 0.5, outlier.shape = NA, width = 0.5) +
+  
+  # B. The Jitter Points (Individual Spots)
+  # This shows if the high average is driven by a few "hotspots" or general over-estimation
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.3, color = "#333333") +
+  
+  # C. The HiTIMED Reference Line
+  geom_hline(aes(yintercept = hitimed_prop, linetype = "HiTIMED (Methylation)"), 
+             color = "blue", size = 1.2) +
+  
+  # D. Formatting and Labels
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, max(card_values) + 0.05)) +
+  scale_linetype_manual(name = "Bulk Reference", values = 2, 
+                        guide = guide_legend(override.aes = list(color = "blue"))) +
+  labs(
+    title = "CD8+ T-Cell Estimation: RNA vs. DNA",
+    subtitle = paste0("Sample 127\nHiTIMED: ", round(hitimed_pct, 2), "% | CARD Mean: ", round(mean(card_values)*100, 2), "%"),
+    y = "Proportion of Cell Type",
+    x = ""
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 16),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 14, face = "bold")
+  )
+
+# 5. Calculate Fold Difference for your records
+fold_diff <- mean(card_values) / hitimed_prop
+cat("Fold Difference (Spatial / Methylation):", round(fold_diff, 2), "x\n")
+```
+```{r}
+# 1. Total Number of Spots in the Boxplot (N)
+n_spots <- nrow(CARD_obj@Proportion_CARD)
+
+# 2. Exact Statistics for the Boxplot
+stats <- summary(CARD_obj@Proportion_CARD[, "CD8_Total"])
+
+# 3. Print the report for your P.I.
+cat("=== Boxplot Data Report ===\n")
+cat("Total Spots Analyzed (N):", n_spots, "\n")
+cat("Minimum Proportion:", round(stats["Min."]*100, 2), "%\n")
+cat("Median Proportion:", round(stats["Median"]*100, 2), "%\n")
+cat("Mean Proportion:", round(stats["Mean"]*100, 2), "%\n")
+cat("Max Proportion:", round(stats["Max."]*100, 2), "%\n")
+```
+

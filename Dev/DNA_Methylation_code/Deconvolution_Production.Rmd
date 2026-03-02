@@ -9,6 +9,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+Good don't touch
 Suplemental Figure 1: Validation box plots
 ```{r}
 ###############################################################################
@@ -377,7 +378,7 @@ for (h in ih_vec) {
 msg("\n✅  All levels complete. Outputs in: ", out_root)
 ```
 
-
+Good don't touch
 Figure 2a: Stacked Bar plots
 ```{r}
 ###############################################################################
@@ -566,6 +567,165 @@ message("Saved: ", fn_all)
 message("✓ Done.")
 ```
 
+```{r}
+###############################################################################
+# stackbars_DH_COMPLETE_DEBUG.R
+# Purpose: Full deconvolution and visualization for DH tumor progression.
+###############################################################################
+
+## ── 1. LIBS ─────────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(minfi)
+  library(sesame)
+  library(ENmix)
+  library(HiTIMED)
+  library(EpiDISH)
+  library(tidyverse)
+  library(scales)
+  library(cowplot)
+  library(grid)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+## ── 2. PATHS & SETTINGS ─────────────────────────────────────────────────────
+# Paths based on your Thesis data structure
+path_dh_epic_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+path_dh_epic_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+path_dh_meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+# Output directory for results
+out_root  <- "/Users/adiallo/Desktop/Thesis/Results/Fig2_allNormals"
+level_tag <- "h6" 
+
+# Create the folder immediately
+out_dir <- file.path(out_root, level_tag, "stackbars_DH")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+
+## ── 3. DATA PROCESSING ──────────────────────────────────────────────────────
+msg("Loading IDATs and performing NOOB normalization...")
+
+# Read and normalize DH datasets
+rg1 <- read.metharray.exp(path_dh_epic_v1, recursive = TRUE, extended = TRUE, force = TRUE)
+rg2 <- read.metharray.exp(path_dh_epic_v2, recursive = TRUE, extended = TRUE, force = TRUE)
+
+beta1 <- getBeta(preprocessNoob(rg1, dyeMethod = "single"))
+beta2 <- getBeta(preprocessNoob(rg2, dyeMethod = "single")) %>% sesame::betasCollapseToPfx()
+
+# Combine matrices
+common <- intersect(rownames(beta1), rownames(beta2))
+DH_beta <- cbind(beta1[common, ], beta2[common, ])
+
+# Run Deconvolution (h6 + Fibroblasts)
+msg("Running HiTIMED (Level 6) and EpiDISH...")
+frac_DH <- HiTIMED_deconvolution(DH_beta, tumor_type = "COAD", h = 6, tissue_type = "tumor") %>%
+  as.data.frame() %>% 
+  rownames_to_column("SampleID")
+
+# EpiDISH for Fibroblasts
+data("centEpiFibIC.m", package = "EpiDISH", envir = environment())
+common_fib <- intersect(rownames(DH_beta), rownames(centEpiFibIC.m))
+fib_DH <- epidish(DH_beta[common_fib, ], centEpiFibIC.m[common_fib, ], "RPC")$estF %>%
+  as.data.frame() %>% 
+  dplyr::select(Fib) %>% 
+  rownames_to_column("SampleID")
+
+# Load and process Metadata
+meta_DH <- read_csv(path_dh_meta_csv, show_col_types = FALSE) %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    mets_cat = case_when(
+      Distant_Mets == TRUE ~ "Distant Metastasis",
+      ("node_stage" %in% names(.) & node_stage > 0) ~ "LN Metastasis",
+      TRUE ~ "No Metastasis"
+    ),
+    mets_cat = factor(mets_cat, levels = c("No Metastasis","LN Metastasis","Distant Metastasis"))
+  )
+
+# Combine for plotting
+comb_DH <- meta_DH %>% 
+  left_join(frac_DH, by = "SampleID") %>% 
+  left_join(fib_DH, by = "SampleID")
+
+## ── 4. VISUALIZATION PREP ───────────────────────────────────────────────────
+# Clean up numeric columns for plotting
+ct_vars <- comb_DH %>% 
+  dplyr::select(-any_of(c("SampleID", "mets_cat", "Immune_total", "any_mets_fct", "dataset"))) %>% 
+  select(where(is.numeric))
+cell_type_vars <- names(ct_vars)
+
+df_long <- comb_DH %>%
+  dplyr::select(SampleID, mets_cat, all_of(cell_type_vars)) %>%
+  pivot_longer(all_of(cell_type_vars), names_to = "CellType", values_to = "Proportion")
+
+# Sort samples by Tumor proportion (descending) within categories
+tumor_col <- if ("Tumor" %in% cell_type_vars) "Tumor" else cell_type_vars[1]
+tumor_order <- df_long %>% 
+  filter(CellType == tumor_col) %>% 
+  arrange(mets_cat, desc(Proportion)) %>% 
+  pull(SampleID)
+
+df_long$SampleID <- factor(df_long$SampleID, levels = unique(tumor_order))
+
+# Order CellTypes by average abundance
+cell_type_order <- df_long %>% 
+  group_by(CellType) %>% 
+  summarise(m = mean(Proportion, na.rm = TRUE)) %>% 
+  arrange(desc(m)) %>% 
+  pull(CellType)
+
+df_long$CellType <- factor(df_long$CellType, levels = rev(cell_type_order))
+
+# Set colors
+base_cols <- c("#66C2A5","#FC8D62","#8DA0CB","#E78AC3","#A6D854","#FFD92F",
+               "#E5C494","#B3B3B3","#1F78B4","#33A02C","#FB9A99","#FDBF6F",
+               "#CAB2D6","#6A3D9A","#E31A1C","#B15928","#C51B8A")
+pal_ct <- setNames(base_cols[1:nlevels(df_long$CellType)], levels(df_long$CellType))
+
+## ── 5. SAVING OUTPUTS ───────────────────────────────────────────────────────
+msg("Starting file export to:", out_dir)
+
+# 1. Legend PDF
+p_leg <- ggplot(df_long, aes(SampleID, Proportion, fill = CellType)) + 
+  geom_bar(stat="identity", position="fill") + 
+  scale_fill_manual(values=pal_ct) + 
+  theme_minimal()
+leg_plot <- cowplot::ggdraw(cowplot::get_legend(p_leg))
+ggsave(file.path(out_dir, "LEGEND_h6.pdf"), leg_plot, width=3, height=6, device=cairo_pdf)
+
+# 2. All Groups Faceted PDF
+p_all <- ggplot(df_long, aes(SampleID, Proportion, fill = CellType)) +
+  geom_bar(stat="identity", position="fill") +
+  facet_grid(~ mets_cat, scales="free_x", space="free_x") +
+  scale_fill_manual(values=pal_ct) +
+  theme_minimal() + 
+  theme(legend.position="none", axis.text.x=element_blank(), panel.grid=element_blank()) +
+  scale_y_continuous(labels = percent_format())
+ggsave(file.path(out_dir, "STACKBAR_allGroups_h6.pdf"), p_all, width=20, height=7, device=cairo_pdf)
+
+# 3. Individual Group PDFs
+for (cat in levels(df_long$mets_cat)) {
+  dcat <- df_long %>% filter(mets_cat == cat)
+  if(nrow(dcat) == 0) next
+  
+  p_ind <- ggplot(dcat, aes(SampleID, Proportion, fill = CellType)) +
+    geom_bar(stat="identity", position="fill") +
+    scale_fill_manual(values=pal_ct) +
+    theme_minimal() + 
+    theme(legend.position="none", axis.text.x=element_blank(), panel.grid=element_blank()) +
+    scale_y_continuous(labels = percent_format())
+  
+  ind_path <- file.path(out_dir, paste0("STACKBAR_", gsub(" ", "_", cat), "_h6.pdf"))
+  ggsave(ind_path, p_ind, width=12, height=6, device=cairo_pdf)
+  msg("Saved:", ind_path)
+}
+
+msg("✅ PROCESS COMPLETE. Files are located in:", out_dir)
+```
+
+
+Old
 Figure 2C: Disease progression box plots
 ```{r}
 ###############################################################################
@@ -1132,106 +1292,951 @@ if ("HIT_DH" %in% ls() && "fib_DH" %in% ls() && "meta_DH" %in% ls()) {
 }
 
 ```
+New 
+Comparisons for all: This should replace everything
 
-MLH1 Plots
+This will produce plots with the p-vales labeled and tables showing correctedd p-values
 ```{r}
 ###############################################################################
-# stratified_MLH1_boxplots.R · Figure Supplement (HiTIMED levels × MLH1)
-# DH tumors: HiTIMED + EpiDISH (Fib) deconvolution stratified by MLH1 status
-# Author: Alos Diallo · Date: 2025-09-12
+#  Fig1_DH_Final_ROBUST.R
+#  Features:
+#  1. ROBUST: Skips rare cells with insufficient data to prevent crashes.
+#  2. SAFETY: Uses tryCatch() to ignore stat errors for specific cells.
+#  3. PLOTS: Numeric P-values (p=0.05).
+#  4. TABLES: Exports CSVs to 'hX' folders.
+#  Author: Alos Diallo (Assisted by Gemini)
 ###############################################################################
 
-msg("======= Starting MLH1-stratified plotting for HiTIMED levels =======")
-out_root <- "/Users/adiallo/Desktop/Thesis/Results/Fig2_MLH1_strat"
+## ── PATHS & SETUP ───────────────────────────────────────────────────────────
+path_dh_epic_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+path_dh_epic_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+path_dh_meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+out_root         <- "/Users/adiallo/Desktop/Thesis/Results/Figure1"
 
-draw_mlh1_boxplots <- function(combined_df, cell_cols, level_tag, out_dir) {
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
 
-  # Convert MLH1 0/1 → labels
-  combined_df <- combined_df %>%
-    filter(MLH1 %in% c(0, 1)) %>%
-    mutate(MLH1_status = ifelse(MLH1 == 1, "MLH1 Intact", "MLH1 Deficient"),
-           MLH1_status = factor(MLH1_status, levels = c("MLH1 Intact", "MLH1 Deficient")))
+suppressPackageStartupMessages({
+  library(minfi); library(sesame); library(ENmix)
+  library(HiTIMED); library(EpiDISH); library(tidyverse); 
+  library(ggpubr); library(rstatix); library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(RColorBrewer)
+})
 
-  long_df <- combined_df %>%
-    pivot_longer(cols = all_of(cell_cols), names_to = "Cell", values_to = "Prop") %>%
-    filter(!is.na(MLH1_status))
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
 
-  comps <- combn(levels(long_df$MLH1_status), 2, simplify = FALSE)
-  pal_mlh1 <- c("MLH1 Intact" = "#1f78b4", "MLH1 Deficient" = "#e31a1c")
+## ── LEVEL DEFINITIONS ───────────────────────────────────────────────────────
+get_level_defs <- function(h) {
+  if (h == 1) {
+    return(list(norm = c(), raw  = c("Tumor", "Other")))
+  } else if (h == 2) {
+    return(list(norm = c(), raw  = c("Tumor", "Immune", "Angiogenic")))
+  } else if (h == 3) {
+    return(list(norm = c(), raw  = c("Tumor", "Lymphocyte", "Myeloid", "Endothelial", "Epithelial", "Stromal")))
+  } else if (h == 4) {
+    return(list(
+      norm = c("Granulocyte", "Mononuclear", "Tcell", "Bcell", "NK"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  } else if (h == 5) {
+    return(list(
+      norm = c("Bas", "Eos", "Neu", "Mono", "DC", "Bnv", "Bmem", "CD4T", "CD8T", "NK"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  } else if (h == 6) {
+    return(list(
+      norm = c("Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", 
+               "Mono", "DC", "NK", "Bas", "Eos", "Neu"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  }
+}
 
-  msg("    Saving individual cell plots (PDF)…")
-  purrr::walk(unique(long_df$Cell), function(cl) {
-    df_cell <- filter(long_df, Cell == cl)
-    if (n_distinct(df_cell$MLH1_status) < 2) return()  # Skip if only one group present
+## ── DATA LOADING ────────────────────────────────────────────────────────────
+read_beta_DH <- function() {
+  msg("Reading DH IDATs...")
+  rg1 <- read.metharray.exp(path_dh_epic_v1, recursive = TRUE, force = TRUE, extended = TRUE)
+  rg2 <- read.metharray.exp(path_dh_epic_v2, recursive = TRUE, force = TRUE, extended = TRUE)
+  msg("NOOB Normalization...")
+  beta1 <- getBeta(preprocessNoob(rg1, dyeMethod = "single"))
+  beta2 <- getBeta(preprocessNoob(rg2, dyeMethod = "single")) %>% sesame::betasCollapseToPfx()
+  common <- intersect(rownames(beta1), rownames(beta2))
+  beta   <- cbind(beta1[common, ], beta2[common, ])
+  msg("Running ENmix QC...")
+  bad <- union(ENmix::QCinfo(rg1)$badCpG, ENmix::QCinfo(rg2)$badCpG)
+  anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  sex_cpgs <- rownames(anno)[anno$chr %in% c("chrX","chrY")]
+  beta <- beta[setdiff(rownames(beta), union(bad, sex_cpgs)), ]
+  msg(paste("Final Beta Matrix:", nrow(beta), "CpGs x", ncol(beta), "Samples"))
+  return(beta)
+}
 
-    y_max <- max(df_cell$Prop, na.rm = TRUE)
-    y_pos_kw <- y_max * 0.95
+if (!exists("DH_beta")) DH_beta <- read_beta_DH()
 
-    p <- ggplot(df_cell, aes(x = MLH1_status, y = Prop, fill = MLH1_status)) +
-      geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.65, color = "gray30") +
-      geom_jitter(width = 0.2, size = 1, alpha = 0.7) +
-      stat_compare_means(comparisons = comps, method = "wilcox.test",
-                         label = "p.signif", hide.ns = TRUE, size = 3.5, tip.length = 0.01) +
-      stat_compare_means(method = "wilcox.test", label.y = y_pos_kw, size = 4) +
-      scale_fill_manual(values = pal_mlh1, guide = "none") +
-      scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
-      labs(x = NULL, y = "Proportion") +
-      theme_bw(base_size = 12) +
-      theme(axis.text.x = element_text(angle = 35, hjust = 1))
+## ── METADATA CLEANING ───────────────────────────────────────────────────────
+msg("Processing Metadata...")
+meta_raw <- read_csv(path_dh_meta_csv, show_col_types = FALSE)
 
-    ggsave(file.path(out_dir,
-                     paste0("BOX_", gsub("[^A-Za-z0-9]+", "_", cl), "_", level_tag, "_MLH1.pdf")),
-           p, width = 4.5, height = 5, device = cairo_pdf)
+meta_DH <- meta_raw %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    
+    site_clean = str_to_title(site),
+    side = case_when(
+      site_clean %in% c("Cecum", "Ascending Colon", "Hepatic Flexure", "Right Colon", "Transverse Colon") ~ "Right Side",
+      site_clean %in% c("Splenic Flexure", "Descending Colon", "Left Colon", "Sigmoid", "Sigmoid Colon") ~ "Left Side",
+      site_clean == "Rectum" ~ "Rectum",
+      TRUE ~ NA_character_
+    ),
+    side = factor(side, levels = c("Right Side", "Left Side", "Rectum")),
+    node_stage_clean = case_when(
+      as.character(node_stage) == "0" ~ "N0",
+      str_detect(as.character(node_stage), "^1") ~ "N1",
+      str_detect(as.character(node_stage), "^2") ~ "N2",
+      TRUE ~ NA_character_
+    ),
+    node_stage_clean = factor(node_stage_clean, levels = c("N0", "N1", "N2")),
+    Grade = factor(as.character(Grade), levels = c("1", "2", "3")),
+
+    mets_cat = case_when(
+      Distant_Mets == TRUE ~ "Distant Mets",
+      (!is.na(node_stage) & node_stage > 0) | ln_only == TRUE ~ "LN Mets",
+      TRUE ~ "No Mets"
+    ),
+    mets_cat = factor(mets_cat, levels = c("No Mets", "LN Mets", "Distant Mets")),
+    
+    M_Stage = if_else(Distant_Mets == TRUE, "M1 (Distant)", "M0 (Locoregional)"),
+    M_Stage = factor(M_Stage, levels = c("M0 (Locoregional)", "M1 (Distant)")),
+    
+    any_mets_bin = if_else(mets_cat == "No Mets", "No Mets", "Mets (LN+Dist)"),
+    any_mets_bin = factor(any_mets_bin, levels = c("No Mets", "Mets (LN+Dist)")),
+    
+    MLH1_status = case_when(
+      MLH1 == 1 ~ "MLH1 Intact",
+      MLH1 == 0 ~ "MLH1 Deficient",
+      TRUE ~ NA_character_
+    ),
+    MLH1_status = factor(MLH1_status, levels = c("MLH1 Intact", "MLH1 Deficient"))
+  ) %>%
+  filter(SampleID %in% colnames(DH_beta)) %>%
+  dplyr::select(SampleID, mets_cat, any_mets_bin, M_Stage, MLH1_status, 
+                site_clean, side, node_stage_clean, Grade)
+
+## ── REFERENCE GENERATION ────────────────────────────────────────────────────
+msg("Generating References...")
+# HiTIMED returns Percentages (0-100)
+h2_res <- HiTIMED_deconvolution(DH_beta, "COAD", 2, "tumor")
+h2_df  <- as.data.frame(h2_res) %>% 
+  rownames_to_column("SampleID") %>% 
+  dplyr::rename(Total_Immune_Ref = Immune)
+
+data("centEpiFibIC.m", package = "EpiDISH", envir = environment())
+common_cpg <- intersect(rownames(DH_beta), rownames(centEpiFibIC.m))
+# EpiDISH returns Proportions (0-1), so we multiply by 100
+fib_res <- epidish(DH_beta[common_cpg, ], centEpiFibIC.m[common_cpg, ], "RPC")$estF
+fib_df  <- as.data.frame(fib_res * 100) %>%  
+  rownames_to_column("SampleID") %>% dplyr::select(SampleID, Fib)
+
+meta_refs <- meta_DH %>%
+  inner_join(h2_df[, c("SampleID", "Total_Immune_Ref")], by = "SampleID") %>%
+  inner_join(fib_df, by = "SampleID")
+
+## ── ROBUST PLOTTING ENGINE ──────────────────────────────────────────────────
+
+process_and_plot <- function(df, cell_cols, group_var, title_suffix, filename_suffix, out_path) {
+  
+  if(!group_var %in% names(df)) return()
+  avail_cols <- intersect(cell_cols, names(df))
+  if(length(avail_cols) == 0) return()
+  
+  long_df <- df %>%
+    pivot_longer(cols = all_of(avail_cols), names_to = "Cell", values_to = "Prop") %>%
+    filter(!is.na(.data[[group_var]]))
+  
+  # 1. STRICTER FILTERING
+  # Only plot cells where AT LEAST 2 GROUPS have >= 3 samples.
+  valid_stats <- long_df %>%
+    filter(!is.na(Prop)) %>%
+    group_by(Cell, .data[[group_var]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(Cell) %>%
+    summarise(n_groups_pass = sum(n >= 3), total_n = sum(n), .groups = "drop")
+  
+  # FIX: Require 2+ viable groups to allow pairwise testing
+  cells_to_plot <- valid_stats %>% filter(n_groups_pass >= 2) %>% pull(Cell)
+  
+  if(length(cells_to_plot) == 0) return()
+
+  plot_df <- long_df %>% filter(Cell %in% cells_to_plot, !is.na(Prop))
+  
+  # 2. GENERATE STATISTICS TABLE (WITH SAFETY CATCH)
+  # We wrap this in tryCatch because Wilcox test crashes on zero-variance/constant data
+  final_stats_table <- tryCatch({
+    
+    stat_test <- plot_df %>%
+      group_by(Cell) %>%
+      wilcox_test(as.formula(paste("Prop ~", group_var))) %>%
+      adjust_pvalue(method = "BH") %>%
+      add_significance("p.adj")
+    
+    kruskal_test <- plot_df %>%
+      group_by(Cell) %>%
+      kruskal_test(as.formula(paste("Prop ~", group_var)))
+    
+    stat_test %>%
+      dplyr::select(Cell, group1, group2, p, p.adj, p.adj.signif) %>%
+      rename(Raw_P = p, FDR_P = p.adj, Significance = p.adj.signif) %>%
+      left_join(kruskal_test %>% dplyr::select(Cell, p) %>% rename(Global_Kruskal_P = p), by = "Cell")
+      
+  }, error = function(e) {
+    msg(paste("  [WARN] Stats calc failed for", filename_suffix, "(likely sparse data). Skipping table. Error:", e$message))
+    return(NULL)
   })
+  
+  if(!is.null(final_stats_table)) {
+    stats_file <- file.path(out_path, paste0("STATS_", filename_suffix, ".csv"))
+    write_csv(final_stats_table, stats_file)
+  }
+  # 2b. GENERATE DESCRIPTIVE SUMMARY TABLE (Mean +/- SD)
+  # ----------------------------------------------------
+  summary_table <- plot_df %>%
+    group_by(Cell, Group = .data[[group_var]]) %>%
+    summarise(
+      Mean   = mean(Prop, na.rm = TRUE),
+      SD     = sd(Prop, na.rm = TRUE),
+      Median = median(Prop, na.rm = TRUE),
+      IQR    = IQR(Prop, na.rm = TRUE),
+      Min    = min(Prop, na.rm = TRUE),
+      Max    = max(Prop, na.rm = TRUE),
+      N      = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(across(where(is.numeric), \(x) round(x, 3))) # Round to 3 decimals
 
-  msg("    Saving faceted MLH1 plot…")
-  p_all <- ggplot(long_df, aes(x = MLH1_status, y = Prop, fill = MLH1_status)) +
-    geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.65, color = "gray30") +
-    geom_jitter(width = 0.15, size = 0.6, alpha = 0.6) +
-    facet_wrap(~ Cell, scales = "free_y", ncol = 5) +
-    stat_compare_means(comparisons = comps, method = "wilcox.test", label = "p.signif",
-                       hide.ns = TRUE, size = 2.8, step.increase = 0.07, tip.length = 0.01) +
-    scale_fill_manual(values = pal_mlh1, name = "MLH1 Status") +
-    labs(x = NULL, y = "Estimated Proportion") +
+  summary_file <- file.path(out_path, paste0("SUMMARY_TABLE_", filename_suffix, ".csv"))
+  write_csv(summary_table, summary_file)
+  # 3. PLOTTING
+  pal <- switch(group_var,
+    "mets_cat"         = c("No Mets"="#00AFBB", "LN Mets"="#E7B800", "Distant Mets"="#FC4E07"),
+    "any_mets_bin"     = c("No Mets"="#00AFBB", "Mets (LN+Dist)"="#FC4E07"),
+    "M_Stage"          = c("M0 (Locoregional)"="#377EB8", "M1 (Distant)"="#E41A1C"),
+    "MLH1_status"      = c("MLH1 Intact"="#1F78B4", "MLH1 Deficient"="#E31A1C"),
+    "side"             = c("Right Side"="#D95F02", "Left Side"="#7570B3", "Rectum"="#1B9E77"),
+    "node_stage_clean" = c("N0"="#66A61E", "N1"="#E6AB02", "N2"="#A6761D"),
+    "Grade"            = c("1"="#FBB4AE", "2"="#F0027F", "3"="#984EA3"),
+    setNames(colorRampPalette(brewer.pal(8, "Dark2"))(length(unique(plot_df[[group_var]]))), 
+             unique(plot_df[[group_var]]))
+  )
+  
+  groups_present <- unique(as.character(plot_df[[group_var]]))
+  if(length(groups_present) < 2) return()
+  comps <- combn(groups_present, 2, simplify = FALSE)
+  
+  n_cells  <- length(unique(plot_df$Cell))
+  n_cols   <- min(5, n_cells)
+  n_rows   <- ceiling(n_cells / n_cols)
+  p_height <- max(4, n_rows * 2.5)
+  p_width  <- max(5, n_cols * 2.2)
+
+  # Facet Plot
+  p_facet <- ggplot(plot_df, aes(x = .data[[group_var]], y = Prop, fill = .data[[group_var]])) +
+    geom_boxplot(outlier.shape = NA, width = 0.4, alpha = 0.8, color = "gray25") +
+    geom_jitter(width = 0.1, size = 0.8, alpha = 0.5) +
+    facet_wrap(~ Cell, scales = "free_y", ncol = n_cols) +
+    stat_compare_means(comparisons = comps, method = "wilcox.test", 
+                       label = "p.format", hide.ns = FALSE, size = 3) +
+    stat_compare_means(method = "kruskal.test", label = "p.format", 
+                       label.y.npc = 0.98, size = 3) +
+    scale_fill_manual(values = pal, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) + 
     theme_bw(base_size = 11) +
     theme(
-      axis.text.x = element_text(angle = 35, hjust = 1),
-      legend.position = "bottom",
-      panel.grid = element_blank(),
-      strip.background = element_rect(fill = "gray90", color = "gray50")
-    )
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+      axis.title.x = element_blank(),
+      strip.background = element_rect(fill = "gray95"),
+      strip.text = element_text(face = "bold"),
+      panel.grid = element_blank()
+    ) +
+    labs(y = "Percentage", title = NULL)
 
-  ggsave(file.path(out_dir, paste0("FACET_allCells_", level_tag, "_MLH1.pdf")),
-         p_all, width = 11, height = 9.5, device = cairo_pdf)
+  ggsave(file.path(out_path, paste0("FACET_", filename_suffix, ".pdf")), 
+         p_facet, width = p_width, height = p_height, device = cairo_pdf)
+
+  # Individual Plots
+  indiv_path <- file.path(out_path, "Individual")
+  dir.create(indiv_path, showWarnings = FALSE)
+  
+  for(cell in unique(plot_df$Cell)) {
+    cell_data <- plot_df %>% filter(Cell == cell)
+    p_indiv <- ggplot(cell_data, aes(x = .data[[group_var]], y = Prop, fill = .data[[group_var]])) +
+      geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.8, color = "gray25") +
+      geom_jitter(width = 0.1, size = 1.0, alpha = 0.6) +
+      stat_compare_means(comparisons = comps, method = "wilcox.test", 
+                         label = "p.format", hide.ns = FALSE, size = 4) +
+      stat_compare_means(method = "kruskal.test", label = "p.format", 
+                         label.y.npc = 0.95, size = 4) +
+      scale_fill_manual(values = pal, guide = "none") +
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) + 
+      theme_bw(base_size = 14) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      ) +
+      labs(y = "Percentage", title = cell)
+    
+    safe_name <- gsub("[^A-Za-z0-9]+", "_", cell)
+    ggsave(file.path(indiv_path, paste0("BOX_", safe_name, "_", filename_suffix, ".pdf")),
+           p_indiv, width = 3.5, height = 4.5, device = cairo_pdf)
+  }
 }
 
-# === LOOP ACROSS ALL LEVELS ===
-for (h in ih_vec) {
-  level_tag <- paste0("h", h)
-  msg("\n==============================")
-  msg(">>> MLH1-stratified plots for:", level_tag)
+## ── MAIN LOOP ───────────────────────────────────────────────────────────────
+msg("======= Starting Final ROBUST Analysis =======")
 
-  frac_DH  <- HIT_DH[[level_tag]]
-  if (is.null(frac_DH)) next
+for (h in 1:6) {
+  level_name <- paste0("h", h)
+  msg("\n>>> Processing Level:", level_name)
+  
+  defs <- get_level_defs(h)
+  res  <- HiTIMED_deconvolution(DH_beta, "COAD", h, "tumor")
+  
+  if (is.vector(res)) {
+    frac_df <- data.frame(SampleID = names(res), res = res)
+    names(frac_df)[2] <- paste0("Cell_h", h)
+  } else {
+    frac_df <- as.data.frame(res) %>% rownames_to_column("SampleID")
+  }
+  
+  combined <- meta_refs %>% inner_join(frac_df, by = "SampleID")
+  present  <- setdiff(names(frac_df), "SampleID")
+  
+  cols_norm <- intersect(present, defs$norm)
+  cols_raw  <- intersect(present, defs$raw)
+  if (h >= 3) cols_raw <- unique(c(cols_raw, "Fib"))
 
-  combined <- meta_DH %>%
-    left_join(frac_DH, by = "SampleID") %>%
-    left_join(fib_DH , by = "SampleID") %>%
-    normalise_fractions()
+  # Normalization & SCALING
+  if (length(cols_norm) > 0) {
+    combined_norm <- combined %>%
+      mutate(across(all_of(cols_norm), 
+                    ~ if_else(Total_Immune_Ref > 0 & !is.na(Total_Immune_Ref), 
+                              (.x / Total_Immune_Ref) * 100, NA_real_),
+                    .names = "{.col}_norm"))
+    immune_cols <- paste0(cols_norm, "_norm")
+  } else {
+    combined_norm <- combined
+    immune_cols   <- NULL
+  }
+  
+  lvl_dir <- file.path(out_root, level_name)
+  dir.create(lvl_dir, showWarnings = FALSE)
+  
+  run_all_vars <- function(df, cols, prefix) {
+    if(length(cols) == 0) return()
+    process_and_plot(df, cols, "mets_cat", "Mets", paste0(prefix, "_Mets"), lvl_dir)
+    process_and_plot(df, cols, "MLH1_status", "MLH1", paste0(prefix, "_MLH1"), lvl_dir)
+    process_and_plot(filter(df, MLH1_status == "MLH1 Intact"), cols, "mets_cat", "MSS", paste0(prefix, "_Mets_IntactOnly"), lvl_dir)
+    process_and_plot(filter(df, MLH1_status == "MLH1 Deficient"), cols, "mets_cat", "MSI", paste0(prefix, "_Mets_DeficientOnly"), lvl_dir)
+    process_and_plot(df, cols, "side", "Side", paste0(prefix, "_Side_LR"), lvl_dir)
+    process_and_plot(df, cols, "site_clean", "Site", paste0(prefix, "_Site_Detailed"), lvl_dir)
+    process_and_plot(df, cols, "node_stage_clean", "NodeStage", paste0(prefix, "_NodeStage"), lvl_dir)
+    process_and_plot(df, cols, "Grade", "Grade", paste0(prefix, "_Grade"), lvl_dir)
+    process_and_plot(df, cols, "M_Stage", "MStage", paste0(prefix, "_M0_vs_M1"), lvl_dir)
+    process_and_plot(df, cols, "any_mets_bin", "AnyMets", paste0(prefix, "_AnyMets_Binary"), lvl_dir)
+  }
 
-  cell_cols <- c(setdiff(names(frac_DH), "SampleID"),
-                 "Fib",
-                 grep("_norm$", names(combined), value = TRUE))
-
-  cell_cols <- unique(cell_cols)
-  cell_cols <- cell_cols[sapply(cell_cols, function(c) c %in% names(combined) && !all(is.na(combined[[c]])))]
-
-  out_dir <- file.path(out_root, paste0(level_tag, "_MLH1"))
-  draw_mlh1_boxplots(combined, cell_cols, level_tag, out_dir)
-  msg("✓  Level", level_tag, "MLH1-stratified plots saved to →", out_dir)
+  if(!is.null(immune_cols)) {
+    msg("  -> Generating Immune Plots (Normalized %)...")
+    run_all_vars(combined_norm, immune_cols, "IMMUNE")
+  }
+  if(length(cols_raw) > 0) {
+    msg("  -> Generating Structural Plots (Raw %)...")
+    run_all_vars(combined_norm, cols_raw, "STRUCTURAL")
+  }
 }
 
-msg("\n✅  All MLH1-stratified boxplots complete.")
+msg("\n✅ Analysis Complete. Check 'hX' folders for PDFs (Raw P) and CSVs (Raw+FDR P).")
 ```
+
+```{r}
+# 2b. GENERATE DESCRIPTIVE SUMMARY TABLE (Mean +/- SD)
+  # ----------------------------------------------------
+  summary_table <- plot_df %>%
+    group_by(Cell, Group = .data[[group_var]]) %>%
+    summarise(
+      Mean   = mean(Prop, na.rm = TRUE),
+      SD     = sd(Prop, na.rm = TRUE),
+      Median = median(Prop, na.rm = TRUE),
+      IQR    = IQR(Prop, na.rm = TRUE),
+      Min    = min(Prop, na.rm = TRUE),
+      Max    = max(Prop, na.rm = TRUE),
+      N      = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(across(where(is.numeric), \(x) round(x, 3))) # Round to 3 decimals
+
+  summary_file <- file.path(out_path, paste0("SUMMARY_TABLE_", filename_suffix, ".csv"))
+  write_csv(summary_table, summary_file)
+```
+
+
+Expanded set, will remove the above if this works:
+```{r}
+###############################################################################
+#  Fig1_DH_MASTER_ALL_COMPARISONS.R
+#  The "Kitchen Sink" Script: 14 distinct comparison sets per cell/level.
+#  Includes: 
+#    - Standard Mets/MLH1
+#    - M0 vs M1
+#    - MLH1 Stratification (Mets within Intact/Deficient)
+#    - Grade/Node/Side Stratification (Within Mets/No Mets)
+#  Author: Alos Diallo (Assisted by Gemini)
+###############################################################################
+
+## ── PATHS & SETUP ───────────────────────────────────────────────────────────
+path_dh_epic_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+path_dh_epic_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+path_dh_meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+out_root         <- "/Users/adiallo/Desktop/Thesis/Results/Figure1"
+
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+suppressPackageStartupMessages({
+  library(minfi); library(sesame); library(ENmix)
+  library(HiTIMED); library(EpiDISH); library(tidyverse); 
+  library(ggpubr); library(rstatix); library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  library(RColorBrewer)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+
+## ── LEVEL DEFINITIONS ───────────────────────────────────────────────────────
+get_level_defs <- function(h) {
+  if (h == 1) {
+    return(list(norm = c(), raw  = c("Tumor", "Other")))
+  } else if (h == 2) {
+    return(list(norm = c(), raw  = c("Tumor", "Immune", "Angiogenic")))
+  } else if (h == 3) {
+    return(list(norm = c(), raw  = c("Tumor", "Lymphocyte", "Myeloid", "Endothelial", "Epithelial", "Stromal")))
+  } else if (h == 4) {
+    return(list(
+      norm = c("Granulocyte", "Mononuclear", "Tcell", "Bcell", "NK"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  } else if (h == 5) {
+    return(list(
+      norm = c("Bas", "Eos", "Neu", "Mono", "DC", "Bnv", "Bmem", "CD4T", "CD8T", "NK"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  } else if (h == 6) {
+    return(list(
+      norm = c("Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", 
+               "Mono", "DC", "NK", "Bas", "Eos", "Neu"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  }
+}
+
+## ── DATA LOADING ────────────────────────────────────────────────────────────
+read_beta_DH <- function() {
+  msg("Reading DH IDATs...")
+  rg1 <- read.metharray.exp(path_dh_epic_v1, recursive = TRUE, force = TRUE, extended = TRUE)
+  rg2 <- read.metharray.exp(path_dh_epic_v2, recursive = TRUE, force = TRUE, extended = TRUE)
+  msg("NOOB Normalization...")
+  beta1 <- getBeta(preprocessNoob(rg1, dyeMethod = "single"))
+  beta2 <- getBeta(preprocessNoob(rg2, dyeMethod = "single")) %>% sesame::betasCollapseToPfx()
+  common <- intersect(rownames(beta1), rownames(beta2))
+  beta   <- cbind(beta1[common, ], beta2[common, ])
+  msg("Running ENmix QC...")
+  bad <- union(ENmix::QCinfo(rg1)$badCpG, ENmix::QCinfo(rg2)$badCpG)
+  anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  sex_cpgs <- rownames(anno)[anno$chr %in% c("chrX","chrY")]
+  beta <- beta[setdiff(rownames(beta), union(bad, sex_cpgs)), ]
+  msg(paste("Final Beta Matrix:", nrow(beta), "CpGs x", ncol(beta), "Samples"))
+  return(beta)
+}
+
+if (!exists("DH_beta")) DH_beta <- read_beta_DH()
+
+## ── METADATA CLEANING ───────────────────────────────────────────────────────
+msg("Processing Metadata...")
+meta_raw <- read_csv(path_dh_meta_csv, show_col_types = FALSE)
+
+meta_DH <- meta_raw %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    
+    # Clean Site/Side
+    site_clean = str_to_title(site),
+    side = case_when(
+      site_clean %in% c("Cecum", "Ascending Colon", "Hepatic Flexure", "Right Colon", "Transverse Colon") ~ "Right Side",
+      site_clean %in% c("Splenic Flexure", "Descending Colon", "Left Colon", "Sigmoid", "Sigmoid Colon") ~ "Left Side",
+      site_clean == "Rectum" ~ "Rectum",
+      TRUE ~ NA_character_
+    ),
+    side = factor(side, levels = c("Right Side", "Left Side", "Rectum")),
+    
+    # Clean Node
+    node_stage_clean = case_when(
+      as.character(node_stage) == "0" ~ "N0",
+      str_detect(as.character(node_stage), "^1") ~ "N1",
+      str_detect(as.character(node_stage), "^2") ~ "N2",
+      TRUE ~ NA_character_
+    ),
+    node_stage_clean = factor(node_stage_clean, levels = c("N0", "N1", "N2")),
+    
+    # Clean Grade
+    Grade = factor(as.character(Grade), levels = c("1", "2", "3")),
+
+    # Mets Variables
+    mets_cat = case_when(
+      Distant_Mets == TRUE ~ "Distant Mets",
+      (!is.na(node_stage) & node_stage > 0) | ln_only == TRUE ~ "LN Mets",
+      TRUE ~ "No Mets"
+    ),
+    mets_cat = factor(mets_cat, levels = c("No Mets", "LN Mets", "Distant Mets")),
+    
+    M_Stage = if_else(Distant_Mets == TRUE, "M1 (Distant)", "M0 (Locoregional)"),
+    M_Stage = factor(M_Stage, levels = c("M0 (Locoregional)", "M1 (Distant)")),
+    
+    any_mets_bin = if_else(mets_cat == "No Mets", "No Mets", "Mets (LN+Dist)"),
+    any_mets_bin = factor(any_mets_bin, levels = c("No Mets", "Mets (LN+Dist)")),
+    
+    # MLH1
+    MLH1_status = case_when(
+      MLH1 == 1 ~ "MLH1 Intact",
+      MLH1 == 0 ~ "MLH1 Deficient",
+      TRUE ~ NA_character_
+    ),
+    MLH1_status = factor(MLH1_status, levels = c("MLH1 Intact", "MLH1 Deficient"))
+  ) %>%
+  filter(SampleID %in% colnames(DH_beta)) %>%
+  dplyr::select(SampleID, mets_cat, any_mets_bin, M_Stage, MLH1_status, 
+                site_clean, side, node_stage_clean, Grade)
+
+## ── REFERENCE GENERATION ────────────────────────────────────────────────────
+msg("Generating References...")
+h2_res <- HiTIMED_deconvolution(DH_beta, "COAD", 2, "tumor")
+h2_df  <- as.data.frame(h2_res) %>% 
+  rownames_to_column("SampleID") %>% 
+  dplyr::rename(Total_Immune_Ref = Immune)
+
+data("centEpiFibIC.m", package = "EpiDISH", envir = environment())
+common_cpg <- intersect(rownames(DH_beta), rownames(centEpiFibIC.m))
+fib_res <- epidish(DH_beta[common_cpg, ], centEpiFibIC.m[common_cpg, ], "RPC")$estF
+fib_df  <- as.data.frame(fib_res) %>% 
+  rownames_to_column("SampleID") %>% dplyr::select(SampleID, Fib)
+
+meta_refs <- meta_DH %>%
+  inner_join(h2_df[, c("SampleID", "Total_Immune_Ref")], by = "SampleID") %>%
+  inner_join(fib_df, by = "SampleID")
+
+## ── PLOTTING ENGINE ─────────────────────────────────────────────────────────
+
+plot_panel_safe <- function(df, cell_cols, group_var, title_suffix, filename_suffix, out_path) {
+  
+  if(!group_var %in% names(df)) return()
+  avail_cols <- intersect(cell_cols, names(df))
+  if(length(avail_cols) == 0) return()
+  
+  long_df <- df %>%
+    pivot_longer(cols = all_of(avail_cols), names_to = "Cell", values_to = "Prop") %>%
+    filter(!is.na(.data[[group_var]]))
+  
+  # Min N=3 Check
+  valid_stats <- long_df %>%
+    filter(!is.na(Prop)) %>%
+    group_by(Cell, .data[[group_var]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(Cell) %>%
+    summarise(n_groups_pass = sum(n >= 3), total_n = sum(n), .groups = "drop")
+  
+  cells_to_plot <- valid_stats %>% filter(total_n > 0) %>% pull(Cell)
+  if(length(cells_to_plot) == 0) return()
+
+  plot_df <- long_df %>% filter(Cell %in% cells_to_plot, !is.na(Prop))
+  
+  # Colors
+  pal <- switch(group_var,
+    "mets_cat"         = c("No Mets"="#00AFBB", "LN Mets"="#E7B800", "Distant Mets"="#FC4E07"),
+    "any_mets_bin"     = c("No Mets"="#00AFBB", "Mets (LN+Dist)"="#FC4E07"),
+    "M_Stage"          = c("M0 (Locoregional)"="#377EB8", "M1 (Distant)"="#E41A1C"),
+    "MLH1_status"      = c("MLH1 Intact"="#1F78B4", "MLH1 Deficient"="#E31A1C"),
+    "side"             = c("Right Side"="#D95F02", "Left Side"="#7570B3", "Rectum"="#1B9E77"),
+    "node_stage_clean" = c("N0"="#66A61E", "N1"="#E6AB02", "N2"="#A6761D"),
+    "Grade"            = c("1"="#FBB4AE", "2"="#F0027F", "3"="#984EA3"),
+    setNames(colorRampPalette(brewer.pal(8, "Dark2"))(length(unique(plot_df[[group_var]]))), 
+             unique(plot_df[[group_var]]))
+  )
+  
+  groups_present <- unique(as.character(plot_df[[group_var]]))
+  if(length(groups_present) < 2) return()
+  comps <- combn(groups_present, 2, simplify = FALSE)
+  
+  # Facet Dimensions
+  n_cells  <- length(unique(plot_df$Cell))
+  n_cols   <- min(5, n_cells)
+  n_rows   <- ceiling(n_cells / n_cols)
+  p_height <- max(4, n_rows * 2.5)
+  p_width  <- max(5, n_cols * 2.2)
+
+  # 1. FACET PLOT
+  p_facet <- ggplot(plot_df, aes(x = .data[[group_var]], y = Prop, fill = .data[[group_var]])) +
+    geom_boxplot(outlier.shape = NA, width = 0.4, alpha = 0.8, color = "gray25") +
+    geom_jitter(width = 0.1, size = 0.8, alpha = 0.5) +
+    facet_wrap(~ Cell, scales = "free_y", ncol = n_cols) +
+    stat_compare_means(comparisons = comps, method = "wilcox.test", 
+                       label = "p.signif", hide.ns = TRUE, size = 3) +
+    stat_compare_means(method = "kruskal.test", label.y.npc = 0.98, size = 3) +
+    scale_fill_manual(values = pal, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) + 
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+      axis.title.x = element_blank(),
+      strip.background = element_rect(fill = "gray95"),
+      strip.text = element_text(face = "bold"),
+      panel.grid = element_blank()
+    ) +
+    labs(y = "Proportion", title = NULL)
+
+  ggsave(file.path(out_path, paste0("FACET_", filename_suffix, ".pdf")), 
+         p_facet, width = p_width, height = p_height, device = cairo_pdf)
+
+  # 2. INDIVIDUAL PLOTS
+  indiv_path <- file.path(out_path, "Individual")
+  dir.create(indiv_path, showWarnings = FALSE)
+  
+  for(cell in unique(plot_df$Cell)) {
+    cell_data <- plot_df %>% filter(Cell == cell)
+    p_indiv <- ggplot(cell_data, aes(x = .data[[group_var]], y = Prop, fill = .data[[group_var]])) +
+      geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.8, color = "gray25") +
+      geom_jitter(width = 0.1, size = 1.0, alpha = 0.6) +
+      stat_compare_means(comparisons = comps, method = "wilcox.test", 
+                         label = "p.signif", hide.ns = TRUE, size = 4) +
+      stat_compare_means(method = "kruskal.test", label.y.npc = 0.95, size = 4) +
+      scale_fill_manual(values = pal, guide = "none") +
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) + 
+      theme_bw(base_size = 14) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      ) +
+      labs(y = "Proportion", title = cell)
+    
+    safe_name <- gsub("[^A-Za-z0-9]+", "_", cell)
+    ggsave(file.path(indiv_path, paste0("BOX_", safe_name, "_", filename_suffix, ".pdf")),
+           p_indiv, width = 3.5, height = 4.5, device = cairo_pdf)
+  }
+}
+
+## ── MAIN LOOP ───────────────────────────────────────────────────────────────
+msg("======= Starting Master Analysis (Levels 1-6) =======")
+
+for (h in 1:6) {
+  level_name <- paste0("h", h)
+  msg("\n>>> Processing Level:", level_name)
+  
+  defs <- get_level_defs(h)
+  res  <- HiTIMED_deconvolution(DH_beta, "COAD", h, "tumor")
+  
+  if (is.vector(res)) {
+    frac_df <- data.frame(SampleID = names(res), res = res)
+    names(frac_df)[2] <- paste0("Cell_h", h)
+  } else {
+    frac_df <- as.data.frame(res) %>% rownames_to_column("SampleID")
+  }
+  
+  combined <- meta_refs %>% inner_join(frac_df, by = "SampleID")
+  present  <- setdiff(names(frac_df), "SampleID")
+  
+  cols_norm <- intersect(present, defs$norm)
+  cols_raw  <- intersect(present, defs$raw)
+  if (h >= 3) cols_raw <- unique(c(cols_raw, "Fib"))
+
+  # Normalization
+  if (length(cols_norm) > 0) {
+    combined_norm <- combined %>%
+      mutate(across(all_of(cols_norm), 
+                    ~ if_else(Total_Immune_Ref > 0 & !is.na(Total_Immune_Ref), 
+                              .x / Total_Immune_Ref, NA_real_),
+                    .names = "{.col}_norm"))
+    immune_cols <- paste0(cols_norm, "_norm")
+  } else {
+    combined_norm <- combined
+    immune_cols   <- NULL
+  }
+  
+  lvl_dir <- file.path(out_root, level_name)
+  dir.create(lvl_dir, showWarnings = FALSE)
+  
+  # ── MASTER RUNNER ──
+  run_master_vars <- function(df, cols, prefix) {
+    if(length(cols) == 0) return()
+    
+    # A. GLOBAL METS / STAGE
+    plot_panel_safe(df, cols, "mets_cat", "Mets_3Level", paste0(prefix, "_Mets_3Level"), lvl_dir)
+    plot_panel_safe(df, cols, "any_mets_bin", "AnyMets", paste0(prefix, "_AnyMets_Binary"), lvl_dir)
+    plot_panel_safe(df, cols, "M_Stage", "MStage", paste0(prefix, "_M0_vs_M1"), lvl_dir)
+    plot_panel_safe(df, cols, "MLH1_status", "MLH1", paste0(prefix, "_MLH1"), lvl_dir)
+    
+    # B. MLH1 STRATIFIED
+    plot_panel_safe(filter(df, MLH1_status == "MLH1 Intact"), cols, "mets_cat", "MSS", paste0(prefix, "_Mets_IntactOnly"), lvl_dir)
+    plot_panel_safe(filter(df, MLH1_status == "MLH1 Deficient"), cols, "mets_cat", "MSI", paste0(prefix, "_Mets_DeficientOnly"), lvl_dir)
+    
+    # C. GRADE
+    plot_panel_safe(df, cols, "Grade", "Grade_All", paste0(prefix, "_Grade_All"), lvl_dir)
+    plot_panel_safe(filter(df, mets_cat=="No Mets"), cols, "Grade", "Grade_NoMets", paste0(prefix, "_Grade_in_NoMets"), lvl_dir)
+    plot_panel_safe(filter(df, any_mets_bin!="No Mets"), cols, "Grade", "Grade_Mets", paste0(prefix, "_Grade_in_Mets"), lvl_dir)
+    
+    # D. NODE STAGE
+    plot_panel_safe(filter(df, any_mets_bin!="No Mets"), cols, "node_stage_clean", "Node_Mets", paste0(prefix, "_Node_in_Mets"), lvl_dir)
+    plot_panel_safe(filter(df, mets_cat=="Distant Mets"), cols, "node_stage_clean", "Node_DistMets", paste0(prefix, "_Node_in_DistantMets"), lvl_dir)
+    
+    # E. SIDE
+    plot_panel_safe(df, cols, "side", "Side_All", paste0(prefix, "_Side_All"), lvl_dir)
+    plot_panel_safe(filter(df, mets_cat=="No Mets"), cols, "side", "Side_NoMets", paste0(prefix, "_Side_in_NoMets"), lvl_dir)
+    plot_panel_safe(filter(df, any_mets_bin!="No Mets"), cols, "side", "Side_Mets", paste0(prefix, "_Side_in_Mets"), lvl_dir)
+  }
+
+  if(!is.null(immune_cols)) {
+    msg("  -> Generating Immune Plots (Normalized)...")
+    run_master_vars(combined_norm, immune_cols, "IMMUNE")
+  }
+  if(length(cols_raw) > 0) {
+    msg("  -> Generating Structural Plots (Raw)...")
+    run_master_vars(combined_norm, cols_raw, "STRUCTURAL")
+  }
+}
+
+msg("\n✅ Analysis Complete. All 14 comparison sets generated per level.")
+```
+
+
+Comparisons for site that were the most significant
+```{r}
+###############################################################################
+#  Fig1_DH_AllCells_AllPossibleSitePairs_FIXED.R
+#  "Brute Force" Discovery Mode
+#  FIXED: Prevents 'Tumor.x/Tumor.y' collision by cleaning reference dataframes.
+#  Author: Alos Diallo (Assisted by Gemini)
+###############################################################################
+
+## ── PATHS & SETUP ───────────────────────────────────────────────────────────
+path_dh_epic_v1  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/idats/"
+path_dh_epic_v2  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/DNA_Methylation/dm_data/no_match/25_samples/"
+path_dh_meta_csv <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+out_root         <- "/Users/adiallo/Desktop/Thesis/Results/Figure1/Site_Specific_Comparisons"
+
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+suppressPackageStartupMessages({
+  library(minfi); library(sesame); library(ENmix)
+  library(HiTIMED); library(EpiDISH); library(tidyverse); 
+  library(ggpubr); library(rstatix); library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+msg <- function(...) cat("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., "\n")
+
+## ── 1. LEVEL DEFINITIONS (Strict Mapping) ───────────────────────────────────
+get_level_defs <- function(h) {
+  if (h == 1) {
+    return(list(norm = c(), raw  = c("Tumor", "Other")))
+  } else if (h == 2) {
+    return(list(norm = c(), raw  = c("Tumor", "Immune", "Angiogenic")))
+  } else if (h == 3) {
+    return(list(norm = c(), raw  = c("Tumor", "Lymphocyte", "Myeloid", "Endothelial", "Epithelial", "Stromal")))
+  } else if (h == 4) {
+    return(list(
+      norm = c("Granulocyte", "Mononuclear", "Tcell", "Bcell", "NK"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  } else if (h == 5) {
+    return(list(
+      norm = c("Bas", "Eos", "Neu", "Mono", "DC", "Bnv", "Bmem", "CD4T", "CD8T", "NK"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  } else if (h == 6) {
+    return(list(
+      norm = c("Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", 
+               "Mono", "DC", "NK", "Bas", "Eos", "Neu"),
+      raw  = c("Tumor", "Endothelial", "Epithelial", "Stromal")
+    ))
+  }
+}
+
+## ── 2. DATA LOADING & METADATA ──────────────────────────────────────────────
+read_beta_DH <- function() {
+  msg("Reading DH IDATs...")
+  rg1 <- read.metharray.exp(path_dh_epic_v1, recursive = TRUE, force = TRUE, extended = TRUE)
+  rg2 <- read.metharray.exp(path_dh_epic_v2, recursive = TRUE, force = TRUE, extended = TRUE)
+  msg("NOOB Normalization...")
+  beta1 <- getBeta(preprocessNoob(rg1, dyeMethod = "single"))
+  beta2 <- getBeta(preprocessNoob(rg2, dyeMethod = "single")) %>% sesame::betasCollapseToPfx()
+  common <- intersect(rownames(beta1), rownames(beta2))
+  beta   <- cbind(beta1[common, ], beta2[common, ])
+  msg("Running ENmix QC...")
+  bad <- union(ENmix::QCinfo(rg1)$badCpG, ENmix::QCinfo(rg2)$badCpG)
+  anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+  sex_cpgs <- rownames(anno)[anno$chr %in% c("chrX","chrY")]
+  beta <- beta[setdiff(rownames(beta), union(bad, sex_cpgs)), ]
+  msg(paste("Final Beta Matrix:", nrow(beta), "CpGs x", ncol(beta), "Samples"))
+  return(beta)
+}
+
+if (!exists("DH_beta")) DH_beta <- read_beta_DH()
+
+msg("Processing Metadata...")
+meta_raw <- read_csv(path_dh_meta_csv, show_col_types = FALSE)
+
+meta_DH <- meta_raw %>%
+  mutate(
+    SampleID = paste(Sentrix_ID, Sentrix_Position, sep = "_"),
+    site_clean = str_to_title(site),
+    site_clean = case_when(
+        site_clean == "Sigmoid Colon" ~ "Sigmoid",
+        TRUE ~ site_clean
+    )
+  ) %>%
+  filter(SampleID %in% colnames(DH_beta)) %>%
+  dplyr::select(SampleID, site_clean)
+
+# ── AUTO-DETECT PAIRS ──
+valid_sites <- meta_DH %>% 
+  count(site_clean) %>% 
+  filter(n >= 2) %>% 
+  pull(site_clean)
+
+msg(paste("Found", length(valid_sites), "sites with N>=2:", paste(valid_sites, collapse=", ")))
+
+all_pairs <- t(combn(valid_sites, 2))
+colnames(all_pairs) <- c("Site_A", "Site_B")
+site_pairs <- as_tibble(all_pairs)
+
+msg(paste("Generated", nrow(site_pairs), "unique site pairwise comparisons."))
+
+
+## ── 3. REFERENCE GENERATION ─────────────────────────────────────────────────
+msg("Generating References...")
+h2_res <- HiTIMED_deconvolution(DH_beta, "COAD", 2, "tumor")
+
+# FIX: Select ONLY the reference column we need to avoid collisions with "Tumor" later
+h2_df  <- as.data.frame(h2_res) %>% 
+          rownames_to_column("SampleID") %>% 
+          dplyr::rename(Total_Immune_Ref = Immune) %>%
+          dplyr::select(SampleID, Total_Immune_Ref) # <--- STRICT SELECTION
+
+data("centEpiFibIC.m", package = "EpiDISH", envir = environment())
+common_cpg <- intersect(rownames(DH_beta), rownames(centEpiFibIC.m))
+fib_res <- epidish(DH_beta[common_cpg, ], centEpiFibIC.m[common_cpg, ], "RPC")$estF
+fib_df  <- as.data.frame(fib_res) %>% rownames_to_column("SampleID") %>% 
+          dplyr::select(SampleID, Fib)
+
+## ── 4. MAIN LOOP (LEVELS 1-6) ───────────────────────────────────────────────
+msg("======= Starting Comprehensive Pairwise Analysis =======")
+
+for (h in 1:6) {
+  level_name <- paste0("h", h)
+  msg("\n>>> Processing Level:", level_name)
+  
+  # A. Deconvolution
+  res <- HiTIMED_deconvolution(DH_beta, "COAD", h, "tumor")
+  if (is.vector(res)) {
+    frac_df <- data.frame(SampleID = names(res), res = res)
+    names(frac_df)[2] <- paste0("Cell_h", h)
+  } else {
+    frac_df <- as.data.frame(res) %>% rownames_to_column("SampleID")
+  }
+
+  # B. Merge
+  # Join structure ensures clean names
+  combined <- meta_DH %>%
+    inner_join(h2_df, by="SampleID") %>%
+    inner_join(fib_df, by="SampleID") %>%
+    inner_join(frac_df, by="SampleID")
+  
+  # C. Identify Cells & Definitions
+  present_cols <- setdiff(names(frac_df), "SampleID")
+  defs         <- get_level_defs(h)
+  cols_norm    <- intersect(present_cols, defs$norm)
+  cols_raw     <- intersect(present_cols, defs$raw)
+  if (h >= 3) cols_raw <- unique(c(cols_raw, "Fib")) # Always add Fib from h3+
+  
+  all_target_cells <- c(cols_norm, cols_raw)
+  
+  # Create Output Directory
+  lvl_dir <- file.path(out_root, level_name)
+  dir.create(lvl_dir, showWarnings = FALSE)
+  
+  msg(paste("   Plotting", length(all_target_cells), "cell types x", nrow(site_pairs), "pairs..."))
+
+  # D. Loop through ALL Cells
+  for(cell in all_target_cells) {
+    
+    is_immune <- cell %in% cols_norm
+    
+    # E. Loop through ALL Site Pairs
+    for(i in 1:nrow(site_pairs)) {
+      site_a <- site_pairs$Site_A[i]
+      site_b <- site_pairs$Site_B[i]
+      
+      # Prepare Data (Safe if() for normalization)
+      plot_data <- combined %>%
+        filter(site_clean %in% c(site_a, site_b)) %>%
+        dplyr::rename(Raw_Prop = all_of(cell)) %>%
+        mutate(site_clean = factor(site_clean, levels = c(site_a, site_b)))
+      
+      if(is_immune) {
+        plot_data$Final_Prop <- ifelse(plot_data$Total_Immune_Ref > 0, 
+                                       plot_data$Raw_Prop / plot_data$Total_Immune_Ref, 
+                                       NA)
+      } else {
+        plot_data$Final_Prop <- plot_data$Raw_Prop
+      }
+      
+      plot_data <- plot_data %>% filter(!is.na(Final_Prop))
+      
+      # N Check (Min 2)
+      n_a <- sum(plot_data$site_clean == site_a)
+      n_b <- sum(plot_data$site_clean == site_b)
+      
+      if(n_a < 2 || n_b < 2) next # Skip insufficient data
+      
+      # Plot
+      file_suffix <- if(is_immune) "_norm" else ""
+      plot_title  <- paste0(cell, file_suffix)
+      y_label     <- if(is_immune) "Prop (Norm)" else "Prop (Raw)"
+      
+      p <- ggplot(plot_data, aes(x = site_clean, y = Final_Prop, fill = site_clean)) +
+        geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.8, color = "gray30") +
+        geom_jitter(width = 0.1, size = 1.5, alpha = 0.6) +
+        stat_compare_means(method = "wilcox.test", 
+                           label = "p.format", size = 5, 
+                           comparisons = list(c(site_a, site_b))) + 
+        scale_fill_manual(values = c("#377EB8", "#E41A1C")) +
+        theme_bw(base_size = 14) +
+        theme(
+          axis.title.x = element_blank(),
+          legend.position = "none",
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          panel.grid.major.x = element_blank()
+        ) +
+        labs(y = y_label, title = plot_title)
+      
+      safe_a <- gsub(" ", "", site_a)
+      safe_b <- gsub(" ", "", site_b)
+      fname  <- paste0("BOX_", cell, file_suffix, "_", safe_a, "_vs_", safe_b, ".pdf")
+      
+      ggsave(file.path(lvl_dir, fname), p, width = 3.5, height = 5, device = cairo_pdf)
+    }
+  }
+}
+
+msg("\n✅ Discovery Complete. Every valid site comparison has been plotted.")
+```
+
+
+
 

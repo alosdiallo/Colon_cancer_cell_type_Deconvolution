@@ -46,7 +46,7 @@ library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 anno_data <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 
 # Define the vector of CpG IDs you're interested in
-cpgs_of_interest <- c("cg16474170")
+cpgs_of_interest <- c("cg14556303")
 
 # Subset the annotation data frame for your specific CpGs
 my_cpg_info <- anno_data[cpgs_of_interest, ]
@@ -339,7 +339,7 @@ beta_rds     <- file.path(results_root, "ewas_cache", "beta_comb_qc.rds")
 meta_csv     <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
 
 # Using official gene symbols for TP53, APC, and KRAS
-genes_of_interest <- c("TP53;WRAP53", "APC", "KRAS")
+genes_of_interest <- c("TCF7", 'BCL6', 'IL7R', 'CXCR5', 'SELL', 'LEF1','PDCD1', 'HAVCR2', 'LAG3', 'TIGIT', 'TOX', 'BATF', 'EOMES','IFNG', 'GZMB', 'PRF1', 'CXCL13' )
 
 ## ---- Load β-matrix + meta ---------------------------------------------------
 beta_comb <- {
@@ -497,6 +497,64 @@ if (nrow(all_stats) > 0) {
 
 cat("✓ Saved per-gene PDF plots to:\n  ", out_dir,
     "\n✓ Stats CSV (if any):\n  ", file.path(out_dir, "AllGenes_TSSvsBody_population_stats.csv"), "\n")
+
+## ---- Facet plot: all genes together ----------------------------------------
+if (nrow(all_stats) > 0) {
+
+  # Recreate the long-format plotting data for all genes
+  plot_data_all <- purrr::map_dfr(genes_of_interest, function(gene_symbol) {
+    cpgs <- get_gene_cpgs(gene_symbol, beta_comb, anno)
+    if (!length(cpgs$tss) && !length(cpgs$body)) return(NULL)
+    df_tss  <- collapse_region(cpgs$tss,  beta_comb, "TSS")
+    df_body <- collapse_region(cpgs$body, beta_comb, "Body")
+    bind_rows(df_tss, df_body) %>%
+      left_join(meta, by = "SampleID") %>%
+      mutate(Gene = gene_symbol)
+  }) %>%
+    filter(!is.na(mets_progression))
+  
+  # Facet by gene and metastasis group
+  p_all <- ggplot(plot_data_all, aes(x = Region, y = BetaCollapsed, fill = Region)) +
+    geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.8, color = "gray30") +
+    geom_jitter(aes(group = SampleID), width = 0.15, size = 0.6, alpha = 0.5) +
+    facet_grid(mets_progression ~ Gene, scales = "free_y") +
+    scale_fill_manual(values = c("TSS" = "#1f78b4", "Body" = "#e31a1c")) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(
+      title = "All Genes: Body vs TSS β-values across metastasis groups",
+      x = NULL,
+      y = "β-value (mean across CpGs per region)"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "gray90", color = "gray50"),
+      strip.text.x = element_text(size = 8, face = "bold"),
+      strip.text.y = element_text(size = 9),
+      panel.spacing = unit(0.3, "lines")
+    )
+
+  ggsave(
+    file.path(out_dir, "AllGenes_TSSvsBody_FacetPlot.pdf"),
+    p_all, width = 14, height = 8
+  )
+
+  cat("✓ Saved combined facet plot:\n  ",
+      file.path(out_dir, "AllGenes_TSSvsBody_FacetPlot.pdf"), "\n")
+}
+
+  # --- Set custom biological order for genes ---
+  gene_order <- c(
+    # Progenitor exhaustion
+    "TCF7", "BCL6", "IL7R", "CXCR5", "SELL", "LEF1",
+    # Intermediate exhaustion
+    "PDCD1", "HAVCR2", "LAG3", "TIGIT", "TOX", "BATF", "EOMES",
+    # Terminal exhaustion
+    "IFNG", "GZMB", "PRF1", "CXCL13"
+  )
+
+  plot_data_all <- plot_data_all %>%
+    mutate(Gene = factor(Gene, levels = gene_order))
 ```
 
 ```{r}

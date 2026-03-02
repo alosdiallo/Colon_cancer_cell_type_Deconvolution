@@ -1,0 +1,131 @@
+---
+title: "Visium_Differential_Ploting"
+author: "Alos Diallo"
+date: "2026-02-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(EnhancedVolcano)
+library(data.table)
+
+# Load results
+results <- fread("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/DC1_IM_vs_CT_additive.csv")
+
+# Cap FDR at a more reasonable level for visualization
+results$fdr_capped <- pmax(results$fdr, 1e-100)
+
+# Select genes to label
+top_hits <- results$primerid[results$fdr < 1e-50 & abs(results$logFC) > 0.75]
+
+# Create volcano plot
+EnhancedVolcano(results,
+    lab = results$primerid,
+    x = 'logFC',
+    y = 'fdr_capped',
+    selectLab = top_hits,
+    title = 'Invasive Margin vs Core Tumor',
+    subtitle = 'DC1 cells',
+    xlim = c(-2, 2),
+    ylim = c(0, 105),
+    pCutoff = 0.01,
+    FCcutoff = 0.5,
+    pointSize = 1.5,
+    labSize = 3.0,
+    labFace = 'italic',
+    colAlpha = 0.6,
+    drawConnectors = TRUE,
+    widthConnectors = 0.4,
+    colConnectors = 'grey50',
+    maxoverlapsConnectors = 25,
+    legendPosition = 'bottom',
+    legendLabels = c('NS', 'Log2 FC', 'FDR', 'FDR & Log2 FC')
+)
+```
+```{r}
+library(data.table)
+library(Matrix)
+library(pheatmap)
+
+base_path <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/"
+
+# Load results
+results <- fread(file.path(base_path, "DC1_IM_vs_CT_additive.csv"))
+
+# Load expression data
+counts <- readMM(file.path(base_path, "DC1_mast_counts.mtx"))
+metadata <- fread(file.path(base_path, "DC1_mast_metadata.csv"))
+gene_info <- fread(file.path(base_path, "DC1_mast_gene_info.csv"))
+
+library(pheatmap)
+
+# Fix gene names - skip the empty first entry
+gene_names <- gene_info$V1[-1]
+spot_ids <- metadata$V1
+
+# Set row/column names
+rownames(counts) <- gene_names
+colnames(counts) <- spot_ids
+
+# Filter to genes detected in >25% of spots
+well_detected <- names(detection_rate[detection_rate > 0.25])
+results_filtered <- results[primerid %in% well_detected]
+
+# Check how many genes pass
+length(well_detected)
+
+# Get top genes from filtered set
+top_up <- results_filtered[direction == "Up_in_IM" & fdr < 0.01][order(-abs(logFC))][1:25, primerid]
+top_down <- results_filtered[direction == "Down_in_IM" & fdr < 0.01][order(-abs(logFC))][1:25, primerid]
+top_genes_filtered <- c(top_up, top_down)
+
+# Check detection rates for these genes
+sapply(top_genes_filtered, function(g) round(detection_rate[g] * 100, 1))
+
+# Remake heatmap
+expr_subset <- as.matrix(counts[top_genes_filtered, ])
+expr_log <- log1p(expr_subset)
+expr_plot_ordered <- expr_log[, sampled_spots][, spot_order]
+
+pheatmap(expr_plot_ordered,
+         scale = "row",
+         show_colnames = FALSE,
+         annotation_col = annotation_col,
+         annotation_colors = annotation_colors,
+         cluster_cols = FALSE,
+         cluster_rows = TRUE,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+         breaks = seq(-2, 2, length.out = 101),
+         main = "Top DE Genes: IM vs CT (DC1, >25% detection)")
+```
+```{r}
+# What genes are in the heatmap?
+print(top_genes)
+
+# Check if CLEC17A is in our top genes
+"CLEC17A" %in% top_genes
+
+# Look at CLEC17A expression
+summary(as.numeric(counts["CLEC17A", ]))
+
+# How many spots have zero expression?
+sum(counts["CLEC17A", ] == 0)
+length(counts["CLEC17A", ])
+
+# Check a few other genes for comparison
+summary(as.numeric(counts["EPCAM", ]))
+sum(counts["EPCAM", ] == 0)
+
+# Expression by region
+table(counts["CLEC17A", ] > 0, metadata$region)
+
+# What's its logFC and component p-values?
+results[primerid == "CLEC17A"]
+
+
+```
+

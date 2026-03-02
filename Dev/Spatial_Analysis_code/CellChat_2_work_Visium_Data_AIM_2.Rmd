@@ -1,0 +1,1263 @@
+---
+title: "CellChat_2_work_Visium_Data_AIM_2"
+author: "Alos Diallo"
+date: "2026-02-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Part 1: Setup and Helper Functions
+```{r include=FALSE}
+library(Seurat)
+library(CellChat)
+library(zellkonverter)
+library(SingleCellExperiment)
+library(patchwork)
+library(ggplot2)
+library(future)
+library(dplyr)
+library(tidyr)
+
+options(future.globals.maxSize = 10 * 1024^3)
+future::plan("multisession", workers = 6)
+
+# ============================================================
+# PATHS
+# ============================================================
+base_dir   <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples"
+meta_path  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+output_dir <- file.path(base_dir, "cellchat2_results")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================
+# LOAD CLINICAL METADATA
+# ============================================================
+clinical <- read.csv(meta_path, stringsAsFactors = FALSE)
+clinical$deident <- as.character(clinical$deident)
+
+# Identify valid sample h5ad files (exclude atlas/reference files)
+all_h5ad <- list.files(base_dir, pattern = "\\.h5ad$", full.names = FALSE)
+exclude_files <- c("Colon_cell_atlas.h5ad", "data_0_adata.h5ad",
+                    "reference.h5ad", "SP18_16438_A3.h5ad", "SP18_56_A19.h5ad")
+sample_h5ad <- setdiff(all_h5ad, exclude_files)
+sample_ids  <- gsub("\\.h5ad$", "", sample_h5ad)
+
+cat("H5AD sample IDs found:", length(sample_ids), "\n")
+cat("Matched in clinical data:",
+    sum(sample_ids %in% clinical$deident), "/",
+    length(sample_ids), "\n")
+```
+
+Part 2: Consolidated Cell Type Mapping
+```{r}
+# ============================================================
+# CELL TYPE MAPPING
+# This must match the column names in obsm["means_cell_abundance_w_sf"]
+# Your Python code shows columns are like:
+#   "meanscell_abundance_w_sf_cE01 (...)"
+# or simply the cell type identifiers.
+#
+# We replicate your h6 mapping logic but tailored for CellChat:
+# keeping immune subtypes separate while merging structural types
+# ============================================================
+
+# This function maps a single Cell2Location column name to a cell type label
+# It mirrors your Python map_to_h6_like() function
+map_c2l_to_celltype <- function(col_name) {
+  # Remove the prefix that Cell2Location adds
+  clean <- gsub("meanscell_abundance_w_sf_", "", col_name)
+  clean <- gsub("means_cell_abundance_w_sf_", "", clean)
+  
+  # --- TUMOR ---
+  if (grepl("^Tumor", clean)) return("Tumor")
+  
+  # --- EPITHELIAL (Normal) ---
+  if (grepl("^cE", clean)) return("Epithelial")
+  
+  # --- STRUCTURAL: Endothelial vs Fibroblast/CAF ---
+  if (grepl("^cS", clean)) {
+    num <- as.integer(gsub("\\D", "", sub("\\s.*", "", clean)))
+    if (!is.na(num)) {
+      if (num >= 1 & num <= 14) return("Endothelial")
+      if (num == 32) return("Smooth_muscle")
+      if (num %in% c(27, 28, 29, 30, 31)) return("CAF")
+      if (num == 26) return("Myofibroblast")
+      if (num %in% c(22, 25)) return("Fibroblast")
+      if (num %in% c(15, 16, 17, 18, 19, 20)) return("Pericyte")
+      if (num == 33) return("Schwann")
+    }
+    return("Fibroblast")
+  }
+  
+  # --- B CELLS ---
+  if (grepl("^cB", clean)) return("B_cell")
+  
+  # --- PLASMA ---
+  if (grepl("^cP", clean)) return("Plasma")
+  
+  # --- MYELOID ---
+  if (grepl("^cMA", clean)) return("Mast")
+  if (grepl("^cM", clean)) {
+    if (grepl("cM10", clean)) return("Granulocyte")
+    if (grepl("cM01|cM02", clean)) return("Macrophage")
+    return("DC")
+  }
+  
+  # --- T CELLS ---
+  if (grepl("^cTNI", clean)) {
+    num <- as.integer(gsub("\\D", "", sub("\\s.*", "", clean)))
+    if (!is.na(num)) {
+      if (num >= 1 & num <= 7) return("CD4_T")
+      if (num %in% c(8, 9)) return("Treg")
+      if (num %in% c(10, 11, 12, 13)) return("CD8_T")
+      if (num %in% c(14, 15, 16)) return("CD8_T_exhausted")
+      if (num %in% c(17, 18)) return("gdT")
+      if (num %in% c(19, 20, 21, 22)) return("Other_T")
+      if (num %in% c(23, 24, 25)) return("NK")
+      if (num == 26) return("ILC")
+    }
+    return("Other_T")
+  }
+  
+  return("Other")
+}
+```
+
+Inspection:
+```{r}
+# ============================================================
+# INSPECT ONE SAMPLE — run this first!
+# ============================================================
+test_sce <- readH5AD(file.path(base_dir, "127.h5ad"))
+
+cat("=== Dimensions ===\n")
+cat("Genes:", nrow(test_sce), "  Spots:", ncol(test_sce), "\n\n")
+
+cat("=== Available columns in colData ===\n")
+print(colnames(colData(test_sce)))
+
+cat("\n=== Looking for Cell2Location results ===\n")
+c2l_cols <- grep("q05_cell_abundance", colnames(colData(test_sce)), value = TRUE)
+cat("Cell2Location columns found:", length(c2l_cols), "\n")
+if (length(c2l_cols) > 0) {
+  cat("First few:\n")
+  print(head(c2l_cols, 10))
+}
+
+cat("\n=== Looking for pre-assigned cell type columns ===\n")
+possible_label_cols <- grep("cell_type|predicted|label|annotation|cluster", 
+                            colnames(colData(test_sce)), 
+                            value = TRUE, ignore.case = TRUE)
+cat("Possible label columns:", paste(possible_label_cols, collapse = ", "), "\n")
+
+cat("\n=== Spatial coordinate columns ===\n")
+coord_cols <- grep("array_|spatial|x_|y_|row|col", 
+                   colnames(colData(test_sce)), 
+                   value = TRUE, ignore.case = TRUE)
+cat("Coordinate columns:", paste(coord_cols, collapse = ", "), "\n")
+
+cat("\n=== Available assays ===\n")
+print(assayNames(test_sce))
+```
+
+
+
+Part 3: Load and Prepare Function (Fixed for obsm)
+```{r}
+# ============================================================
+# FUNCTION: Load one h5ad and extract Cell2Location cell types from obsm
+# ============================================================
+load_and_prepare_sample <- function(sample_id, base_dir,
+                                     min_spots_per_type = 10,
+                                     immune_rescue_threshold = 0.10,
+                                     max_spots_per_type = 500) {
+  
+  h5ad_path <- file.path(base_dir, paste0(sample_id, ".h5ad"))
+  if (!file.exists(h5ad_path)) stop("File not found: ", h5ad_path)
+  
+  cat("\n========================================\n")
+  cat("Loading sample:", sample_id, "\n")
+  cat("========================================\n")
+  
+  sce <- readH5AD(h5ad_path)
+  cd  <- as.data.frame(colData(sce))
+  
+  # --- 1. Extract count matrix ---
+  spatial_counts <- assay(sce, "X")
+  cat("  Dimensions:", nrow(sce), "genes x", ncol(sce), "spots\n")
+  
+  # --- 2. Extract spatial coordinates (pixel-level from obsm) ---
+  spatial_coords <- as.matrix(reducedDim(sce, "spatial"))
+  colnames(spatial_coords) <- c("x", "y")
+  
+  # --- 3. Extract Cell2Location results from obsm ---
+  available_obsm <- reducedDimNames(sce)
+  cat("  Available obsm slots:", paste(available_obsm, collapse = ", "), "\n")
+  
+  # Find the Cell2Location abundance matrix
+  c2l_name <- grep("means_cell_abundance_w_sf|mean_cell_abundance", 
+                    available_obsm, value = TRUE, ignore.case = TRUE)
+  
+  if (length(c2l_name) == 0) {
+    stop("No Cell2Location abundance matrix found in obsm for sample ", sample_id,
+         "\nAvailable obsm: ", paste(available_obsm, collapse = ", "))
+  }
+  
+  cat("  Using obsm slot:", c2l_name[1], "\n")
+  c2l_matrix <- reducedDim(sce, c2l_name[1])
+  
+  # Ensure it's a standard matrix with proper names
+  c2l_matrix <- as.matrix(c2l_matrix)
+  cat("  Cell2Location matrix:", nrow(c2l_matrix), "spots x", 
+      ncol(c2l_matrix), "cell types\n")
+  cat("  Column names (first 5):", paste(head(colnames(c2l_matrix), 5), collapse = ", "), "\n")
+  
+  # --- 4. Map each column to consolidated cell type ---
+  col_mapping <- sapply(colnames(c2l_matrix), map_c2l_to_celltype)
+  cat("  Cell type mapping:\n")
+  print(table(col_mapping))
+  
+  # --- 5. Aggregate abundances by consolidated cell type ---
+  # Sum columns that map to the same type (like your Python groupby)
+  unique_types <- unique(col_mapping)
+  agg_matrix <- matrix(0, nrow = nrow(c2l_matrix), ncol = length(unique_types))
+  colnames(agg_matrix) <- unique_types
+  rownames(agg_matrix) <- rownames(c2l_matrix)
+  
+  for (ct in unique_types) {
+    cols_for_ct <- which(col_mapping == ct)
+    if (length(cols_for_ct) == 1) {
+      agg_matrix[, ct] <- c2l_matrix[, cols_for_ct]
+    } else {
+      agg_matrix[, ct] <- rowSums(c2l_matrix[, cols_for_ct])
+    }
+  }
+  
+  # --- 6. Assign cell types with immune rescue ---
+  # First pass: assign every spot to its highest-abundance cell type
+  dominant_type <- apply(agg_matrix, 1, function(row) {
+    colnames(agg_matrix)[which.max(row)]
+  })
+  names(dominant_type) <- rownames(agg_matrix)
+  
+  # Define immune types that are at risk of being lost under
+  # winner-take-all assignment (they are typically outnumbered by
+  # structural/epithelial cells in the same Visium spot)
+  immune_types <- c("CD8_T", "CD8_T_exhausted", "CD4_T", "Treg",
+                    "Macrophage", "DC", "NK", "B_cell")
+  
+  # Second pass: rescue immune labels
+  # For spots assigned to a non-immune type, check whether an immune
+  # population accounts for more than immune_rescue_threshold (default
+  # 10%) of the total Cell2Location abundance in that spot. If so,
+  # relabel the spot to that immune type.
+  n_rescued <- 0
+  for (spot in names(dominant_type)) {
+    if (dominant_type[spot] %in% immune_types) next  # already immune
+    
+    immune_cols <- intersect(colnames(agg_matrix), immune_types)
+    if (length(immune_cols) == 0) next
+    
+    immune_vals <- agg_matrix[spot, immune_cols]
+    top_immune <- names(immune_vals)[which.max(immune_vals)]
+    top_immune_val <- max(immune_vals)
+    total_val <- sum(agg_matrix[spot, ])
+    
+    if (total_val > 0 && (top_immune_val / total_val) > immune_rescue_threshold) {
+      dominant_type[spot] <- top_immune
+      n_rescued <- n_rescued + 1
+    }
+  }
+  cat("  Immune rescue: relabeled", n_rescued, "spots (threshold:",
+      immune_rescue_threshold, ")\n")
+  
+  # --- 7. Use histology column to help distinguish regions ---
+  if ("histology" %in% colnames(cd)) {
+    cat("  Histology column found — regions available\n")
+    histology <- cd$histology
+    names(histology) <- rownames(cd)
+  } else {
+    histology <- rep("unknown", nrow(cd))
+    names(histology) <- rownames(cd)
+  }
+  
+  # --- 8. Report and filter ---
+  type_counts <- sort(table(dominant_type), decreasing = TRUE)
+  cat("  Cell type distribution (after immune rescue):\n")
+  print(type_counts)
+  
+  # Merge rare types into "Other"
+  rare_types <- names(type_counts[type_counts < min_spots_per_type])
+  if (length(rare_types) > 0) {
+    cat("  Merging rare types (<", min_spots_per_type, " spots):",
+        paste(rare_types, collapse = ", "), "\n")
+    dominant_type[dominant_type %in% rare_types] <- "Other"
+  }
+  
+  # Remove "Other" spots
+  keep <- dominant_type != "Other"
+  cat("  Keeping", sum(keep), "of", length(keep), "spots\n")
+  
+  if (sum(keep) < 50) {
+    warning("Sample ", sample_id, " has very few usable spots (", sum(keep), ")")
+  }
+  
+  # --- 9. Subset ---
+  counts_use <- spatial_counts[, keep]
+  coords_use <- spatial_coords[keep, , drop = FALSE]
+  coords_use <- as.matrix(coords_use)
+  meta_use   <- data.frame(
+    labels    = dominant_type[keep],
+    histology = histology[keep],
+    row.names = names(dominant_type)[keep]
+  )
+  
+  # --- 9b. Stratified downsampling ---
+  # Cap overrepresented cell types while keeping rare ones intact.
+  # This controls runtime for spatial CellChat without losing the
+  # immune populations that matter for the analysis.
+  keep_indices <- c()
+  for (ct in unique(meta_use$labels)) {
+    ct_idx <- which(meta_use$labels == ct)
+    if (length(ct_idx) > max_spots_per_type) {
+      set.seed(42)
+      ct_idx <- sample(ct_idx, max_spots_per_type)
+    }
+    keep_indices <- c(keep_indices, ct_idx)
+  }
+  
+  counts_use <- counts_use[, keep_indices]
+  coords_use <- coords_use[keep_indices, , drop = FALSE]
+  meta_use   <- meta_use[keep_indices, , drop = FALSE]
+  cat("  Downsampled from", sum(keep), "to", length(keep_indices), "spots\n")
+  cat("  Post-downsample distribution:\n")
+  print(table(meta_use$labels))
+  
+  # --- 10. Normalize ---
+  seu <- CreateSeuratObject(counts = counts_use, meta.data = meta_use)
+  seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 10000)
+  data_norm <- GetAssayData(seu, layer = "data", assay = "RNA")
+  
+  # --- 11. Spatial factors ---
+  # For Visium: ratio = spot_size_um / spot_diameter_fullres
+  # tol = spot_size_um / 2
+  spot_size_um <- 65
+  conversion_factor <- 0.5686331
+  
+  spatial_factors <- data.frame(
+    ratio = as.numeric(conversion_factor),
+    tol   = as.numeric(spot_size_um / 2)
+  )
+
+  
+  return(list(
+    data            = data_norm,
+    meta            = meta_use,
+    coords          = coords_use,
+    spatial_factors = spatial_factors,
+    sample_id       = sample_id,
+    seu             = seu,
+    c2l_agg         = agg_matrix[keep, ][keep_indices, ]
+  ))
+}
+```
+
+
+
+Part 4: Function to Create and Run CellChat on One Sample
+```{r}
+# ============================================================
+# FUNCTION: Run CellChat2 analysis
+# ============================================================
+run_cellchat_sample <- function(prep, min_cells = 10) {
+  
+  cat("\n--- Running CellChat2 for sample:", prep$sample_id, "---\n")
+  
+  # Create CellChat object with spatial information
+  cellchat <- createCellChat(
+    object          = prep$data,
+    meta            = prep$meta,
+    group.by        = "labels",
+    datatype        = "spatial",
+    coordinates     = prep$coords,
+    spatial.factors = prep$spatial_factors
+  )
+  
+  # --- Database ---
+  # Secreted Signaling: chemokines, cytokines, growth factors (bulk of
+  #   tumor-immune-CAF crosstalk: CXCL, CCL, TGFb, VEGF, IL, etc.)
+  # ECM-Receptor: collagens, laminins, fibronectin (CAF-mediated immune
+  #   exclusion and tissue remodeling)
+  # Cell-Cell Contact omitted: checkpoint interactions (PD-L1, CTLA4)
+  #   are important but too computationally expensive at this spot count.
+  #   Checkpoint genes are examined via spatial feature plots instead.
+  CellChatDB <- CellChatDB.human
+  CellChatDB.use <- subsetDB(CellChatDB, 
+                              search = c("Secreted Signaling"),
+                              key = "annotation")
+  cellchat@DB <- CellChatDB.use
+  cat("  Database categories: Secreted Signaling + ECM-Receptor\n")
+  
+  # --- Preprocessing ---
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  
+  # --- Communication probability ---
+  # distance.use = FALSE: spatial coordinates are still used for
+  #   contact-dependent signaling (via contact.knn.k), but the
+  #   expensive full pairwise distance matrix is not computed for
+  #   secreted signaling. This matches the original fast runtime.
+  # scale.distance = 0.01: standard for Visium (~100 um spacing).
+  #   Use the SAME value across all 41 samples for comparability.
+  # nboot = 20: reduced from default 100 for speed. Sufficient to
+  #   identify significant interactions for cross-sample comparison.
+  cellchat <- computeCommunProb(
+    cellchat,
+    type           = "triMean",
+    distance.use   = FALSE,
+    scale.distance = 0.01,
+    contact.knn.k  = 10,
+    nboot          = 20
+  )
+  
+  # --- Filter, pathway, aggregate, centrality ---
+  cellchat <- filterCommunication(cellchat, min.cells = min_cells)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+  
+  cat("  Cell types:", paste(levels(cellchat@idents), collapse = ", "), "\n")
+  cat("  Active pathways:", length(cellchat@netP$pathways), "\n")
+  
+  return(cellchat)
+}
+```
+
+Test on 1 Sample:
+```{r}
+# ============================================================
+# TEST ON SAMPLE 127 BEFORE BATCH PROCESSING
+# ============================================================
+cat("=== Testing on sample 127 ===\n")
+
+prep_127 <- load_and_prepare_sample(
+  sample_id              = "127",
+  base_dir               = base_dir,
+  min_spots_per_type     = 10,
+  immune_rescue_threshold = 0.10,
+  max_spots_per_type     = 500
+)
+
+# Inspect what we got
+cat("\nCell types assigned:\n")
+print(table(prep_127$meta$labels))
+
+cat("\nHistology breakdown:\n")
+print(table(prep_127$meta$histology))
+
+# Cross-tabulate: cell type by region
+cat("\nCell type × Region:\n")
+print(table(prep_127$meta$labels, prep_127$meta$histology))
+
+# Inspect immune proportion distribution (for calibrating threshold)
+immune_types <- c("CD8_T", "CD8_T_exhausted", "CD4_T", "Treg",
+                  "Macrophage", "DC", "NK", "B_cell")
+immune_props <- apply(prep_127$c2l_agg, 1, function(row) {
+  immune_vals <- row[intersect(names(row), immune_types)]
+  if (length(immune_vals) == 0) return(0)
+  max(immune_vals) / sum(row)
+})
+hist(immune_props[immune_props > 0], breaks = 50,
+     main = "Distribution of top immune proportion per spot",
+     xlab = "Top immune type / total abundance")
+abline(v = 0.10, col = "red", lty = 2)
+
+  cat("  Data class:", class(prep_127$data), "\n")
+  cat("  Data dimensions:", dim(prep_127$data), "\n")
+
+# Run CellChat
+cc_127 <- run_cellchat_sample(prep_127, min_cells = 10)
+
+# Quick check
+cat("\nAvailable pathways:\n")
+print(cc_127@netP$pathways)
+```
+Visualize 1 sample:
+```{r}
+# ============================================================
+# VISUALIZE SAMPLE 127
+# ============================================================
+cellchat <- cc_127
+
+# Color scheme
+interface_colors <- c(
+  "Tumor"           = "#E377C2",
+  "Epithelial"      = "#FFB6C1",
+  "CAF"             = "#2CA02C",
+  "CD4_T"           = "#FF7F0E",
+  "Macrophage"      = "#1F77B4",
+  "DC"              = "#6BAED6",
+  "Granulocyte"     = "#C49C94",
+  "Endothelial"     = "#17BECF",
+  "Pericyte"        = "#BCBD22",
+  "Smooth_muscle"   = "#8C564B"
+)
+
+present_types <- levels(cellchat@idents)
+colors_use <- interface_colors[intersect(names(interface_colors), present_types)]
+
+# --- 1. Overall network ---
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 color.use = colors_use,
+                 title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 color.use = colors_use,
+                 title.name = "Interaction strength")
+
+# --- 2. Heatmaps ---
+netVisual_heatmap(cellchat, measure = "count", color.heatmap = "Blues")
+netVisual_heatmap(cellchat, measure = "weight", color.heatmap = "Reds")
+
+# --- 3. Your core question: Tumor/CAF → Immune ---
+netVisual_bubble(cellchat,
+                 sources.use = c("Tumor", "CAF"),
+                 targets.use = c("CD4_T", "Macrophage", "DC"),
+                 remove.isolate = TRUE,
+                 title.name = "Tumor/CAF → Immune")
+
+# --- 4. Immune → Tumor/CAF ---
+netVisual_bubble(cellchat,
+                 sources.use = c("CD4_T", "Macrophage", "DC"),
+                 targets.use = c("Tumor", "CAF"),
+                 remove.isolate = TRUE,
+                 title.name = "Immune → Tumor/CAF")
+
+# --- 5. Key pathways for your question ---
+key_pathways <- intersect(
+  c("TGFb", "CXCL", "CCL", "VEGF", "MIF", "SPP1", 
+    "COMPLEMENT", "CSF", "IL1", "IL2", "EGF", "PDGF"),
+  cellchat@netP$pathways
+)
+
+for (pw in key_pathways) {
+  tryCatch({
+    par(mfrow = c(1, 1))
+    netVisual_aggregate(cellchat, signaling = pw, layout = "circle",
+                        color.use = colors_use)
+    title(main = pw)
+  }, error = function(e) cat("  Could not plot:", pw, "\n"))
+}
+
+# --- 6. Signaling roles: who sends vs receives ---
+netAnalysis_signalingRole_scatter(cellchat, color.use = colors_use)
+
+# --- 7. Top senders and receivers ---
+netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing", 
+                                  color.use = colors_use)
+netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming", 
+                                  color.use = colors_use)
+```
+
+
+Part 5: Process All 41 Samples
+```{r}
+# ============================================================
+# PROCESS ALL SAMPLES
+# ============================================================
+cellchat_list  <- list()
+failed_samples <- c()
+
+for (sid in sample_ids) {
+  tryCatch({
+    
+    prep <- load_and_prepare_sample(
+      sample_id              = sid,
+      base_dir               = base_dir,
+      min_spots_per_type     = 10,
+      immune_rescue_threshold = 0.10,
+      max_spots_per_type     = 500
+    )
+    
+    cc <- run_cellchat_sample(prep, min_cells = 10)
+    
+    cellchat_list[[sid]] <- cc
+    saveRDS(cc, file.path(output_dir, paste0("cellchat_", sid, ".rds")))
+    
+    cat("✓ Sample", sid, "complete\n")
+    
+  }, error = function(e) {
+    cat("✗ Sample", sid, "FAILED:", conditionMessage(e), "\n")
+    failed_samples <<- c(failed_samples, sid)
+  })
+}
+
+saveRDS(cellchat_list, file.path(output_dir, "cellchat_all_samples.rds"))
+
+cat("\n========================================\n")
+cat("Completed:", length(cellchat_list), "of", length(sample_ids), "samples\n")
+if (length(failed_samples) > 0) {
+  cat("Failed:", paste(failed_samples, collapse = ", "), "\n")
+}
+```
+
+
+Part 6: Single-Sample Visualization (Immune–Fibroblast–Tumor Focus)
+```{r}
+# ============================================================
+# VISUALIZE SAMPLE 127
+# ============================================================
+cellchat <- cc_127
+
+# Color scheme for your biological question
+interface_colors <- c(
+  "Tumor"           = "#E377C2",
+  "Epithelial"      = "#FFB6C1",
+  "CAF"             = "#2CA02C",
+  "Fibroblast"      = "#98DF8A",
+  "Myofibroblast"   = "#006400",
+  "CD8_T"           = "#D62728",
+  "CD8_T_exhausted" = "#8B0000",
+  "CD4_T"           = "#FF7F0E",
+  "Treg"            = "#FFD700",
+  "Macrophage"      = "#1F77B4",
+  "DC"              = "#6BAED6",
+  "B_cell"          = "#AEC7E8",
+  "Plasma"          = "#9467BD",
+  "Mast"            = "#C5B0D5",
+  "Granulocyte"     = "#C49C94",
+  "gdT"             = "#DBDB8D",
+  "NK"              = "#E7969C",
+  "Other_T"         = "#7F7F7F",
+  "ILC"             = "#C7C7C7",
+  "Endothelial"     = "#17BECF",
+  "Pericyte"        = "#BCBD22",
+  "Smooth_muscle"   = "#8C564B",
+  "Schwann"         = "#9EDAE5"
+)
+
+present_types <- levels(cellchat@idents)
+colors_use    <- interface_colors[intersect(names(interface_colors), present_types)]
+
+# --- 1. Network overview ---
+groupSize <- as.numeric(table(cellchat@idents))
+
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 color.use = colors_use,
+                 title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 color.use = colors_use,
+                 title.name = "Interaction strength")
+
+# --- 2. Sender-focused views ---
+mat <- cellchat@net$weight
+par(mfrow = c(2, 2), xpd = TRUE)
+
+for (sender in c("Tumor", "CAF", "CD8_T", "Macrophage")) {
+  if (sender %in% rownames(mat)) {
+    mat_focus <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+    mat_focus[sender, ] <- mat[sender, ]
+    netVisual_circle(mat_focus, vertex.weight = groupSize, weight.scale = TRUE,
+                     edge.weight.max = max(mat), color.use = colors_use,
+                     title.name = paste(sender, "as sender"))
+  }
+}
+
+# --- 3. Heatmaps ---
+netVisual_heatmap(cellchat, measure = "count", color.heatmap = "Blues")
+netVisual_heatmap(cellchat, measure = "weight", color.heatmap = "Reds")
+
+# --- 4. Bubble plots: your core question ---
+sources_tumor_caf <- intersect(c("Tumor", "CAF", "Fibroblast", "Myofibroblast"), present_types)
+targets_immune    <- intersect(c("CD8_T", "CD8_T_exhausted", "CD4_T", "Treg",
+                                  "Macrophage", "DC"), present_types)
+
+if (length(sources_tumor_caf) > 0 & length(targets_immune) > 0) {
+  netVisual_bubble(cellchat,
+                   sources.use = sources_tumor_caf,
+                   targets.use = targets_immune,
+                   remove.isolate = TRUE,
+                   title.name = "Tumor/Fibroblast → Immune")
+}
+
+if (length(targets_immune) > 0 & length(sources_tumor_caf) > 0) {
+  netVisual_bubble(cellchat,
+                   sources.use = targets_immune,
+                   targets.use = sources_tumor_caf,
+                   remove.isolate = TRUE,
+                   title.name = "Immune → Tumor/Fibroblast")
+}
+
+# --- 5. Key pathways ---
+available_pw <- cellchat@netP$pathways
+cat("Active pathways:\n")
+print(available_pw)
+
+# Immune-relevant pathway groups to check
+pw_groups <- list(
+  "Chemokine"       = c("CXCL", "CCL", "CX3C"),
+  "Immunosuppressive" = c("TGFb", "IL10", "VEGF"),
+  "Activation"      = c("TNF", "IFN-II", "IL2", "IL6", "IL1"),
+  "Growth"          = c("EGF", "FGF", "PDGF", "HGF", "WNT"),
+  "ECM"             = c("COLLAGEN", "LAMININ", "FN1", "PERIOSTIN")
+)
+
+for (grp_name in names(pw_groups)) {
+  hits <- intersect(pw_groups[[grp_name]], available_pw)
+  if (length(hits) > 0) {
+    cat("\n---", grp_name, "pathways:", paste(hits, collapse = ", "), "---\n")
+    for (pw in hits) {
+      tryCatch({
+        par(mfrow = c(1, 1))
+        netVisual_aggregate(cellchat, signaling = pw, layout = "circle",
+                           color.use = colors_use)
+        title(main = paste(grp_name, ":", pw))
+      }, error = function(e) cat("  Could not plot:", pw, "\n"))
+    }
+  }
+}
+
+# --- 6. Signaling roles ---
+par(mfrow = c(1, 1))
+netAnalysis_signalingRole_scatter(cellchat, color.use = colors_use)
+
+# --- 7. Outgoing and incoming signaling patterns ---
+netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing",
+                                  color.use = colors_use)
+netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming",
+                                  color.use = colors_use)
+
+# --- 8. Spatial gene features ---
+# Checkpoint and immune markers — examined directly since Cell-Cell
+# Contact signaling was omitted from the CellChat DB for runtime
+spatialFeaturePlot(cellchat,
+                   features = c("CD8A", "GZMB", "PDCD1", "CTLA4",
+                                "FAP", "ACTA2", "EPCAM", "CXCL13",
+                                "TGFB1", "IL10", "IFNG", "TNF"),
+                   point.size = 0.8, color.heatmap = "Reds",
+                   direction = 1, ncol = 4)
+```
+
+
+Part 7: Multi-Sample Comparison (41 SAMPLES)
+```{r}
+# ============================================================
+# GROUP SAMPLES USING CLINICAL METADATA
+# ============================================================
+processed_ids <- names(cellchat_list)
+clin_sub <- clinical[clinical$deident %in% processed_ids, ]
+
+# --- MMR status (dMMR vs pMMR) ---
+# dMMR = loss of MLH1 or PMS2 (MLH1=0 or PMS2=0)
+clin_sub$MMR_status <- ifelse(clin_sub$MLH1 == 0 | clin_sub$PMS2 == 0,
+                               "dMMR", "pMMR")
+cat("MMR status:\n"); print(table(clin_sub$MMR_status))
+
+# --- Metastatic status (matching your Python grouping) ---
+clin_sub$met_group <- case_when(
+  clin_sub$Distant_Mets == TRUE | clin_sub$Distant_Mets == "TRUE" ~ "Distant_Mets",
+  clin_sub$ln_only == TRUE | clin_sub$ln_only == "TRUE"           ~ "LN_Mets",
+  TRUE                                                             ~ "No_Mets"
+)
+cat("\nMetastasis group:\n"); print(table(clin_sub$met_group))
+
+# --- Tumor site ---
+clin_sub$site_group <- case_when(
+  grepl("Right|Cecum|Hepatic|Transverse", clin_sub$site, ignore.case = TRUE) ~ "Right_colon",
+  grepl("Left|Sigmoid|Splenic", clin_sub$site, ignore.case = TRUE)           ~ "Left_colon",
+  grepl("Rectum", clin_sub$site, ignore.case = TRUE)                          ~ "Rectum",
+  TRUE ~ "Other"
+)
+cat("\nSite group:\n"); print(table(clin_sub$site_group))
+
+# --- Grade ---
+cat("\nGrade:\n"); print(table(clin_sub$Grade))
+
+# ============================================================
+# COMPARISON FUNCTION
+# ============================================================
+compare_groups <- function(cc_list, group_a_ids, group_b_ids,
+                           group_names = c("Group_A", "Group_B")) {
+  
+  # Keep only IDs that exist in our CellChat list
+  group_a_ids <- intersect(group_a_ids, names(cc_list))
+  group_b_ids <- intersect(group_b_ids, names(cc_list))
+  
+  cat("Group", group_names[1], ":", length(group_a_ids), "samples\n")
+  cat("Group", group_names[2], ":", length(group_b_ids), "samples\n")
+  
+  if (length(group_a_ids) < 2 | length(group_b_ids) < 2) {
+    stop("Need at least 2 samples per group")
+  }
+  
+  # Get all cell types across both groups
+  all_types <- unique(unlist(lapply(cc_list[c(group_a_ids, group_b_ids)],
+                                    function(cc) levels(cc@idents))))
+  
+  # Lift all objects to same cell type universe
+  lifted_a <- lapply(group_a_ids, function(sid) {
+    liftCellChat(cc_list[[sid]], group.new = all_types)
+  })
+  names(lifted_a) <- group_a_ids
+  
+  lifted_b <- lapply(group_b_ids, function(sid) {
+    liftCellChat(cc_list[[sid]], group.new = all_types)
+  })
+  names(lifted_b) <- group_b_ids
+  
+  # Merge within groups
+  cc_a <- mergeCellChat(lifted_a, add.names = group_a_ids)
+  cc_b <- mergeCellChat(lifted_b, add.names = group_b_ids)
+  
+  # Compare
+  cc_compare <- mergeCellChat(list(cc_a, cc_b), add.names = group_names)
+  
+  return(cc_compare)
+}
+```
+
+Run Key Comparisons:
+```{r}
+# ============================================================
+# COMPARISON 1: dMMR vs pMMR
+# Most biologically interesting — dMMR tumors have higher immune
+# infiltration and respond better to checkpoint immunotherapy
+# ============================================================
+dmmr_ids <- clin_sub$deident[clin_sub$MMR_status == "dMMR"]
+pmmr_ids <- clin_sub$deident[clin_sub$MMR_status == "pMMR"]
+
+cat("dMMR samples:", length(dmmr_ids), "\n")
+cat("pMMR samples:", length(pmmr_ids), "\n")
+
+if (length(intersect(dmmr_ids, processed_ids)) >= 2 &
+    length(intersect(pmmr_ids, processed_ids)) >= 2) {
+  
+  cc_mmr <- compare_groups(cellchat_list, dmmr_ids, pmmr_ids,
+                           group_names = c("dMMR", "pMMR"))
+  
+  # Visualize
+  compareInteractions(cc_mmr, show.legend = TRUE, group = c(1, 2))
+  compareInteractions(cc_mmr, show.legend = TRUE, group = c(1, 2), measure = "weight")
+  
+  netVisual_heatmap(cc_mmr, measure = "weight",
+                    color.heatmap = c("#2166AC", "#B2182B"))
+  
+  rankNet(cc_mmr, mode = "comparison", measure = "weight",
+          stacked = FALSE, do.stat = TRUE)
+  
+  # Signaling changes in key cell types
+  for (ct in c("Tumor", "CAF", "CD8_T", "Macrophage", "Treg")) {
+    tryCatch({
+      netAnalysis_signalingChanges_scatter(cc_mmr, idents.use = ct)
+      title(main = paste("Signaling changes:", ct))
+    }, error = function(e) cat("  Cannot plot for:", ct, "\n"))
+  }
+  
+  # Bubble comparison
+  netVisual_bubble(cc_mmr,
+                   sources.use = c("Tumor", "CAF"),
+                   targets.use = c("CD8_T", "CD8_T_exhausted", "Treg", "Macrophage"),
+                   comparison = c(1, 2), max.dataset = 2,
+                   remove.isolate = TRUE,
+                   title.name = "dMMR vs pMMR: Tumor/CAF → Immune")
+  
+  saveRDS(cc_mmr, file.path(output_dir, "comparison_dMMR_vs_pMMR.rds"))
+}
+
+# ============================================================
+# COMPARISON 2: Metastatic status (matching your Python analysis)
+# ============================================================
+distant_ids <- clin_sub$deident[clin_sub$met_group == "Distant_Mets"]
+nomets_ids  <- clin_sub$deident[clin_sub$met_group == "No_Mets"]
+
+if (length(intersect(distant_ids, processed_ids)) >= 2 &
+    length(intersect(nomets_ids, processed_ids)) >= 2) {
+  
+  cc_met <- compare_groups(cellchat_list, distant_ids, nomets_ids,
+                           group_names = c("Distant_Mets", "No_Mets"))
+  
+  compareInteractions(cc_met, show.legend = TRUE, group = c(1, 2))
+  rankNet(cc_met, mode = "comparison", measure = "weight",
+          stacked = FALSE, do.stat = TRUE)
+  
+  saveRDS(cc_met, file.path(output_dir, "comparison_DistantMets_vs_NoMets.rds"))
+}
+
+# ============================================================
+# COMPARISON 3: Right colon vs Left colon/Rectum
+# ============================================================
+right_ids <- clin_sub$deident[clin_sub$site_group == "Right_colon"]
+left_ids  <- clin_sub$deident[clin_sub$site_group %in% c("Left_colon", "Rectum")]
+
+if (length(intersect(right_ids, processed_ids)) >= 2 &
+    length(intersect(left_ids, processed_ids)) >= 2) {
+  
+  cc_site <- compare_groups(cellchat_list, right_ids, left_ids,
+                            group_names = c("Right_colon", "Left_colon_Rectum"))
+  
+  compareInteractions(cc_site, show.legend = TRUE, group = c(1, 2))
+  rankNet(cc_site, mode = "comparison", measure = "weight",
+          stacked = FALSE, do.stat = TRUE)
+  
+  saveRDS(cc_site, file.path(output_dir, "comparison_Right_vs_Left.rds"))
+}
+```
+
+Part 8: Comparative Visualization
+```{r}
+# ============================================================
+# EXTRACT METRICS FOR STATISTICAL ANALYSIS
+# ============================================================
+summary_list <- lapply(names(cellchat_list), function(sid) {
+  
+  cc    <- cellchat_list[[sid]]
+  net_w <- cc@net$weight
+  net_c <- cc@net$count
+  
+  safe_extract <- function(source, target, mat) {
+    if (source %in% rownames(mat) & target %in% colnames(mat)) {
+      return(mat[source, target])
+    }
+    return(NA_real_)
+  }
+  
+  data.frame(
+    sample_id          = sid,
+    n_spots            = ncol(cc@data),
+    n_cell_types       = length(levels(cc@idents)),
+    total_interactions = sum(net_c),
+    total_strength     = sum(net_w),
+    
+    tumor_to_cd8         = safe_extract("Tumor", "CD8_T", net_w),
+    tumor_to_cd8exh      = safe_extract("Tumor", "CD8_T_exhausted", net_w),
+    tumor_to_treg        = safe_extract("Tumor", "Treg", net_w),
+    tumor_to_caf         = safe_extract("Tumor", "CAF", net_w),
+    tumor_to_macrophage  = safe_extract("Tumor", "Macrophage", net_w),
+    
+    caf_to_cd8           = safe_extract("CAF", "CD8_T", net_w),
+    caf_to_cd8exh        = safe_extract("CAF", "CD8_T_exhausted", net_w),
+    caf_to_treg          = safe_extract("CAF", "Treg", net_w),
+    caf_to_tumor         = safe_extract("CAF", "Tumor", net_w),
+    caf_to_macrophage    = safe_extract("CAF", "Macrophage", net_w),
+    
+    cd8_to_tumor         = safe_extract("CD8_T", "Tumor", net_w),
+    macrophage_to_cd8    = safe_extract("Macrophage", "CD8_T", net_w),
+    macrophage_to_treg   = safe_extract("Macrophage", "Treg", net_w),
+    
+    stringsAsFactors = FALSE
+  )
+})
+
+interaction_summary <- do.call(rbind, summary_list)
+
+# Merge with clinical data
+interaction_clinical <- merge(
+  interaction_summary,
+  clin_sub[, c("deident", "Grade", "MMR_status", "met_group", "site_group",
+               "node_stage", "age", "sex", "Death_from_cancer")],
+  by.x = "sample_id", by.y = "deident",
+  all.x = TRUE
+)
+
+write.csv(interaction_clinical,
+          file.path(output_dir, "interaction_summary_with_clinical.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# VISUALIZE KEY INTERACTIONS BY MMR STATUS
+# ============================================================
+plot_cols <- c("tumor_to_cd8", "tumor_to_treg", "caf_to_cd8",
+               "caf_to_tumor", "cd8_to_tumor", "caf_to_macrophage")
+
+plot_df <- interaction_clinical %>%
+  select(sample_id, MMR_status, all_of(plot_cols)) %>%
+  pivot_longer(cols = all_of(plot_cols),
+               names_to = "interaction", values_to = "strength") %>%
+  filter(!is.na(strength), !is.na(MMR_status))
+
+ggplot(plot_df, aes(x = interaction, y = strength, fill = MMR_status)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, position = position_dodge(0.75)) +
+  geom_jitter(aes(color = MMR_status),
+              position = position_jitterdodge(jitter.width = 0.15),
+              size = 1, alpha = 0.5) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+  labs(title = "Immune–Tumor–Fibroblast interactions by MMR status",
+       y = "Interaction strength", x = "") +
+  scale_fill_manual(values = c("dMMR" = "#E41A1C", "pMMR" = "#377EB8")) +
+  scale_color_manual(values = c("dMMR" = "#E41A1C", "pMMR" = "#377EB8"))
+
+# ============================================================
+# STATISTICAL TESTS
+# ============================================================
+cat("\n=== Wilcoxon tests: dMMR vs pMMR ===\n")
+for (col in plot_cols) {
+  vals_a <- interaction_clinical[[col]][interaction_clinical$MMR_status == "dMMR"]
+  vals_b <- interaction_clinical[[col]][interaction_clinical$MMR_status == "pMMR"]
+  vals_a <- vals_a[!is.na(vals_a)]
+  vals_b <- vals_b[!is.na(vals_b)]
+  
+  if (length(vals_a) >= 2 & length(vals_b) >= 2) {
+    wt <- wilcox.test(vals_a, vals_b)
+    cat(sprintf("  %-25s p = %.4f  (dMMR median: %.4f, pMMR median: %.4f)\n",
+                col, wt$p.value, median(vals_a), median(vals_b)))
+  }
+}
+```
+
+
+Part 9: Quantitative Summary Across All 41 Samples
+```{r}
+# ============================================================
+# PART 9: EXTRACT QUANTITATIVE METRICS ACROSS ALL SAMPLES
+# Updated to match corrected cell type labels from obsm extraction
+# ============================================================
+
+summary_list <- lapply(names(cellchat_list), function(sid) {
+  
+  cc <- cellchat_list[[sid]]
+  net_count  <- cc@net$count
+  net_weight <- cc@net$weight
+  present    <- levels(cc@idents)
+  
+  total_count  <- sum(net_count)
+  total_weight <- sum(net_weight)
+  
+  # Safe extraction helper
+  extract_interaction <- function(source, target, mat) {
+    if (source %in% rownames(mat) & target %in% colnames(mat)) {
+      return(mat[source, target])
+    } else {
+      return(NA_real_)
+    }
+  }
+  
+  data.frame(
+    sample_id          = sid,
+    n_spots            = ncol(cc@data),
+    n_cell_types       = length(present),
+    cell_types_present = paste(present, collapse = ";"),
+    total_interactions = total_count,
+    total_strength     = total_weight,
+    
+    # --- TUMOR → IMMUNE ---
+    tumor_to_cd8         = extract_interaction("Tumor", "CD8_T", net_weight),
+    tumor_to_cd8exh      = extract_interaction("Tumor", "CD8_T_exhausted", net_weight),
+    tumor_to_treg        = extract_interaction("Tumor", "Treg", net_weight),
+    tumor_to_cd4         = extract_interaction("Tumor", "CD4_T", net_weight),
+    tumor_to_macrophage  = extract_interaction("Tumor", "Macrophage", net_weight),
+    tumor_to_dc          = extract_interaction("Tumor", "DC", net_weight),
+    
+    # --- CAF/FIBROBLAST → IMMUNE ---
+    caf_to_cd8           = extract_interaction("CAF", "CD8_T", net_weight),
+    caf_to_cd8exh        = extract_interaction("CAF", "CD8_T_exhausted", net_weight),
+    caf_to_treg          = extract_interaction("CAF", "Treg", net_weight),
+    caf_to_macrophage    = extract_interaction("CAF", "Macrophage", net_weight),
+    caf_to_tumor         = extract_interaction("CAF", "Tumor", net_weight),
+    fibroblast_to_cd8    = extract_interaction("Fibroblast", "CD8_T", net_weight),
+    myofibro_to_cd8      = extract_interaction("Myofibroblast", "CD8_T", net_weight),
+    
+    # --- IMMUNE → TUMOR/CAF ---
+    cd8_to_tumor         = extract_interaction("CD8_T", "Tumor", net_weight),
+    cd8exh_to_tumor      = extract_interaction("CD8_T_exhausted", "Tumor", net_weight),
+    macrophage_to_cd8    = extract_interaction("Macrophage", "CD8_T", net_weight),
+    macrophage_to_treg   = extract_interaction("Macrophage", "Treg", net_weight),
+    dc_to_cd8            = extract_interaction("DC", "CD8_T", net_weight),
+    treg_to_cd8          = extract_interaction("Treg", "CD8_T", net_weight),
+    
+    # --- TUMOR ↔ STROMA ---
+    tumor_to_caf         = extract_interaction("Tumor", "CAF", net_weight),
+    tumor_to_endothelial = extract_interaction("Tumor", "Endothelial", net_weight),
+    
+    stringsAsFactors = FALSE
+  )
+})
+
+interaction_summary <- do.call(rbind, summary_list)
+
+# ============================================================
+# MERGE WITH CLINICAL DATA
+# ============================================================
+clinical <- read.csv(meta_path, stringsAsFactors = FALSE)
+clinical$deident <- as.character(clinical$deident)
+
+# Create clinical groupings
+clinical$MMR_status <- ifelse(clinical$MLH1 == 0 | clinical$PMS2 == 0, "dMMR", "pMMR")
+clinical$met_group  <- case_when(
+  clinical$Distant_Mets == TRUE | clinical$Distant_Mets == "TRUE" ~ "Distant_Mets",
+  clinical$ln_only == TRUE | clinical$ln_only == "TRUE"           ~ "LN_Mets",
+  TRUE                                                             ~ "No_Mets"
+)
+
+interaction_clinical <- merge(
+  interaction_summary,
+  clinical[, c("deident", "Grade", "MMR_status", "met_group",
+               "node_stage", "age", "sex", "site",
+               "Distant_Mets", "Death_from_cancer")],
+  by.x = "sample_id", by.y = "deident",
+  all.x = TRUE
+)
+
+write.csv(interaction_clinical,
+          file.path(output_dir, "interaction_summary_with_clinical.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# VISUALIZE: Boxplots by MMR status
+# ============================================================
+library(tidyr)
+library(ggplot2)
+
+plot_cols <- c("tumor_to_cd8", "tumor_to_cd8exh", "tumor_to_treg",
+               "caf_to_cd8", "caf_to_tumor", "cd8_to_tumor",
+               "caf_to_macrophage", "macrophage_to_cd8")
+
+plot_df <- interaction_clinical %>%
+  select(sample_id, MMR_status, all_of(plot_cols)) %>%
+  pivot_longer(cols = all_of(plot_cols),
+               names_to = "interaction", values_to = "strength") %>%
+  filter(!is.na(strength), !is.na(MMR_status))
+
+ggplot(plot_df, aes(x = interaction, y = strength, fill = MMR_status)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, position = position_dodge(0.75)) +
+  geom_jitter(aes(color = MMR_status),
+              position = position_jitterdodge(jitter.width = 0.15),
+              size = 1, alpha = 0.5) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9)) +
+  labs(title = "Immune–Tumor–Fibroblast interactions: dMMR vs pMMR",
+       subtitle = paste0("N = ", nrow(interaction_summary), " samples"),
+       y = "Interaction strength", x = "") +
+  scale_fill_manual(values = c("dMMR" = "#E41A1C", "pMMR" = "#377EB8")) +
+  scale_color_manual(values = c("dMMR" = "#E41A1C", "pMMR" = "#377EB8"))
+
+# ============================================================
+# VISUALIZE: Boxplots by Metastatic status
+# ============================================================
+plot_df_met <- interaction_clinical %>%
+  select(sample_id, met_group, all_of(plot_cols)) %>%
+  pivot_longer(cols = all_of(plot_cols),
+               names_to = "interaction", values_to = "strength") %>%
+  filter(!is.na(strength), !is.na(met_group))
+
+ggplot(plot_df_met, aes(x = interaction, y = strength, fill = met_group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, position = position_dodge(0.75)) +
+  geom_jitter(aes(color = met_group),
+              position = position_jitterdodge(jitter.width = 0.15),
+              size = 1, alpha = 0.5) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9)) +
+  labs(title = "Immune–Tumor–Fibroblast interactions by Metastatic Status",
+       y = "Interaction strength", x = "") +
+  scale_fill_manual(values = c("No_Mets" = "#00AFBB", "LN_Mets" = "#E7B800", 
+                                "Distant_Mets" = "#FC4E07")) +
+  scale_color_manual(values = c("No_Mets" = "#00AFBB", "LN_Mets" = "#E7B800", 
+                                 "Distant_Mets" = "#FC4E07"))
+
+# ============================================================
+# STATISTICAL TESTS
+# ============================================================
+cat("\n=== Wilcoxon tests: dMMR vs pMMR ===\n")
+for (col in plot_cols) {
+  vals_dmmr <- interaction_clinical[[col]][interaction_clinical$MMR_status == "dMMR"]
+  vals_pmmr <- interaction_clinical[[col]][interaction_clinical$MMR_status == "pMMR"]
+  vals_dmmr <- vals_dmmr[!is.na(vals_dmmr)]
+  vals_pmmr <- vals_pmmr[!is.na(vals_pmmr)]
+  
+  if (length(vals_dmmr) >= 2 & length(vals_pmmr) >= 2) {
+    wt <- wilcox.test(vals_dmmr, vals_pmmr)
+    cat(sprintf("  %-25s p = %.4f  (dMMR med: %.4f, pMMR med: %.4f)\n",
+                col, wt$p.value, median(vals_dmmr), median(vals_pmmr)))
+  } else {
+    cat(sprintf("  %-25s SKIPPED (insufficient data)\n", col))
+  }
+}
+
+cat("\n=== Kruskal-Wallis: Metastatic groups ===\n")
+for (col in plot_cols) {
+  groups <- split(interaction_clinical[[col]], interaction_clinical$met_group)
+  groups <- lapply(groups, function(x) x[!is.na(x)])
+  groups <- groups[sapply(groups, length) >= 2]
+  
+  if (length(groups) >= 2) {
+    kt <- kruskal.test(groups)
+    cat(sprintf("  %-25s p = %.4f\n", col, kt$p.value))
+  }
+}
+
+# ============================================================
+# PATHWAY-LEVEL SUMMARY
+# ============================================================
+pathway_summary <- lapply(names(cellchat_list), function(sid) {
+  cc <- cellchat_list[[sid]]
+  if (is.null(cc@netP$prob)) return(NULL)
+  
+  pathways <- dimnames(cc@netP$prob)[[3]]
+  
+  pw_data <- lapply(pathways, function(pw) {
+    tryCatch({
+      prob_mat <- cc@netP$prob[,,pw]
+      data.frame(
+        sample_id  = sid,
+        pathway    = pw,
+        total_prob = sum(prob_mat, na.rm = TRUE),
+        stringsAsFactors = FALSE
+      )
+    }, error = function(e) NULL)
+  })
+  
+  do.call(rbind, pw_data)
+})
+
+pathway_df <- do.call(rbind, pathway_summary)
+
+top_pathways <- pathway_df %>%
+  group_by(pathway) %>%
+  summarise(
+    mean_prob        = mean(total_prob, na.rm = TRUE),
+    median_prob      = median(total_prob, na.rm = TRUE),
+    n_samples_active = sum(total_prob > 0)
+  ) %>%
+  arrange(desc(mean_prob)) %>%
+  head(20)
+
+cat("\nTop 20 active pathways across all samples:\n")
+print(top_pathways)
+
+# Save pathway data
+write.csv(pathway_df, file.path(output_dir, "pathway_summary_all_samples.csv"),
+          row.names = FALSE)
+```
+
+
+Part 10: Save Everything and Launch Explorer
+```{r}
+# ============================================================
+# PART 10: SAVE AND EXPLORE
+# ============================================================
+
+# Save everything
+saveRDS(cellchat_list, file.path(output_dir, "cellchat_all_41_samples.rds"))
+saveRDS(interaction_summary, file.path(output_dir, "interaction_summary.rds"))
+saveRDS(interaction_clinical, file.path(output_dir, "interaction_clinical.rds"))
+saveRDS(pathway_df, file.path(output_dir, "pathway_summary.rds"))
+
+cat("\nAll results saved to:", output_dir, "\n")
+cat("Files:\n")
+print(list.files(output_dir))
+
+# --- Interactive exploration ---
+cellchat_explore <- cellchat_list[["127"]]
+runCellChatApp(cellchat_explore)
+```

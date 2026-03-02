@@ -1,0 +1,1589 @@
+---
+title: "Single_Cell_analysis"
+author: "Alos Diallo"
+date: "2025-08-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading data previously processed:
+```{r}
+combined_data = readRDS(file= "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Single_cell/Single_cell_samples/Single\ Cell/combined_data.rds")
+
+analysis_outputs <- "/Users/adiallo/Desktop/Thesis/Results"
+```
+
+
+
+Build biologically-meaningful "program" gene sets
+```{r}
+###############################################################################
+# PURPOSE
+# -------
+# Build atlas-driven program gene sets and score with UCell; export
+# patient-level summaries. Then derive Tex↑/Tex↓ within CD8 **without**
+# pseudotime and **without** mixed models by using within-patient Spearman
+# correlations and Stouffer meta-analysis across patients.
+#
+# NEW:
+# - Adds Treg program(s):
+#     1) Treg_suppressive   (atlas-driven from cTNI08/cTNI09)
+#     2) Treg_cytokine_IL10_TGFB_IL35 (curated fallback panel; optional)
+###############################################################################
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr); library(purrr); library(stringr)
+  library(tibble); library(readr); library(UCell); library(Matrix); library(stats)
+})
+
+# ---------------------------
+# 0) Inputs, labels, QC covars
+# ---------------------------
+srt <- combined_data
+srt$atlas_label <- srt$predicted.id
+
+# Broad class mapping (unchanged; truncated to save space)
+label_to_class <- c(
+  "cB2 (B GC-like)"="B cells","cB3 (B CD40+ GC-like)"="B cells","cB1 (B IGD+IgM+)"="B cells",
+  "cP1 (Plasma IgA)"="Plasma cells","cP2 (Plasma IgG)"="Plasma cells","cP3 (Plasma IgG prolif)"="Plasma cells",
+  "cMA01 (Mast)"="Mast cells","cM01 (Monocyte)"="Monocytes","cM02 (Macrophage-like)"="Macrophages",
+  "cM03 (DC1)"="Dendritic cells","cM04 (DC2)"="Dendritic cells","cM05 (DC2 C1Q+)"="Dendritic cells",
+  "cM06 (DC IL22RA2)"="Dendritic cells","cM07 (pDC)"="Dendritic cells","cM08 (AS-DC)"="Dendritic cells",
+  "cM09 (mregDC)"="Dendritic cells","cM10 (Granulocyte)"="Granulocytes",
+  "cTNI01 (CD4+ IL7R+)"="CD4+ T-cells","cTNI02 (CD4+ IL7R+SELL+)"="CD4+ T-cells",
+  "cTNI03 (CD4+ IL7R+HSP+)"="CD4+ T-cells","cTNI04 (CD4+ IL7R+CCL5+)"="CD4+ T-cells",
+  "cTNI05 (CD4+ IL17+)"="CD4+ T-cells","cTNI06 (CD4+ TFH)"="TFH cells","cTNI07 (CD4+ CXCL13+)"="CD4+ T-cells",
+  "cTNI08 (CD4+ Treg)"="Treg","cTNI09 (CD4+ Treg prolif)"="Treg",
+  "cTNI10 (CD8+ IL7R+)"="CD8+ T-cells","cTNI11 (CD8+GZMK+)"="CD8+ T-cells",
+  "cTNI12 (CD8+ IL7R+)"="CD8+ T-cells","cTNI13 (CD8+ T IL17+)"="CD8+ T-cells",
+  "cTNI14 (CD8+ CXCL13+)"="CD8+ T-cells","cTNI15 (CD8+ CXCL13+ HSP+)"="CD8+ T-cells",
+  "cTNI16 (CD8+ CXCL13+ prolif)"="CD8+ T-cells","cTNI17 (gd-like T)"="γδ T-cells",
+  "cTNI18 (gd-like T PDCD1+)"="γδ T-cells","cTNI19 (gd-like T prolif)"="γδ T-cells",
+  "cTNI20 (PLZF+ T)"="iNKT cells","cTNI21 (PLZF+ T prolif)"="MAIT cells","cTNI22 (cTNI22)"="T cells (other)",
+  "cTNI23 (NK CD16A+)"="NK cells","cTNI24 (NK GZMK+)"="NK cells","cTNI25 (NK XCL1+)"="NK cells",
+  "cTNI26 (ILC3)"="Innate lymphoid cells",
+  "cE01 (Stem/TA-like)"="Tumor cells","cE02 (Stem/TA-like/Immature Goblet)"="Tumor cells",
+  "cE03 (Stem/TA-like prolif)"="Tumor cells","cE04 (Enterocyte 1)"="Tumor cells","cE05 (Enterocyte 2)"="Tumor cells",
+  "cE06 (Immature Goblet)"="Tumor cells","cE07 (Goblet/Enterocyte)"="Goblet cells","cE08 (Goblet)"="Goblet cells",
+  "cE09 (Best4)"="Goblet cells","cE10 (Tuft)"="Tuft cells","cE11 (Enteroendocrine)"="Enteroendocrine cells",
+  "cS01 (Endo arterial)"="Endothelial cells","cS02 (Endo capillary)"="Endothelial cells",
+  "cS03 (Endo capillary)"="Endothelial cells","cS04 (Endo)"="Endothelial cells","cS05 (Endo venous)"="Endothelial cells",
+  "cS06 (Endo lymphatic)"="Endothelial cells","cS07 (Endo capillary-like)"="Endothelial cells",
+  "cS08 (Endo arterial-like)"="Endothelial cells","cS09 (Endo)"="Endothelial cells","cS10 (Endo tip cells)"="Endothelial cells",
+  "cS11 (Endo proif)"="Endothelial cells","cS12 (Endo)"="Endothelial cells","cS13 (Endo venous-like)"="Endothelial cells",
+  "cS14 (Endo)"="Endothelial cells","cS15 (Pericyte)"="Pericytes","cS16 (Pericyte)"="Pericytes","cS17 (Pericyte)"="Pericytes",
+  "cS18 (Pericyte)"="Pericytes","cS19 (Pericyte)"="Pericytes","cS20 (Pericyte prolif)"="Pericytes",
+  "cS21 (Fibro stem cell niche)"="CAF_stem_niche","cS22 (Fibro stem cell niche)"="CAF_stem_niche",
+  "cS23 (Fibro BMP-producing)"="CAF_stem_niche","cS24 (Fibro BMP-producing)"="CAF_stem_niche",
+  "cS25 (Fibro CCL8+)"="iCAF","cS26 (Myofibro)"="mCAF","cS27 (CXCL14+ CAF)"="CAF",
+  "cS28 (GREM1+ CAF)"="mCAF","cS29 (MMP3+ CAF)"="mCAF","cS30 (CAF CCL8 Fibro-like)"="iCAF",
+  "cS31 (CAF stem niche Fibro-like)"="CAF_stem_niche","cS32 (Smooth Muscle)"="Smooth muscle cells","cS33 (Schwann)"="Schwann cells"
+)
+
+srt$cell_class <- ifelse(srt$atlas_label %in% names(label_to_class),
+                         label_to_class[srt$atlas_label], "Unmapped")
+
+# Patient/metastasis and batch proxy
+srt$patient_id <- ifelse(grepl("^patient_\\d+$", srt$orig.ident),
+                         sub("^patient_", "", srt$orig.ident), srt$orig.ident)
+srt$mets <- ifelse(tolower(srt$dataset_origin) %in% c("metastasis","mets","ln","distant"), 1L, 0L)
+if (!"batch" %in% colnames(srt@meta.data)) srt$batch <- srt$orig.ident
+
+# QC covariates
+DefaultAssay(srt) <- "RNA"
+srt[["percent.mt"]] <- PercentageFeatureSet(srt, pattern = "^MT-")
+cc <- Seurat::cc.genes.updated.2019
+srt <- CellCycleScoring(srt, s.features = cc$s.genes, g2m.features = cc$g2m.genes, set.ident = FALSE)
+
+# ------------------------------------
+# 1) Markers within each broad class
+# ------------------------------------
+min_cells_per_label <- 50; min_labels_in_class <- 2
+get_markers_within_class <- function(srt_class){
+  Idents(srt_class) <- factor(srt_class$atlas_label)
+  keep_levels <- names(which(table(Idents(srt_class)) >= min_cells_per_label))
+  srt_class <- subset(srt_class, idents = keep_levels)
+  if (length(unique(Idents(srt_class))) < min_labels_in_class) return(tibble())
+  mk <- Seurat::FindAllMarkers(srt_class, only.pos=TRUE, min.pct=0.1, logfc.threshold=0.25, test.use="wilcox") |> tibble::as_tibble()
+  nm <- names(mk)
+  if ("cluster" %in% nm) mk <- dplyr::rename(mk, label=.data$cluster)
+  else if ("group" %in% nm) mk <- dplyr::rename(mk, label=.data$group)
+  else if ("ident" %in% nm) mk <- dplyr::rename(mk, label=.data$ident)
+  mk
+}
+classes_target <- c("Fibroblasts","CD8+ T-cells","Tumor cells","Monocytes","Macrophages","Dendritic cells","Treg")
+classes_keep   <- intersect(classes_target, unique(srt$cell_class))
+markers_tbl <- map(classes_keep, function(cls){
+  srt_sub <- subset(srt, subset = cell_class == cls)
+  if (ncol(srt_sub) == 0) return(tibble())
+  out <- get_markers_within_class(srt_sub)
+  if (nrow(out) == 0) return(tibble())
+  mutate(out, cell_class = cls)
+}) |> bind_rows()
+if (nrow(markers_tbl) == 0) stop("No markers found—lower thresholds or check class mapping.")
+
+# -------------------------
+# 2) Program definitions
+# -------------------------
+program_map <- list(
+  CAF_myofibroblast = c("cS26 (Myofibro)", "cS28 (GREM1+ CAF)", "cS29 (MMP3+ CAF)"),
+  CAF_inflammatory  = c("cS25 (Fibro CCL8+)", "cS30 (CAF CCL8 Fibro-like)"),
+  CAF_stem_niche    = c("cS21 (Fibro stem cell niche)", "cS22 (Fibro stem cell niche)",
+                        "cS31 (CAF stem niche Fibro-like)", "cS23 (Fibro BMP-producing)", "cS24 (Fibro BMP-producing)"),
+  CD8_cytotoxic     = c("cTNI11 (CD8+GZMK+)"),  # NK removed
+  CD8_exhausted     = c("cTNI14 (CD8+ CXCL13+)", "cTNI15 (CD8+ CXCL13+ HSP+)",
+                        "cTNI16 (CD8+ CXCL13+ prolif)"),
+  CD8_naive_memory  = c("cTNI10 (CD8+ IL7R+)", "cTNI12 (CD8+ IL7R+)"),
+  Tumor_epithelial  = c("cE01 (Stem/TA-like)", "cE02 (Stem/TA-like/Immature Goblet)",
+                        "cE03 (Stem/TA-like prolif)", "cE04 (Enterocyte 1)", "cE05 (Enterocyte 2)"),
+  Myeloid_inflammatory = c("cM01 (Monocyte)", "cM02 (Macrophage-like)"),
+  # NEW: Treg atlas-driven program (suppression/activation markers come from markers_tbl)
+  Treg_suppressive  = c("cTNI08 (CD4+ Treg)", "cTNI09 (CD4+ Treg prolif)")
+)
+
+# Optional curated Treg cytokine panel to ensure IL10/TGFB/IL35 coverage (added after atlas sets)
+curated_Treg_cytokine <- c(
+  "FOXP3","IL2RA","IKZF2","CTLA4","TIGIT","LAG3","TNFRSF18","TNFRSF4","ENTPD1","NT5E",
+  "IL10","TGFB1","TGFB2","TGFB3","IL12A","EBI3"  # IL-35 = IL12A + EBI3
+)
+
+# -----------------------------------------------
+# 3) Build program gene sets from marker tables
+# -----------------------------------------------
+topN <- 80
+rm_patterns <- c("^RPL","^RPS","^MT-")
+cleanup <- function(genes) genes[!Reduce(`|`, lapply(rm_patterns, function(p) grepl(p, genes)))]
+
+program_gene_sets <- imap(program_map, function(lbls, prog){
+  lbls_present <- intersect(lbls, unique(markers_tbl$label))
+  if (length(lbls_present) == 0) return(NULL)
+  markers_tbl |>
+    filter(label %in% lbls_present) |>
+    group_by(label) |>
+    slice_max(order_by = avg_log2FC, n = topN, with_ties = FALSE) |>
+    ungroup() |>
+    pull(gene) |>
+    unique() |>
+    cleanup()
+}) |> discard(is.null)
+
+# Append curated Treg cytokine program if genes exist in the object
+genes_all <- rownames(srt)
+curated_keep <- unique(curated_Treg_cytokine[curated_Treg_cytokine %in% genes_all])
+if (length(curated_keep) >= 6) {  # require a minimal footprint
+  program_gene_sets$Treg_cytokine_IL10_TGFB_IL35 <- curated_keep
+}
+
+dir.create("program_gene_sets", showWarnings = FALSE)
+iwalk(program_gene_sets, ~ write_csv(tibble(gene = .x),
+                                     file = file.path("program_gene_sets", paste0(.y, ".csv"))))
+cat("Programs built:\n"); print(names(program_gene_sets))
+
+# ------------------------------
+# 4) Score programs with UCell
+# ------------------------------
+stopifnot(length(program_gene_sets) > 0)
+DefaultAssay(srt) <- "RNA"
+program_gene_sets_f <- imap(program_gene_sets, function(gs, nm){
+  keep <- unique(gs[gs %in% genes_all])
+  message(sprintf("[CHECK] %s: %d / %d genes present", nm, length(keep), length(gs)))
+  if (length(keep) == 0) NULL else keep
+}) |> discard(is.null)
+if (length(program_gene_sets_f) == 0) stop("No program had genes present.")
+
+pre_cols <- colnames(srt@meta.data)
+srt <- Seurat::AddModuleScore(object = srt, features = program_gene_sets_f,
+                              method = "UCell", name = make.names(names(program_gene_sets_f)))
+post_cols <- colnames(srt@meta.data)
+added_cols <- setdiff(post_cols, pre_cols)
+added_by_name <- unlist(mapply(function(nm){ grep(paste0("^", make.names(nm), "\\d+$"), added_cols, value = TRUE) },
+                               names(program_gene_sets_f)))
+if (length(added_by_name) != length(program_gene_sets_f)) added_by_name <- grep("\\d+$", added_cols, value=TRUE)
+stopifnot(length(added_by_name) == length(program_gene_sets_f))
+desired <- paste0(make.names(names(program_gene_sets_f)), "_UCell")
+colnames(srt@meta.data)[match(added_by_name, colnames(srt@meta.data))] <- desired
+score_cols <- desired
+message("[INFO] UCell columns: ", paste(score_cols, collapse = ", "))
+
+# Export patient summaries
+cell_scores <- srt@meta.data |>
+  dplyr::select(patient_id, mets, cell_class, atlas_label, all_of(score_cols)) |>
+  as_tibble()
+patient_scores <- cell_scores |>
+  group_by(patient_id, mets, cell_class) |>
+  summarize(across(all_of(score_cols), ~mean(.x, na.rm=TRUE)), .groups = "drop")
+write_csv(patient_scores, "program_patient_scores.csv")
+write_csv(markers_tbl, "atlas_label_markers_by_class.csv")
+
+# -------------------------------------------------------------------------
+# 4B) Tex↑ / Tex↓ without pseudotime & without lmer (replicate-aware)
+# -------------------------------------------------------------------------
+cd8 <- subset(
+  srt,
+  subset = cell_class %in% c("CD8+ T-cells","T cells") &
+           !atlas_label %in% c("cTNI23 (NK CD16A+)","cTNI24 (NK GZMK+)","cTNI25 (NK XCL1+)")
+)
+if (ncol(cd8) < 50) stop("Too few CD8 cells after NK removal.")
+
+E <- Seurat::GetAssayData(cd8, slot = "data")        # genes x cells
+tex_score <- cd8$CD8_exhausted_UCell
+if (is.null(tex_score)) stop("CD8_exhausted_UCell not found; ensure program scoring ran.")
+
+keep <- rowSums(E > 0) >= max(20, floor(0.02 * ncol(E)))
+E <- E[keep, , drop = FALSE]
+
+cov_df <- cd8@meta.data[, c("nCount_RNA","percent.mt","S.Score","G2M.Score","patient_id")]
+cov_df$nCount_RNA <- scale(cov_df$nCount_RNA)
+cov_df$percent.mt <- scale(cov_df$percent.mt)
+cov_df$S.Score    <- scale(cov_df$S.Score)
+cov_df$G2M.Score  <- scale(cov_df$G2M.Score)
+
+tex_res <- residuals(lm(tex_score ~ nCount_RNA + percent.mt + S.Score + G2M.Score, data = cov_df))
+
+min_cells_per_patient <- 30
+meta_one_gene <- function(g){
+  z_list <- list(); w_list <- list()
+  for (pid in unique(cov_df$patient_id)) {
+    idx <- which(cov_df$patient_id == pid)
+    if (length(idx) < min_cells_per_patient) next
+    x <- as.numeric(E[g, idx]); y <- tex_res[idx]
+    if (all(x == 0)) next
+    r <- suppressWarnings(cor(x, y, method = "spearman"))
+    if (is.na(r)) next
+    r <- max(min(r, 0.999999), -0.999999)
+    z <- atanh(r) * sqrt(length(idx) - 3)
+    z_list[[length(z_list)+1]] <- z
+    w_list[[length(w_list)+1]] <- sqrt(length(idx) - 3)
+  }
+  k <- length(z_list)
+  if (k == 0) return(c(rho_meta = NA, p_meta = NA, k = 0))
+  z_vec <- unlist(z_list); w_vec <- unlist(w_list)
+  Z <- sum(z_vec) / sqrt(sum(w_vec^2))
+  p <- 2*pnorm(-abs(Z))
+  rho_hat <- tanh( Z / sqrt(mean(w_vec^2)) )
+  c(rho_meta = rho_hat, p_meta = p, k = k)
+}
+
+message("[Tex] Computing replicate-aware meta-correlations (no pseudotime, no lmer)...")
+res_mat <- t(vapply(rownames(E), meta_one_gene, c(rho_meta=NA_real_, p_meta=NA_real_, k=NA_real_)))
+res_df  <- as_tibble(res_mat) |> mutate(gene = rownames(E),
+                                        q_meta = p.adjust(p_meta, "BH"),
+                                        k = as.integer(k)) |>
+          relocate(gene)
+
+min_patients_with_signal <- 3
+tex_up   <- res_df %>% filter(!is.na(rho_meta), q_meta < 0.05, rho_meta > 0, k >= min_patients_with_signal) %>%
+  arrange(desc(rho_meta)) %>% slice_head(n = 200) %>% pull(gene)
+tex_down <- res_df %>% filter(!is.na(rho_meta), q_meta < 0.05, rho_meta < 0, k >= min_patients_with_signal) %>%
+  arrange(rho_meta) %>% slice_head(n = 200) %>% pull(gene)
+
+dir.create("program_gene_sets", showWarnings = FALSE)
+write_csv(res_df, "program_gene_sets/Tex_meta_gene_table.csv")
+write_csv(tibble(gene = tex_up),   "program_gene_sets/Tex_up.csv")
+write_csv(tibble(gene = tex_down), "program_gene_sets/Tex_down.csv")
+message(sprintf("[Tex] Selected %d Tex↑ and %d Tex↓ genes (FDR<0.05; ≥%d patients).",
+                length(tex_up), length(tex_down), min_patients_with_signal))
+
+tex_sets_present <- list(
+  Tex_up   = tex_up[tex_up   %in% rownames(srt)],
+  Tex_down = tex_down[tex_down %in% rownames(srt)]
+)
+tex_sets_present <- tex_sets_present[ lengths(tex_sets_present) > 0 ]
+if (length(tex_sets_present) >= 1) {
+  pre <- colnames(srt@meta.data)
+  srt <- AddModuleScore(srt, features = tex_sets_present, method = "UCell", name = "Tex")
+  post <- setdiff(colnames(srt@meta.data), pre)
+  idx <- grep("^Tex\\d+$", post, value = TRUE)
+  if (length(idx) >= 1) {
+    new_names <- paste0(names(tex_sets_present), "_UCell")
+    colnames(srt@meta.data)[match(idx[seq_along(new_names)], colnames(srt@meta.data))] <- new_names
+    message("[Tex] Added: ", paste(new_names, collapse = ", "))
+  }
+} else {
+  warning("[Tex] Tex gene lists empty or absent from object; skipping re-score.")
+}
+
+# --------------------------------------
+# 5) (Optional) basic sanity correlation
+# --------------------------------------
+if (exists("patient_scores")) {
+  cd8_ps <- dplyr::filter(patient_scores, grepl("CD8|T cell|T-cells", cell_class))
+  if (all(c("CD8_cytotoxic_UCell","CD8_exhausted_UCell") %in% colnames(cd8_ps)) && nrow(cd8_ps) >= 5) {
+    r <- suppressWarnings(cor(cd8_ps$CD8_cytotoxic_UCell, cd8_ps$CD8_exhausted_UCell, method = "spearman"))
+    message(sprintf("[CHECK] Spearman(CD8_cytotoxic, CD8_exhausted) = %.2f (expect negative)", r))
+  }
+}
+
+# ----------------
+# Outputs summary
+# ----------------
+# program_gene_sets/:
+#   - <PROGRAM>.csv           (atlas-driven; now includes Treg_suppressive)
+#   - Treg_cytokine_IL10_TGFB_IL35.csv (if ≥6 genes detected)
+#   - Tex_meta_gene_table.csv ; Tex_up.csv ; Tex_down.csv
+# program_patient_scores.csv ; atlas_label_markers_by_class.csv
+###############################################################################
+```
+
+Generate the plots and statistics for each program
+```{r}
+###############################################################################
+# PURPOSE
+# Batch screen of multiple gene programs at the **cell level**:
+# for each specified program and its matching cell class, test score ~ metastasis.
+# Adds Treg programs to program_specs.
+###############################################################################
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr); library(stringr)
+  library(tibble); library(readr); library(ggplot2)
+})
+
+stopifnot(exists("srt"))
+meta <- srt@meta.data
+
+# (Optional safety) collapse any duplicated UCell columns by row-wise mean
+dup_names <- names(meta)[duplicated(names(meta))]
+if (length(dup_names) > 0) {
+  message("[CLEANUP] Collapsing duplicated columns in srt@meta.data ...")
+  for (nm in unique(dup_names)) {
+    idx <- which(names(meta) == nm)
+    if (length(idx) == 1) next
+    if (all(vapply(meta[, idx, drop=FALSE], is.numeric, TRUE))) {
+      combined <- rowMeans(meta[, idx, drop=FALSE], na.rm = TRUE)
+    } else {
+      m <- meta[, idx, drop=FALSE]
+      combined <- apply(m, 1, function(x){
+        i <- which(!is.na(x))
+        if (length(i) == 0) NA else x[tail(i, 1)]
+      })
+    }
+    meta <- meta[, -idx, drop=FALSE]
+    meta[[nm]] <- combined
+  }
+  srt@meta.data <- meta
+}
+
+# ------------------------------------------------------------------------------
+# Programs to test (restrict each program to the right class)
+# ------------------------------------------------------------------------------
+program_specs <- tibble::tibble(
+  program      = c("CD8_exhausted_UCell",
+                   "CD8_cytotoxic_UCell",
+                   "CD8_naive_memory_UCell",
+                   "CAF_inflammatory_UCell",
+                   "CAF_myofibroblast_UCell",
+                   "CAF_stem_niche_UCell",
+                   "Tumor_epithelial_UCell",
+                   # NEW: Treg programs (note: columns only appear if genes existed)
+                   "Treg_suppressive_UCell",
+                   "Treg_cytokine_IL10_TGFB_IL35_UCell"),
+  class_filter = list(
+    c("CD8+ T-cells"),    # CD8_exhausted
+    c("CD8+ T-cells"),    # CD8_cytotoxic
+    c("CD8+ T-cells"),    # CD8_naive_memory
+    c("Fibroblasts"),               # CAF_inflammatory
+    c("Fibroblasts"),               # CAF_myofibroblast
+    c("Fibroblasts"),               # CAF_stem_niche
+    c("Tumor cells"),               # Tumor_epithelial
+    c("Treg"),                      # Treg_suppressive
+    c("Treg")                       # Treg cytokine panel
+  ),
+  pretty       = c("CD8 exhausted", "CD8 cytotoxic", "CD8 naive/memory",
+                   "CAF inflammatory", "CAF myofibroblast", "CAF stem/niche",
+                   "Tumor epithelial",
+                   "Treg suppressive (atlas)", "Treg IL10/TGFB/IL35 (curated)")
+)
+
+# Keep only programs that actually exist in metadata
+ucols <- colnames(srt@meta.data)
+program_specs <- program_specs %>% filter(program %in% ucols)
+if (nrow(program_specs) == 0) stop("None of the specified program columns exist in srt@meta.data.")
+
+# ------------------------------------------------------------------------------
+# Helper: one program → plot + Wilcoxon + summary row
+# ------------------------------------------------------------------------------
+format_p <- function(p){
+  if (is.na(p)) return("p = NA")
+  if (p < 1e-4) sprintf("p = %.2e", p) else sprintf("p = %.3f", p)
+}
+
+plot_program_by_mets <- function(program, class_filter, pretty_name, outdir){
+  df <- srt@meta.data %>%
+    tibble::as_tibble(rownames = "cell_id") %>%
+    dplyr::filter(.data$cell_class %in% class_filter) %>%
+    dplyr::select(cell_id, mets, score = dplyr::all_of(program)) %>%
+    tidyr::drop_na(mets, score)
+
+  df <- df %>%
+    mutate(mets = as.integer(mets),
+           mets_fac = factor(mets, levels = c(0,1), labels = c("Non-mets","Mets")))
+
+  n0 <- sum(df$mets == 0, na.rm = TRUE)
+  n1 <- sum(df$mets == 1, na.rm = TRUE)
+  message(sprintf("[BALANCE] %-30s | class=%-22s | n0=%d  n1=%d  n=%d",
+                  program, paste(class_filter, collapse=","),
+                  n0, n1, nrow(df)))
+
+  if (length(unique(df$mets)) < 2 || nrow(df) < 2) {
+    return(tibble(
+      prog_id      = program,
+      prog_pretty  = pretty_name,
+      n_cells      = nrow(df),
+      n_mets0      = n0,
+      n_mets1      = n1,
+      median0      = NA_real_,
+      median1      = NA_real_,
+      p            = NA_real_,
+      plot_file    = NA_character_
+    ))
+  }
+
+  wt   <- suppressWarnings(stats::wilcox.test(score ~ mets, data = df, exact = FALSE))
+  pval <- wt$p.value
+  med0 <- stats::median(df$score[df$mets == 0], na.rm = TRUE)
+  med1 <- stats::median(df$score[df$mets == 1], na.rm = TRUE)
+  p_lab <- format_p(pval)
+
+  y_min <- min(df$score, na.rm = TRUE)
+  y_max <- max(df$score, na.rm = TRUE)
+  pad   <- 0.08 * (y_max - y_min + 1e-8)
+  y_lab <- y_max + pad
+
+  p <- ggplot(df, aes(x = mets_fac, y = score, fill = mets_fac)) +
+    geom_violin(trim = TRUE, alpha = 0.85) +
+    geom_boxplot(width = 0.18, outlier.shape = NA, color = "black") +
+    scale_fill_manual(values = c("Non-mets" = "#E69F00", "Mets" = "#56B4E9"), name = "Group") +
+    annotate("text", x = 1.5, y = y_lab, label = p_lab, size = 4.2, fontface = "bold") +
+    expand_limits(y = y_lab) +
+    labs(
+      title = paste0(pretty_name, " (cell-level)"),
+      x = NULL,
+      y = paste0(pretty_name, " score")
+    ) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold"),
+          plot.margin = unit(c(10, 12, 10, 10), "pt")) +
+    coord_cartesian(clip = "off")
+
+  # --- Save as PDF instead of PNG ---
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  file_out <- file.path(outdir, paste0("violin_celllevel_", make.names(pretty_name), ".pdf"))
+  ggsave(file_out, p, width = 5.6, height = 4.0, device = cairo_pdf)
+
+  tibble(
+    prog_id      = program,
+    prog_pretty  = pretty_name,
+    n_cells      = nrow(df),
+    n_mets0      = n0,
+    n_mets1      = n1,
+    median0      = med0,
+    median1      = med1,
+    p            = pval,
+    plot_file    = file_out
+  )
+}
+# ------------------------------------------------------------------------------
+# Run across programs
+# ------------------------------------------------------------------------------
+outdir <- "analysis_outputs/celllevel_program_programs"
+res_list <- purrr::pmap(
+  list(program_specs$program, program_specs$class_filter, program_specs$pretty),
+  plot_program_by_mets,
+  outdir = outdir
+)
+
+summary_tbl <- if (utils::packageVersion("purrr") >= "1.0.0") {
+  purrr::list_rbind(res_list)
+} else {
+  dplyr::bind_rows(res_list)
+} %>%
+  dplyr::arrange(prog_pretty)
+
+readr::write_csv(summary_tbl, file.path(outdir, "celllevel_wilcoxon_summary.csv"))
+
+print(
+  summary_tbl %>%
+    transmute(Program = prog_pretty,
+              `n cells` = n_cells,
+              `n non-mets` = n_mets0,
+              `n mets` = n_mets1,
+              median_non_mets = signif(median0, 3),
+              median_mets     = signif(median1, 3),
+              p = signif(p, 3),
+              plot = plot_file)
+)
+```
+
+
+CellChat: Making the Cell chat objects
+```{r}
+###############################################################################
+# PURPOSE
+# -------
+# Run CellChat v2 on Non-mets vs Mets cohorts from Seurat object `srt`.
+# - Splits Seurat object by srt$mets (0 = Non-mets, 1 = Mets)
+# - Groups by cell_class (CD8+ T-cells, Treg, Fibroblasts, Tumor cells, etc.)
+# - Builds CellChat objects for each group
+# - Saves results to "analysis_outputs/cellchat_non" and "analysis_outputs/cellchat_mets"
+#
+# REQUIREMENTS
+# ------------
+# - CellChat v2 installed
+# - Seurat object `srt` with:
+#     srt$mets        : 0 = Non-mets, 1 = Mets
+#     srt$cell_class  : broad cell type labels
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(purrr)
+  library(ggplot2)
+  library(patchwork)
+  library(future)
+  library(presto)   # fast Wilcoxon for identifyOverExpressed*
+  library(Seurat)
+})
+
+# ---------------------------------------------------------------------------
+# Global options
+# ---------------------------------------------------------------------------
+#options(future.globals.maxSize = 8000 * 1024^2)  # allow large Seurat/CellChat objects
+#future::plan("multisession", workers = 4) # do parallel
+# ---------------------------------------------------------------------------
+# Helper: prep CellChat inputs from Seurat
+# ---------------------------------------------------------------------------
+prep_cellchat_inputs_from_seurat <- function(srt, cells_keep, group_col = "cell_class", min.cells = 30) {
+  # subset Seurat object
+  srt_sub <- subset(srt, cells = Cells(srt)[cells_keep])
+  expr    <- GetAssayData(srt_sub, slot = "data", assay = "RNA")   # genes x cells
+  meta    <- srt_sub@meta.data %>%
+    dplyr::select(all_of(group_col)) %>%
+    dplyr::rename(labels = !!sym(group_col)) %>%
+    tibble::rownames_to_column("cell_id")
+  # filter small groups
+  keep_groups <- names(which(table(meta$labels) >= min.cells))
+  meta <- meta %>% filter(labels %in% keep_groups)
+  expr <- expr[, meta$cell_id, drop = FALSE]
+  list(data = expr, meta = meta)
+}
+
+# ---------------------------------------------------------------------------
+# Helper: run CellChat end-to-end for one cohort
+# ---------------------------------------------------------------------------
+run_cellchat <- function(data.input, meta.input, project_name, outdir) {
+  message("[CellChat] Running for ", project_name)
+  cellchat <- createCellChat(object = data.input, meta = meta.input, group.by = "labels")
+  CellChatDB <- CellChatDB.human
+  cellchat@DB <- CellChatDB
+  cellchat <- subsetData(cellchat)                  # subset signaling genes
+  cellchat <- identifyOverExpressedGenes(cellchat) # requires presto
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat <- computeCommunProb(cellchat)
+  cellchat <- filterCommunication(cellchat, min.cells = 30)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  saveRDS(cellchat, file.path(outdir, paste0("cellchat_", project_name, ".rds")))
+  return(cellchat)
+}
+
+# ---------------------------------------------------------------------------
+# Build inputs from Seurat (Option B, since first run)
+# ---------------------------------------------------------------------------
+stopifnot(exists("srt"))
+out_base <- "analysis_outputs"
+
+nm_in <- prep_cellchat_inputs_from_seurat(
+  srt, cells_keep = srt$mets == 0, group_col = "cell_class", min.cells = 30
+)
+m_in  <- prep_cellchat_inputs_from_seurat(
+  srt, cells_keep = srt$mets == 1, group_col = "cell_class", min.cells = 30
+)
+
+# ---------------------------------------------------------------------------
+# Run CellChat for Non-mets and Mets
+# ---------------------------------------------------------------------------
+cellchat_non <- run_cellchat(
+  data.input   = nm_in$data,
+  meta.input   = nm_in$meta,
+  project_name = "NonMets",
+  outdir       = file.path(out_base, "cellchat_non")
+)
+
+cellchat_mets <- run_cellchat(
+  data.input   = m_in$data,
+  meta.input   = m_in$meta,
+  project_name = "Mets",
+  outdir       = file.path(out_base, "cellchat_mets")
+)
+
+###############################################################################
+# ✅ Outputs:
+# - RDS files saved in analysis_outputs/cellchat_non and analysis_outputs/cellchat_mets
+# - Each RDS can be reloaded and passed to CellChat plotting functions
+###############################################################################
+```
+
+The following are for visualizing CellChat results:
+Making Exhaustion groups
+```{r}
+###############################################################################
+# PURPOSE
+# Subset CellChat to exhaustion/suppressive pathways (based on your DB names),
+# optionally restrict to Tumor / Fibroblast / CD8 / Treg, and export bar plots
+# comparing NonMets vs Mets (interaction COUNT and WEIGHT).
+#
+# REQUIRES:
+# - cellchat_non, cellchat_mets (already processed through computeCommunProb,
+#   computeCommunProbPathway, aggregateNet, and netAnalysis_computeCentrality)
+###############################################################################
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(dplyr)
+  library(ggplot2)
+})
+
+stopifnot(inherits(cellchat_non, "CellChat"), inherits(cellchat_mets, "CellChat"))
+
+outdir <- "analysis_outputs/cellchat_plots_exhaustion"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# 1) Exhaustion/suppressive pathway names present in YOUR DB
+db_paths <- sort(unique(cellchat_non@DB$interaction$pathway_name))
+exhaustion_paths_try <- c(
+  # inhibitory checkpoints
+  "PD-L1", "PDL2", "VISTA", "BTLA", "CD160", "LAIR1", "CD200", "SIRP",
+  # TIGIT axis (via PVR/NECTIN ligands)
+  "PVR", "NECTIN",
+  # LAG3 axis proxies
+  "MHC-II",
+  # TIM-3 axis proxy (galectins)
+  "GALECTIN",
+  # immunosuppressive cytokines
+  "TGFb", "IL10",
+  # (optional co-stim to contextualize balance)
+  "CD80", "CD86" # CTLA-4 competes with these; useful reference
+)
+exhaustion_paths <- intersect(exhaustion_paths_try, db_paths)
+
+if (length(exhaustion_paths) == 0) {
+  stop("No requested exhaustion/suppressive pathways found. Available examples:\n",
+       paste(utils::head(db_paths, 40), collapse = ", "))
+}
+message("[CellChat] Using exhaustion/suppressive pathways: ",
+        paste(exhaustion_paths, collapse = ", "))
+
+# 2) (Optional) restrict to key sender/receiver groups
+groups_keep     <- c("Tumor cells", "Fibroblasts", "CD8+ T-cells", "Treg")
+restrict_groups <- TRUE
+
+restrict_groups_fun <- function(cc, groups_keep, restrict = TRUE) {
+  if (!restrict) return(cc)
+  present <- intersect(levels(cc@idents), groups_keep)
+  if (length(present) == 0)
+    stop("None of groups_keep are present in this CellChat object. ",
+         "Available: ", paste(levels(cc@idents), collapse = ", "))
+  subsetCellChat(cc, idents.use = present)
+}
+
+# 3) Subset to exhaustion pathways and recompute centrality (v2 API)
+subset_exhaustion <- function(cc, paths, groups_keep, restrict = TRUE) {
+  cc2 <- restrict_groups_fun(cc, groups_keep, restrict)
+  cc2 <- subsetData(cc2)
+  # recompute centrality on pathway-level network (required for some plots)
+  cc2 <- netAnalysis_computeCentrality(cc2, slot.name = "netP")
+  cc2
+}
+
+cellchat_non_ex  <- subset_exhaustion(cellchat_non,  exhaustion_paths, groups_keep, restrict_groups)
+cellchat_mets_ex <- subset_exhaustion(cellchat_mets, exhaustion_paths, groups_keep, restrict_groups)
+
+# 4) Merge and compare (bar plots)
+object.list      <- list(NonMets = cellchat_non_ex, Mets = cellchat_mets_ex)
+cellchat_merged  <- mergeCellChat(object.list, add.names = names(object.list))
+
+p_cnt <- compareInteractions(cellchat_merged, measure = "count")
+p_wt  <- compareInteractions(cellchat_merged, measure = "weight")
+
+ggsave(file.path(outdir, "compare_interactions_exhaustion_count.pdf"),
+       plot = p_cnt, width = 6, height = 5, device = cairo_pdf)
+ggsave(file.path(outdir, "compare_interactions_exhaustion_weight.pdf"),
+       plot = p_wt,  width = 6, height = 5, device = cairo_pdf)
+
+message("[CellChat] Saved exhaustion-focused bar plots → ", outdir)
+```
+
+Making Bar plots
+```{r}
+###############################################################################
+# PURPOSE
+# Make per–cell-type bar plots (NonMets vs Mets) for **exhaustion/suppressive**
+# signaling only, using existing CellChat v2 objects:
+#   - cellchat_non, cellchat_mets
+#
+# WHAT IT DOES
+# 1) Selects exhaustion/suppressive pathways (PD-L1/PDL2, VISTA, BTLA, CD160,
+#    LAIR1, CD200, SIRP, PVR/NECTIN (TIGIT axis), MHC-II (LAG3 proxy),
+#    GALECTIN (TIM-3 proxy), IL10, TGFb).
+# 2) Aggregates those pathway-specific adjacency matrices (cc@netP$prob)
+#    into a single adjacency per dataset.
+# 3) For each focal group (Tumor cells, Fibroblasts, CD8+ T-cells, Treg),
+#    computes:
+#       - COUNT = number of edges touching the group (incoming + outgoing)
+#       - WEIGHT = sum of edge weights touching the group
+# 4) Exports one PDF per group for COUNT and WEIGHT.
+###############################################################################
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+})
+
+# --- Sanity: need v2 objects with pathway-level networks computed ---
+stopifnot(inherits(cellchat_non, "CellChat"),
+          inherits(cellchat_mets, "CellChat"))
+# These must already have been run earlier on each object:
+# computeCommunProb(); computeCommunProbPathway(); aggregateNet(); netAnalysis_computeCentrality()
+
+outdir <- "analysis_outputs/cellchat_plots_exhaustion_bygroup"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# 1) Define the exhaustion/suppressive pathway names present in YOUR DB
+db_paths <- sort(unique(cellchat_non@DB$interaction$pathway_name))
+exhaustion_paths_try <- c(
+  # inhibitory checkpoints
+  "PD-L1","PDL2","VISTA","BTLA","CD160","LAIR1","CD200","SIRP",
+  # TIGIT axis (via PVR/NECTIN ligands)
+  "PVR","NECTIN",
+  # LAG-3 axis proxy
+  "MHC-II",
+  # TIM-3 axis proxy
+  "GALECTIN",
+  # suppressive cytokines
+  "TGFb","IL10"
+)
+exhaustion_paths <- intersect(exhaustion_paths_try, db_paths)
+if (length(exhaustion_paths) == 0) {
+  stop("No requested exhaustion/suppressive pathways found in this DB. Available examples:\n",
+       paste(utils::head(db_paths, 40), collapse = ", "))
+}
+message("[CellChat] Using exhaustion/suppressive pathways: ",
+        paste(exhaustion_paths, collapse = ", "))
+
+# 2) Focal groups we want separate figures for
+groups_focus <- c("Tumor cells","Fibroblasts","CD8+ T-cells","Treg")
+
+# --- helpers ----------------------------------------------------------
+
+# Sum pathway-level adjacency matrices (probability) into one aggregated matrix
+sum_pathway_adj <- function(cc, pathways) {
+  stopifnot(!is.null(cc@netP$prob))
+  prob_arr <- cc@netP$prob  # 3D: senders x receivers x pathways
+  pw_all   <- dimnames(prob_arr)[[3]]
+  keep     <- intersect(pathways, pw_all)
+  if (length(keep) == 0) {
+    stop("Requested pathways are not in cc@netP$pathways. Available: ",
+         paste(pw_all, collapse = ", "))
+  }
+  idx <- match(keep, pw_all)
+  # sum over the 3rd dimension (selected pathways)
+  apply(prob_arr[ , , idx, drop = FALSE], c(1, 2), sum)
+}
+
+# Compute group-level COUNT & WEIGHT from a (sender x receiver) adjacency
+group_stats_from_adj <- function(adj, group, mode = c("both","incoming","outgoing")) {
+  mode <- match.arg(mode)
+  if (!group %in% rownames(adj) || !group %in% colnames(adj)) {
+    stop("Group '", group, "' not found in adjacency.")
+  }
+  # ignore self-loops when counting
+  diag(adj) <- 0
+  out_vec <- adj[group, , drop = TRUE]   # group -> others
+  in_vec  <- adj[ , group, drop = TRUE]  # others -> group
+
+  if (mode == "both") {
+    weight <- sum(out_vec, na.rm = TRUE) + sum(in_vec, na.rm = TRUE)
+    count  <- sum(out_vec > 0, na.rm = TRUE) + sum(in_vec > 0, na.rm = TRUE)
+  } else if (mode == "outgoing") {
+    weight <- sum(out_vec, na.rm = TRUE)
+    count  <- sum(out_vec > 0, na.rm = TRUE)
+  } else { # incoming
+    weight <- sum(in_vec, na.rm = TRUE)
+    count  <- sum(in_vec > 0, na.rm = TRUE)
+  }
+  tibble::tibble(group = group, count = count, weight = weight)
+}
+
+# Build a tidy summary for one CellChat object
+summarize_one_cc <- function(cc, label, pathways, mode = "both", groups_focus = NULL) {
+  adj_sum <- sum_pathway_adj(cc, pathways)
+  grps    <- if (is.null(groups_focus)) rownames(adj_sum) else intersect(groups_focus, rownames(adj_sum))
+  if (length(grps) == 0) stop("No focus groups found in adjacency.")
+  dplyr::bind_rows(lapply(grps, function(g) group_stats_from_adj(adj_sum, g, mode = mode))) |>
+    dplyr::mutate(dataset = label, .before = 1)
+}
+
+# 3) Summaries for NonMets and Mets (mode = "both" by default)
+sum_non <- summarize_one_cc(cellchat_non, "NonMets", exhaustion_paths, mode = "both")
+sum_mets <- summarize_one_cc(cellchat_mets, "Mets", exhaustion_paths, mode = "both")
+sum_all <- bind_rows(sum_non, sum_mets)
+
+# 4) Plotting per group (NonMets vs Mets) for COUNT and WEIGHT
+save_group_bar <- function(df, grp, measure = c("count","weight")) {
+  measure <- match.arg(measure)
+  dd <- df %>% filter(group == grp)
+  if (nrow(dd) == 0) return(invisible(NULL))
+  ylab <- if (measure == "count") "Number of inferred interactions"
+          else "Interaction strength (probability sum)"
+  p <- ggplot(dd, aes(x = dataset, y = .data[[measure]], fill = dataset)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = signif(.data[[measure]], 3)), vjust = -0.4, size = 3.5) +
+    scale_fill_manual(values = c(NonMets = "#808080", Mets = "#cc0000")) +
+    labs(title = paste0(grp, " — exhaustion/suppressive signaling"),
+         x = NULL, y = ylab) +
+    theme_classic(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold"))
+  fn <- file.path(outdir, paste0("bar_", make.names(grp), "_", measure, ".pdf"))
+  ggsave(fn, plot = p, width = 5.6, height = 4.0, device = cairo_pdf)
+  message("Saved: ", fn)
+}
+
+invisible(lapply(groups_focus, function(g) save_group_bar(sum_all, g, "count")))
+invisible(lapply(groups_focus, function(g) save_group_bar(sum_all, g, "weight")))
+
+message("[CellChat] Saved per–cell-type exhaustion bar plots → ", outdir)
+```
+
+Making Scatter plots
+```{r}
+###############################################################################
+# PURPOSE
+# Plot signaling role scatter (sending vs receiving) restricted to exhaustion/
+# suppressive pathways, separately for NonMets and Mets.
+#
+# REQUIRES:
+# - cellchat_non_ex, cellchat_mets_ex (subsetted to exhaustion pathways)
+# - netAnalysis_computeCentrality already run on them
+###############################################################################
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(ggplot2)
+  library(patchwork)
+})
+
+stopifnot(inherits(cellchat_non_ex, "CellChat"), inherits(cellchat_mets_ex, "CellChat"))
+
+outdir <- "analysis_outputs/cellchat_plots_exhaustion"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# Compute centrality if not yet done
+cellchat_non_ex  <- netAnalysis_computeCentrality(cellchat_non_ex,  slot.name = "netP")
+cellchat_mets_ex <- netAnalysis_computeCentrality(cellchat_mets_ex, slot.name = "netP")
+
+# Plot sending vs receiving roles (scatter) for exhaustion-only networks
+p_non <- netAnalysis_signalingRole_scatter(cellchat_non_ex, title = "NonMets (Exhaustion)")
+p_mets <- netAnalysis_signalingRole_scatter(cellchat_mets_ex, title = "Mets (Exhaustion)")
+
+# Combine side by side
+p_comb <- p_non + p_mets
+
+# Save to PDF
+pdf(file.path(outdir, "signalingRole_scatter_exhaustion.pdf"), width = 11, height = 5, useDingbats = FALSE)
+print(p_comb)
+dev.off()
+
+message("[CellChat] Saved exhaustion-specific signaling role scatter → ", outdir)
+```
+
+
+```{r}
+###############################################################################
+# PURPOSE
+# 1) Diagnose zeros in exhaustion circles for focus groups (Tumor/Fibro/CD8/Treg)
+#    by printing per-pathway, per edge (sender→receiver) sums from netP.
+# 2) If they’re truly all ~0, recompute a *rescue* CellChat object that is
+#    restricted to exhaustion pathways and uses slightly more permissive options,
+#    then plot circles again for the focus groups.
+#
+# INPUTS (already processed with CellChat v2 pipeline):
+#   - cellchat_non, cellchat_mets (have @netP$prob etc.)
+#
+# OUTPUTS:
+#   analysis_outputs/cellchat_plots_exhaustion/*
+###############################################################################
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(dplyr)
+  library(tidyr)
+})
+
+stopifnot(inherits(cellchat_non, "CellChat"), inherits(cellchat_mets, "CellChat"))
+outdir <- "analysis_outputs/cellchat_plots_exhaustion"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# Exhaustion / suppressive pathways to test (must match your DB)
+exhaustion_paths <- c(
+  "PD-L1","PDL2","VISTA","BTLA","CD160","LAIR1","CD200","SIRP",
+  "PVR","NECTIN",          # TIGIT axis
+  "MHC-II","GALECTIN",     # LAG3 / TIM-3 proxies
+  "TGFb","IL10"            # suppressive cytokines
+)
+focus_groups <- c("Tumor cells","Fibroblasts","CD8+ T-cells","Treg")
+drop_self_loops <- TRUE
+
+# ---------- helpers ----------
+present_paths_netP <- function(cc) {
+  if (is.null(cc@netP) || is.null(cc@netP$prob) || length(dim(cc@netP$prob)) < 3) character(0)
+  else dimnames(cc@netP$prob)[[3]]
+}
+
+# Per-pathway edge matrix for selected groups (sums of netP probability)
+extract_pathway_matrix <- function(cc, pathway, groups_keep = NULL, drop_diag = TRUE) {
+  pw_names <- present_paths_netP(cc)
+  if (!(pathway %in% pw_names)) return(NULL)
+  M <- cc@netP$prob[, , pathway, drop = FALSE][,,1]
+  if (!is.null(groups_keep)) {
+    g <- intersect(rownames(M), groups_keep)
+    if (length(g) >= 2) {
+      M <- M[g, g, drop = FALSE]
+    } else {
+      return(matrix(0, 0, 0))
+    }
+  }
+  if (drop_diag && length(diag(M))) diag(M) <- 0
+  M
+}
+
+# Print top non-zero edges per pathway for the focus groups
+diagnose_edges <- function(cc, label, paths, groups_keep) {
+  cat(sprintf("\n[Diag] %s — per-pathway sender→receiver sums within focus groups\n", label))
+  avail <- intersect(paths, present_paths_netP(cc))
+  if (length(avail) == 0) {
+    cat("  (no requested pathways present in netP)\n")
+    return(invisible(NULL))
+  }
+  for (pw in avail) {
+    M <- extract_pathway_matrix(cc, pw, groups_keep = groups_keep, drop_diag = TRUE)
+    if (is.null(M) || length(M) == 0) next
+    nz <- which(M > 0, arr.ind = TRUE)
+    if (nrow(nz) == 0) {
+      cat(sprintf("  %s: all zero within focus groups\n", pw))
+    } else {
+      df <- data.frame(
+        sender = rownames(M)[nz[,1]],
+        receiver = colnames(M)[nz[,2]],
+        prob = M[nz]
+      ) |>
+        arrange(desc(prob))
+      cat(sprintf("  %s: top edges (n=%d)\n", pw, nrow(df)))
+      print(head(df, 12), row.names = FALSE)
+    }
+  }
+}
+
+# Build exhaustion-only adjacency from netP for plotting
+make_adj_from_netP <- function(cc, keep_paths, groups_keep = NULL, drop_diag = TRUE) {
+  pw_names <- present_paths_netP(cc)
+  keep_pw  <- intersect(keep_paths, pw_names)
+  rn <- dimnames(cc@netP$prob)[[1]]; cn <- dimnames(cc@netP$prob)[[2]]
+  zeros <- list(
+    count  = matrix(0, length(rn), length(cn), dimnames = list(rn, cn)),
+    weight = matrix(0, length(rn), length(cn), dimnames = list(rn, cn))
+  )
+  if (length(keep_pw) == 0) return(zeros)
+  arr <- cc@netP$prob[, , keep_pw, drop = FALSE]
+  mat_count  <- apply(arr > 0, c(1, 2), sum)
+  mat_weight <- apply(arr,    c(1, 2), sum)
+  if (!is.null(groups_keep)) {
+    g <- intersect(rownames(mat_count), groups_keep)
+    if (length(g) >= 2) {
+      mat_count  <- mat_count [g, g, drop = FALSE]
+      mat_weight <- mat_weight[g, g, drop = FALSE]
+    } else {
+      mat_count[,]  <- 0; mat_weight[,] <- 0
+    }
+  }
+  if (drop_diag) { diag(mat_count) <- 0; diag(mat_weight) <- 0 }
+  list(count = mat_count, weight = mat_weight)
+}
+
+plot_circle <- function(mat, title, file, weight.scale = TRUE, edge.weight.max = NULL) {
+  if (!is.matrix(mat) || all(mat == 0, na.rm = TRUE)) {
+    message(sprintf("[WARN] %s has no non-zero edges — skipping plot.", title)); return(invisible(NULL))
+  }
+  vertex_wt <- rowSums(mat) + colSums(mat)
+  if (all(vertex_wt == 0)) vertex_wt[] <- 1
+  pdf(file, width = 6, height = 6, useDingbats = FALSE)
+  netVisual_circle(
+    mat,
+    vertex.weight   = vertex_wt,
+    weight.scale    = weight.scale,
+    edge.weight.max = edge.weight.max,
+    label.edge      = FALSE,
+    title.name      = title
+  )
+  dev.off()
+}
+
+# ---------- (1) DIAGNOSE ----------
+diag_non_paths  <- intersect(exhaustion_paths, present_paths_netP(cellchat_non))
+diag_mets_paths <- intersect(exhaustion_paths, present_paths_netP(cellchat_mets))
+cat("[Diag] NonMets has exhaustion pathways in netP:", paste(diag_non_paths, collapse = ", "), "\n")
+cat("[Diag] Mets    has exhaustion pathways in netP:", paste(diag_mets_paths, collapse = ", "), "\n")
+
+diagnose_edges(cellchat_non,  "NonMets", exhaustion_paths, focus_groups)
+diagnose_edges(cellchat_mets, "Mets",    exhaustion_paths, focus_groups)
+
+# Try to plot (focus groups) with current netP
+adj_non_focus  <- make_adj_from_netP(cellchat_non,  exhaustion_paths, groups_keep = focus_groups, drop_diag = drop_self_loops)
+adj_mets_focus <- make_adj_from_netP(cellchat_mets, exhaustion_paths, groups_keep = focus_groups, drop_diag = drop_self_loops)
+
+edge_max_count  <- max(c(adj_non_focus$count,  adj_mets_focus$count),  na.rm = TRUE)
+edge_max_weight <- max(c(adj_non_focus$weight, adj_mets_focus$weight), na.rm = TRUE)
+if (!is.finite(edge_max_count))  edge_max_count  <- NULL
+if (!is.finite(edge_max_weight)) edge_max_weight <- NULL
+
+plot_circle(adj_non_focus$count,  "NonMets — Exhaustion (COUNT, Tumor/Fibro/CD8/Treg)",
+            file.path(outdir, "circle_exhaustion_count_NonMets_focus.pdf"),
+            weight.scale = FALSE, edge.weight.max = edge_max_count)
+plot_circle(adj_mets_focus$count, "Mets — Exhaustion (COUNT, Tumor/Fibro/CD8/Treg)",
+            file.path(outdir, "circle_exhaustion_count_Mets_focus.pdf"),
+            weight.scale = FALSE, edge.weight.max = edge_max_count)
+
+plot_circle(adj_non_focus$weight,  "NonMets — Exhaustion (WEIGHT, Tumor/Fibro/CD8/Treg)",
+            file.path(outdir, "circle_exhaustion_weight_NonMets_focus.pdf"),
+            weight.scale = TRUE, edge.weight.max = edge_max_weight)
+plot_circle(adj_mets_focus$weight, "Mets — Exhaustion (WEIGHT, Tumor/Fibro/CD8/Treg)",
+            file.path(outdir, "circle_exhaustion_weight_Mets_focus.pdf"),
+            weight.scale = TRUE, edge.weight.max = edge_max_weight)
+
+# ---------- (2) OPTIONAL RESCUE: recompute with only exhaustion DB -----------
+# If the printed diagnostics show zeros across the board for the focus groups,
+# run the block below (uncomment) to build “rescue” objects restricted to
+# exhaustion LR and slightly relaxed parameters.
+
+# ---- helper to restrict DB to specific pathways and recompute netP ----------
+recompute_exhaustion_only <- function(cc, keep_paths,
+                                      nboot = 100, trim = 0.1, Kh = 0.5,
+                                      raw.use = TRUE, seed = 1) {
+  cc2 <- cc
+  # keep only interactions in keep_paths
+  keep_int <- which(cc2@DB$interaction$pathway_name %in% keep_paths)
+  cc2@DB$interaction <- cc2@DB$interaction[keep_int, , drop = FALSE]
+  cc2@LR$LRsig       <- cc2@LR$LRsig      [cc2@LR$LRsig$pathway_name %in% keep_paths, , drop = FALSE]
+
+  # refresh signaling genes and expression subset
+  cc2 <- subsetData(cc2)
+
+  # more permissive knobs
+  cc2@options$parameter$raw.use <- raw.use
+  cc2@options$parameter$nboot   <- nboot
+  cc2@options$parameter$trim    <- trim
+  cc2@options$parameter$Kh      <- Kh
+  cc2@options$parameter$seed.use <- seed
+
+  # recompute
+  cc2 <- computeCommunProb(cc2)
+  cc2 <- computeCommunProbPathway(cc2)
+  cc2 <- aggregateNet(cc2)
+  cc2 <- netAnalysis_computeCentrality(cc2, slot.name = "netP")
+  cc2
+}
+message("[CellChat] Diagnostics complete. See console for per-pathway edges within focus groups.")
+```
+Making circle plots
+```{r}
+###############################################################################
+# PURPOSE
+# Plot clean, interpretable circle plots for a *subset* of cell types
+# (e.g., Tumor/Fibro/CD8/Treg) showing either:
+#   - number of interactions (COUNT), or
+#   - aggregate interaction strength (WEIGHT),
+# for each cohort (NonMets vs Mets), using the full (all-pathway) networks.
+#
+# WHY
+# Exhaustion-only circles were ~0. Here we visualize the overall
+# communication “traffic” but restrict to a few key players to avoid clutter.
+#
+# INPUTS: cellchat_non, cellchat_mets (already processed through pipeline)
+# OUTPUTS: analysis_outputs/cellchat_plots_subset/*.pdf
+###############################################################################
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(dplyr)
+})
+
+stopifnot(inherits(cellchat_non, "CellChat"), inherits(cellchat_mets, "CellChat"))
+
+outdir <- "analysis_outputs/cellchat_plots_subset"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Choose the small set of cell types to display (edit as needed) ----------
+focus_groups <- c("Tumor cells","Fibroblasts","CD8+ T-cells","Treg")
+drop_self_loops <- TRUE   # set FALSE if you want autocrine edges visible
+
+# ---- Helper to subset a CellChat adjacency (count or weight) to chosen groups -
+subset_net_matrix <- function(cc, measure = c("count","weight"),
+                              groups_keep = NULL, drop_diag = TRUE) {
+  measure <- match.arg(measure)
+  mat <- switch(measure,
+                count  = cc@net$count,
+                weight = cc@net$weight)
+  # keep only existing groups in this object
+  keep <- if (is.null(groups_keep)) rownames(mat) else intersect(groups_keep, rownames(mat))
+  if (length(keep) < 2) {
+    # return an all-zero matrix with intended dimnames so plotting can gracefully skip
+    Z <- matrix(0, length(groups_keep), length(groups_keep),
+                dimnames = list(groups_keep, groups_keep))
+    return(Z)
+  }
+  M <- mat[keep, keep, drop = FALSE]
+  if (drop_diag && length(diag(M))) diag(M) <- 0
+  M
+}
+
+# ---- Build objects list for compact looping ----------------------------------
+object.list <- list(NonMets = cellchat_non, Mets = cellchat_mets)
+
+# ---- Extract focused matrices for both cohorts --------------------------------
+mats_count  <- lapply(object.list, subset_net_matrix, measure = "count",
+                      groups_keep = focus_groups, drop_diag = drop_self_loops)
+mats_weight <- lapply(object.list, subset_net_matrix, measure = "weight",
+                      groups_keep = focus_groups, drop_diag = drop_self_loops)
+
+# ---- Shared edge scales across cohorts (fair visual comparison) ---------------
+edge_max_count  <- max(unlist(mats_count),  na.rm = TRUE);  if (!is.finite(edge_max_count))  edge_max_count  <- NULL
+edge_max_weight <- max(unlist(mats_weight), na.rm = TRUE);  if (!is.finite(edge_max_weight)) edge_max_weight <- NULL
+
+# ---- Plot saver around netVisual_circle (works with plain matrices) ----------
+plot_circle_mat <- function(mat, title, file, weight.scale = TRUE, edge.weight.max = NULL) {
+  if (!is.matrix(mat) || all(mat == 0, na.rm = TRUE)) {
+    message(sprintf("[WARN] %s has no non-zero edges — skipping plot.", title)); return(invisible(NULL))
+  }
+  vertex_wt <- rowSums(mat) + colSums(mat)
+  if (all(vertex_wt == 0)) vertex_wt[] <- 1
+  pdf(file, width = 6, height = 6, useDingbats = FALSE)
+  netVisual_circle(
+    mat,
+    vertex.weight   = vertex_wt,
+    weight.scale    = weight.scale,     # TRUE = use edge width scaling for weights
+    edge.weight.max = edge.weight.max,  # keeps scale consistent across cohorts
+    label.edge      = FALSE,
+    title.name      = title
+  )
+  dev.off()
+}
+
+# ---- Plot COUNT circles (number of interactions) ------------------------------
+for (nm in names(mats_count)) {
+  plot_circle_mat(
+    mats_count[[nm]],
+    paste0(nm, " — Number of interactions (", paste(focus_groups, collapse="/"), ")"),
+    file.path(outdir, paste0("circle_COUNT_", nm, "_focus.pdf")),
+    weight.scale = FALSE,
+    edge.weight.max = edge_max_count
+  )
+}
+
+# ---- Plot WEIGHT circles (interaction strength) -------------------------------
+for (nm in names(mats_weight)) {
+  plot_circle_mat(
+    mats_weight[[nm]],
+    paste0(nm, " — Interaction strength (", paste(focus_groups, collapse="/"), ")"),
+    file.path(outdir, paste0("circle_WEIGHT_", nm, "_focus.pdf")),
+    weight.scale = TRUE,
+    edge.weight.max = edge_max_weight
+  )
+}
+
+message("[CellChat] Subset circle plots written → ", outdir)
+
+# -------------------------------------------------------------------------------
+# OPTIONAL: show only *selected* pairs (e.g., CD8→Tumor & Treg→CD8) as circles.
+# Set all other senders/receivers to 0, leaving labels intact.
+# -------------------------------------------------------------------------------
+# example_pairs <- list(
+#   c("CD8+ T-cells","Tumor cells"),
+#   c("Treg","CD8+ T-cells")
+# )
+# mask_to_pairs <- function(M, pairs) {
+#   keep <- matrix(FALSE, nrow(M), ncol(M), dimnames = dimnames(M))
+#   for (pr in pairs) {
+#     s <- pr[1]; r <- pr[2]
+#     if (s %in% rownames(M) && r %in% colnames(M)) keep[s, r] <- TRUE
+#   }
+#   M[!keep] <- 0
+#   M
+# }
+# for (nm in names(mats_weight)) {
+#   Msel <- mask_to_pairs(mats_weight[[nm]], example_pairs)
+#   plot_circle_mat(
+#     Msel,
+#     paste0(nm, " — Strength (selected pairs)"),
+#     file.path(outdir, paste0("circle_WEIGHT_", nm, "_selected_pairs.pdf")),
+#     weight.scale = TRUE,
+#     edge.weight.max = edge_max_weight
+#   )
+# }
+```
+
+Circle plots for collagen and ADGRG
+```{r}
+###############################################################################
+# PURPOSE
+# Export circle/aggregate plots for specific exhaustion-relevant pathways
+# (e.g., COLLAGEN and ADGRG) from your restricted CellChat objects:
+#   - cellchat_non_ex
+#   - cellchat_mets_ex
+#
+# NOTES (CellChat v2):
+# - Do NOT pass `title.name` to netVisual_aggregate(); v2 sets titles internally.
+# - If you want a shared edge scale across cohorts, set `use_shared_edge_scale <- TRUE`.
+###############################################################################
+suppressPackageStartupMessages({ library(CellChat) })
+
+stopifnot(inherits(cellchat_non_ex, "CellChat"), inherits(cellchat_mets_ex, "CellChat"))
+
+outdir <- "analysis_outputs/cellchat_plots_exhaustion_pathways"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# Pathways to plot explicitly
+pathways_interest <- c("COLLAGEN", "ADGRG")
+
+# If you want both cohorts to use the same max edge weight in the circle plots
+use_shared_edge_scale <- FALSE  # set TRUE if desired
+
+# Compute a shared edge cap (optional)
+edge_cap <- NULL
+if (use_shared_edge_scale) {
+  # Pull pathway-level 3D arrays and compute a rough global max over selected pathways
+  get_pw_max <- function(cc, pws) {
+    if (is.null(cc@netP) || is.null(cc@netP$prob)) return(0)
+    keep <- intersect(pws, dimnames(cc@netP$prob)[[3]])
+    if (length(keep) == 0) return(0)
+    max(cc@netP$prob[, , keep, drop = FALSE], na.rm = TRUE)
+  }
+  edge_cap <- max(get_pw_max(cellchat_non_ex, pathways_interest),
+                  get_pw_max(cellchat_mets_ex, pathways_interest), na.rm = TRUE)
+  if (!is.finite(edge_cap) || edge_cap <= 0) edge_cap <- NULL
+}
+
+# Helper: plot one pathway for one CellChat object
+plot_pathway_pdf <- function(cc, pathway, label, edge.weight.max = NULL) {
+  if (is.null(cc@netP) || is.null(cc@netP$prob)) {
+    message(sprintf("[SKIP] %s: netP not available for %s", pathway, label)); return(invisible(NULL))
+  }
+  if (!(pathway %in% cc@netP$pathways)) {
+    message(sprintf("[SKIP] %s not in pathways for %s", pathway, label)); return(invisible(NULL))
+  }
+
+  file_out <- file.path(outdir, paste0("circle_", pathway, "_", label, ".pdf"))
+  pdf(file_out, width = 6, height = 6, useDingbats = FALSE)
+  # IMPORTANT: no `title.name` here (CellChat v2 handles titles internally)
+  netVisual_aggregate(
+    cc,
+    signaling       = pathway,
+    layout          = "circle",
+    vertex.label.cex = 0.9,
+    label.edge      = TRUE,
+    edge.width.max  = 12,
+    edge.weight.max = edge.weight.max
+  )
+  dev.off()
+  message("[OK] Wrote: ", file_out)
+}
+
+# Run for each cohort (NonMets vs Mets) on each pathway
+for (pw in pathways_interest) {
+  plot_pathway_pdf(cellchat_non_ex,  pw, "NonMets_ex", edge.weight.max = edge_cap)
+  plot_pathway_pdf(cellchat_mets_ex, pw, "Mets_ex",    edge.weight.max = edge_cap)
+}
+```
+
+Making Heatmaps
+```{r}
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(ComplexHeatmap)
+  library(grid)   # for unit()
+})
+
+outdir <- "analysis_outputs/cellchat_plots_exhaustion"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# Helper: save heatmap with padding + transparent background
+save_heatmap_pdf <- function(cellchat_obj, file, measure = "weight",
+                             width = 7, height = 6,
+                             padding_mm = c(25, 25, 25, 25)) {
+  pdf(file, width = width, height = height, useDingbats = FALSE, bg = "transparent")
+  ht <- netVisual_heatmap(cellchat_obj, measure = measure)
+  draw(ht, padding = unit(padding_mm, "mm"))  # add whitespace around the heatmap
+  dev.off()
+  message("[OK] Wrote heatmap: ", file)
+}
+
+# Mets
+save_heatmap_pdf(cellchat_mets_ex,
+                 file = file.path(outdir, "Heatmap_interactions_exhaustion_mets.pdf"),
+                 measure = "weight",
+                 width = 7, height = 6,
+                 padding_mm = c(30, 30, 30, 30))  # increase these for more white space
+
+# Non-mets
+save_heatmap_pdf(cellchat_non_ex,
+                 file = file.path(outdir, "Heatmap_interactions_exhaustion_nonmets.pdf"),
+                 measure = "weight",
+                 width = 7, height = 6,
+                 padding_mm = c(30, 30, 30, 30))
+```
+
+Differential expression analysis
+```{r}
+###############################################################################
+# PURPOSE
+# One-model (NOT per-patient meta):
+# Test gene ~ exhaustion (UCell) with MAST (hurdle GLM), blocking by patient
+# and adjusting for QC covariates. Extract the continuous-part beta for
+# "exhaustion" and combine with lrTest p-values.
+###############################################################################
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(MAST)
+  library(dplyr)
+  library(tibble)
+  library(readr)
+})
+
+stopifnot(exists("srt"))
+stopifnot(all(c("patient_id","cell_class") %in% colnames(srt@meta.data)))
+
+# -------------------- knobs --------------------
+cell_classes_focus <- c("CD8+ T-cells","T cells")
+EXH_COL <- if ("CD8_exhausted_UCell" %in% colnames(srt@meta.data)) "CD8_exhausted_UCell" else
+           if (all(c("Tex_up_UCell","Tex_down_UCell") %in% colnames(srt@meta.data))) {
+             srt$CD8_exhausted_UCell <- srt$Tex_up_UCell - srt$Tex_down_UCell; "CD8_exhausted_UCell"
+           } else stop("No exhaustion score found.")
+USE_RANDOM_EFFECT <- FALSE
+min_detect_frac   <- 0.05
+min_detect_abs    <- 50
+
+# -------------------- data prep --------------------
+cells_focus <- WhichCells(srt, expression = cell_class %in% cell_classes_focus)
+if (length(cells_focus) < 100) stop("Too few focus cells for analysis.")
+DefaultAssay(srt) <- "RNA"
+
+expr <- Seurat::GetAssayData(srt, slot = "data")[, cells_focus, drop = FALSE]
+meta <- srt@meta.data[cells_focus, , drop = FALSE] %>%
+  as_tibble(rownames = "cell") %>%
+  transmute(
+    cell,
+    patient    = factor(patient_id),
+    exhaustion = .data[[EXH_COL]],
+    nCount_RNA, percent.mt, S.Score, G2M.Score
+  ) %>%
+  tidyr::drop_na(patient, exhaustion, nCount_RNA, percent.mt, S.Score, G2M.Score)
+
+expr <- expr[, meta$cell, drop = FALSE]
+
+detect_counts <- Matrix::rowSums(expr > 0)
+min_detect <- max(min_detect_abs, ceiling(min_detect_frac * ncol(expr)))
+keep_genes <- names(which(detect_counts >= min_detect))
+expr <- expr[keep_genes, , drop = FALSE]
+
+sca <- MAST::FromMatrix(
+  exprsArray = as.matrix(expr),
+  cData      = data.frame(row.names = meta$cell, meta)
+)
+colData(sca)$cngeneson <- scale(colSums(assay(sca) > 0))
+colData(sca)$nCount_RNA <- scale(colData(sca)$nCount_RNA)
+colData(sca)$percent.mt <- scale(colData(sca)$percent.mt)
+colData(sca)$S.Score    <- scale(colData(sca)$S.Score)
+colData(sca)$G2M.Score  <- scale(colData(sca)$G2M.Score)
+
+# -------------------- fit model --------------------
+if (USE_RANDOM_EFFECT) {
+  message("[MAST] Fitting with random intercept for patient …")
+  fml <- ~ exhaustion + cngeneson + nCount_RNA + percent.mt + S.Score + G2M.Score + (1|patient)
+  fit <- zlm(formula = fml, sca = sca, method = "glmer", ebayes = FALSE,
+             fitArgsD = list(nAGQ = 0))
+  lr  <- lrTest(fit, "exhaustion")
+} else {
+  message("[MAST] Fitting with patient as fixed blocking factor …")
+  contrasts(colData(sca)$patient) <- contr.sum(nlevels(colData(sca)$patient))
+  fml <- ~ patient + exhaustion + cngeneson + nCount_RNA + percent.mt + S.Score + G2M.Score
+  fit <- zlm(formula = fml, sca = sca, method = "bayesglm", ebayes = TRUE)
+  lr  <- lrTest(fit, "exhaustion")
+}
+
+# -------------------- extract results (correct orientation) -------------------
+# coef(fit, "C") returns a matrix with ROWS = genes and COLS = predictors.
+coefC <- suppressWarnings(coef(fit, "C"))  # genes x predictors
+
+# find the exhaustion COLUMN robustly
+find_exh_col <- function(nms) {
+  if (is.null(nms)) return(NA_integer_)
+  hit <- which(nms == "exhaustion")
+  if (!length(hit)) hit <- grep("^`?\\s*exhaustion\\s*`?$", nms)
+  if (!length(hit)) hit <- grep("exhaustion", nms, ignore.case = TRUE)
+  if (length(hit)) hit[1] else NA_integer_
+}
+exh_col_idx <- find_exh_col(colnames(coefC))
+if (is.na(exh_col_idx)) {
+  stop(
+    "Couldn't find an 'exhaustion' coefficient in the continuous part (columns).\n",
+    "Example predictor colnames: ", paste(head(colnames(coefC), 16), collapse = ", ")
+  )
+}
+
+# named vector (by gene) of exhaustion betas from the continuous part
+beta_vec <- coefC[, exh_col_idx]
+names(beta_vec) <- rownames(coefC)
+
+# lrTest gives the combined hurdle p-value per gene
+lr_df <- as.data.frame(lr)
+lr_df$gene <- rownames(lr_df)
+
+# align and finalize
+p_col <- intersect(c("hurdle.Pr(>Chisq)", "Pr(>Chisq)"), colnames(lr_df))
+if (length(p_col) == 0) stop("Couldn't find a p-value column in lrTest output.")
+p_col <- p_col[1]
+
+res <- tibble(
+  gene        = lr_df$gene,
+  p_combined  = lr_df[[p_col]],     # <-- use hurdle.Pr(>Chisq)
+  coef_cont   = beta_vec[lr_df$gene]
+) %>%
+  mutate(
+    q_combined = p.adjust(p_combined, "BH"),
+    direction  = dplyr::case_when(
+      is.na(coef_cont) ~ "unknown",
+      coef_cont > 0    ~ "up_with_exhaustion",
+      coef_cont < 0    ~ "down_with_exhaustion",
+      TRUE             ~ "flat"
+    )
+  ) %>%
+  arrange(q_combined, dplyr::desc(abs(coef_cont)))
+
+# -------------------- save --------------------
+dir.create("program_DE_exhaustion_mast", showWarnings = FALSE)
+write_csv(res, file.path("program_DE_exhaustion_mast", "mast_exhaustion_results_full.csv"))
+
+top_up   <- res %>% filter(q_combined < 0.05, direction == "up_with_exhaustion")
+top_down <- res %>% filter(q_combined < 0.05, direction == "down_with_exhaustion")
+write_csv(top_up,   file.path("program_DE_exhaustion_mast", "mast_exhaustion_top_up.csv"))
+write_csv(top_down, file.path("program_DE_exhaustion_mast", "mast_exhaustion_top_down.csv"))
+
+message(sprintf("[MAST] Genes tested: %d | q<0.05 up=%d down=%d → program_DE_exhaustion_mast/",
+                nrow(res), nrow(top_up), nrow(top_down)))
+```
+
+UMAP
+```{r}
+## ------------------------------------------------------------
+## Panel B — Global UMAP (labels on) + separate legend PDF
+## ------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(Seurat); library(ggplot2); library(dplyr); library(ggrepel); library(cowplot)
+})
+
+stopifnot(exists("srt"), "umap" %in% names(srt@reductions), "cell_class" %in% colnames(srt@meta.data))
+
+# --- palette (same as before) ---
+cell_levels <- sort(unique(srt$cell_class))
+pal <- c(
+  "CD8+ T-cells"="dodgerblue3","T cells"="steelblue3","Treg"="mediumorchid3",
+  "CD4+ T-cells"="royalblue1","TFH cells"="lightskyblue3",
+  "NK cells"="slateblue4","Monocytes"="darkorange2","Macrophages"="chocolate3",
+  "Dendritic cells"="tan3","Plasma cells"="goldenrod2","B cells"="gold3",
+  "Fibroblasts"="seagreen3","Endothelial cells"="darkseagreen","Pericytes"="olivedrab3",
+  "Tumor cells"="firebrick2","Goblet cells"="sienna3","Smooth muscle cells"="darkolivegreen",
+  "Schwann cells"="gray40","Innate lymphoid cells"="darkturquoise","Granulocytes"="thistle4",
+  "Enteroendocrine cells"="plum3","MAIT cells"="darkmagenta","iNKT cells"="mediumslateblue",
+  "γδ T-cells"="royalblue4","T cells (other)"="grey35","Unmapped"="gray70"
+)
+pal_use <- pal[intersect(names(pal), cell_levels)]
+
+# --- data.frame for plotting + centroids ---
+emb <- Embeddings(srt, "umap") %>% as.data.frame()
+emb$cell_class <- srt$cell_class
+centroids <- emb %>%
+  group_by(cell_class) %>%
+  summarise(UMAP_1 = median(UMAP_1), UMAP_2 = median(UMAP_2), .groups = "drop")
+
+# Manually nudge a few crowded labels to reduce overlap (edit as needed)
+nudge_tbl <- tibble::tribble(
+  ~cell_class,        ~dx,   ~dy,
+  "CD8+ T-cells",      1.2,  -0.8,
+  "γδ T-cells",       -1.2,   0.6,
+  "iNKT cells",        0.9,   0.6,
+  "MAIT cells",       -0.8,  -0.6
+)
+centroids <- centroids %>%
+  left_join(nudge_tbl, by = "cell_class") %>%
+  mutate(
+    dx = dplyr::coalesce(dx, 0),
+    dy = dplyr::coalesce(dy, 0),
+    label_x = UMAP_1 + dx,
+    label_y = UMAP_2 + dy
+  )
+
+# base UMAP (points)
+p_points <- ggplot(emb, aes(UMAP_1, UMAP_2, color = cell_class)) +
+  geom_point(size = 0.2, alpha = 0.85) +
+  theme_classic(base_size = 11) +
+  ggtitle("Global cell classes") +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "none",                       # <-- legend OFF in the main figure
+    plot.margin = margin(15, 70, 15, 15)           # extra right margin for labels
+  )
+if (length(pal_use)) p_points <- p_points + scale_color_manual(values = pal_use)
+
+# add non-overlapping labels (repel) at nudged centroid positions
+set.seed(12348934)
+p_classes_main <- p_points +
+  geom_text_repel(
+    data = centroids,
+    aes(x = label_x, y = label_y, label = cell_class),  # no color mapping here
+    inherit.aes = FALSE,
+    size = 3.3, fontface = "bold",
+    color = "black",               # <-- force labels to black
+    box.padding = 0.35, point.padding = 0.6, max.overlaps = Inf,
+    segment.size = 0.2, min.segment.length = 0
+  ) +
+  # ensure the canvas includes any nudged labels (prevents clipping)
+  expand_limits(x = centroids$label_x, y = centroids$label_y) +
+  coord_cartesian(clip = "off")
+
+# ----- make a standalone legend figure -----
+# Build a copy with legend on, then extract it
+p_with_legend <- p_points + theme(legend.position = "right") +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1), ncol = 1))
+leg_g <- cowplot::get_legend(p_with_legend)
+
+legend_plot <- cowplot::ggdraw(leg_g) +
+  theme(plot.margin = margin(10, 10, 10, 10))
+
+# ----- save PDFs -----
+dir.create("analysis_outputs/umap", showWarnings = FALSE, recursive = TRUE)
+
+# main UMAP (labels ON, legend OFF)
+ggsave("analysis_outputs/umap/PanelB1_umap_cell_classes.pdf",
+       p_classes_main, width = 6.8, height = 5.8, device = cairo_pdf, limitsize = FALSE)
+
+# legend-only PDF (for Illustrator)
+ggsave("analysis_outputs/umap/PanelB1_umap_cell_classes_LEGEND.pdf",
+       legend_plot, width = 3.2, height = 7.5, device = cairo_pdf, limitsize = FALSE)
+```
+
+

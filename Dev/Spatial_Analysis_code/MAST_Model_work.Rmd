@@ -1,0 +1,85 @@
+---
+title: "MAST_Visium_Analysis"
+author: "Alos Diallo"
+date: "2026-01-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(MAST)
+  library(dplyr)
+  library(readr)
+  library(tibble)
+})
+```
+
+```{r}
+# 0. Load the bridge library
+library(SingleCellExperiment)
+
+# --- Step 1: Load Data (Same as before) ---
+base_path <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/"
+
+counts <- readMM(paste0(base_path, "mast_counts.mtx"))
+metadata <- read_csv(paste0(base_path, "mast_metadata.csv"))
+gene_info <- read_csv(paste0(base_path, "mast_gene_info.csv"))
+
+# --- Step 2: Clean Metadata ---
+metadata_df <- as.data.frame(metadata) %>% column_to_rownames(var = "...1")
+gene_info_df <- as.data.frame(gene_info) %>% column_to_rownames(var = "...1")
+
+# --- Step 3: Create a SingleCellExperiment ---
+# This is the modern way to pass sparse data to MAST
+# We use 'counts' directly as it is already a sparse Matrix object
+sce <- SingleCellExperiment(
+    assays = list(counts = as(counts, "CsparseMatrix")),
+    colData = metadata_df,
+    rowData = gene_info_df
+)
+
+# --- Step 1: Ensure Log Transformation is Sparse ---
+# Use 'logcounts' as the assay name, as MAST looks for this by default
+assay(sce, "logcounts") <- log2(assay(sce, "counts") + 1)
+
+# --- Step 2: Convert to SingleCellAssay ---
+sca <- as(sce, "SingleCellAssay")
+
+# --- Step 3: Handle the missing IDs using Modern Syntax ---
+# rowData() replaces fData()
+# colData() replaces cData()
+rowData(sca)$primerid <- rownames(sca)
+colData(sca)$wellKey <- colnames(sca)
+
+# --- Step 4: Verify Factor Levels ---
+# Ensure the model knows which group is the baseline
+colData(sca)$region <- factor(colData(sca)$region, levels = c("Center Tumor (CT)", "Invasive Margin (IM)"))
+colData(sca)$mets_status <- factor(colData(sca)$mets_status, levels = c("No", "LN", "Distant"))
+colData(sca)$patient_id <- as.factor(colData(sca)$patient_id)
+
+# --- Step 5: Clean Memory ---
+rm(sce)
+gc()
+
+# Check the object
+print(sca)
+```
+```{r}
+# 1. Clear memory again
+gc()
+
+# 2. Run the additive model sequentially
+# It is better to wait 2 hours for a result than to crash 5 times in 10 minutes.
+zlm_additive <- zlm(~ region + mets_status + DC2_abundance + QC + MLH1 + patient_id, 
+                    sca, 
+                    parallel = FALSE)
+
+# 3. Save as soon as it's done
+saveRDS(zlm_additive, "zlm_additive_final.rds")
+```
+
