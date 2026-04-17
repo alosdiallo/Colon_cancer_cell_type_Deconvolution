@@ -1,0 +1,471 @@
+---
+title: "01_prep_samples_mac"
+author: "Alos Diallo"
+date: "2026-03-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#!/usr/bin/env Rscript
+# ============================================================
+# 01_prep_samples_mac.R
+# Run on Mac: reads .h5ad files, prepares Seurat objects,
+# saves each as .rds for CellChat on HPC.
+# ============================================================
+
+# --------------------------------------------------
+# Libraries
+# --------------------------------------------------
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(zellkonverter)
+  library(SingleCellExperiment)
+  library(dplyr)
+})
+
+# ============================================================
+# PATHS — UPDATE THESE FOR YOUR MAC
+# ============================================================
+base_dir   <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples"
+meta_path  <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+output_dir <- file.path(base_dir, "prepped_samples")
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================
+# LOAD CLINICAL METADATA
+# ============================================================
+clinical <- read.csv(meta_path, stringsAsFactors = FALSE)
+clinical$deident <- as.character(clinical$deident)
+
+# Identify valid sample h5ad files (exclude atlas/reference files)
+all_h5ad <- list.files(base_dir, pattern = "\\.h5ad$", full.names = FALSE)
+exclude_files <- c(
+  "Colon_cell_atlas.h5ad",
+  "data_0_adata.h5ad",
+  "reference.h5ad",
+  "SP18_16438_A3.h5ad",
+  "SP18_56_A19.h5ad"
+)
+
+sample_h5ad <- setdiff(all_h5ad, exclude_files)
+sample_ids  <- gsub("\\.h5ad$", "", sample_h5ad)
+
+cat("H5AD sample IDs found:", length(sample_ids), "\n")
+cat("Matched in clinical data:",
+    sum(sample_ids %in% clinical$deident), "/",
+    length(sample_ids), "\n")
+
+# ============================================================
+# CELL TYPE MAPPING
+# ============================================================
+map_c2l_to_celltype <- function(col_name) {
+  clean <- gsub("meanscell_abundance_w_sf_", "", col_name)
+  clean <- gsub("means_cell_abundance_w_sf_", "", clean)
+
+  if (grepl("^Tumor", clean)) return("Tumor")
+  if (grepl("^cE", clean)) return("Epithelial")
+
+  if (grepl("^cS", clean)) {
+    num <- as.integer(gsub("\\D", "", sub("\\s.*", "", clean)))
+    if (!is.na(num)) {
+      if (num >= 1 & num <= 14) return("Endothelial")
+      if (num == 32) return("Smooth_muscle")
+      if (num %in% c(27, 28, 29, 30, 31)) return("CAF")
+      if (num == 26) return("Myofibroblast")
+      if (num %in% c(22, 25)) return("Fibroblast")
+      if (num %in% c(15, 16, 17, 18, 19, 20)) return("Pericyte")
+      if (num == 33) return("Schwann")
+    }
+    return("Fibroblast")
+  }
+
+  if (grepl("^cB", clean)) return("B_cell")
+  if (grepl("^cP", clean)) return("Plasma")
+
+  if (grepl("^cMA", clean)) return("Mast")
+  if (grepl("^cM", clean)) {
+    if (grepl("cM10", clean)) return("Granulocyte")
+    if (grepl("cM01|cM02", clean)) return("Macrophage")
+    return("DC")
+  }
+
+  if (grepl("^cTNI", clean)) {
+    num <- as.integer(gsub("\\D", "", sub("\\s.*", "", clean)))
+    if (!is.na(num)) {
+      if (num >= 1 & num <= 7) return("CD4_T")
+      if (num %in% c(8, 9)) return("Treg")
+      if (num %in% c(10, 11, 12, 13)) return("CD8_T")
+      if (num %in% c(14, 15, 16)) return("CD8_T_exhausted")
+      if (num %in% c(17, 18)) return("gdT")
+      if (num %in% c(19, 20, 21, 22)) return("Other_T")
+      if (num %in% c(23, 24, 25)) return("NK")
+      if (num == 26) return("ILC")
+    }
+    return("Other_T")
+  }
+
+  return("Other")
+}
+
+# ============================================================
+# FUNCTION: LOAD AND PREPARE ONE SAMPLE
+# ============================================================
+load_and_prepare_sample <- function(sample_id, base_dir,
+                                    min_spots_per_type = 10,
+                                    immune_rescue_threshold = 0.10,
+                                    max_spots_per_type = 500) {
+
+  h5ad_path <- file.path(base_dir, paste0(sample_id, ".h5ad"))
+  if (!file.exists(h5ad_path)) stop("File not found: ", h5ad_path)
+
+  cat("\n========================================\n")
+  cat("Loading sample:", sample_id, "\n")
+  cat("========================================\n")
+
+  sce <- readH5AD(h5ad_path)
+  cd  <- as.data.frame(colData(sce))
+
+  # 1. Counts
+  spatial_counts <- assay(sce, "X")
+  cat("  Dimensions:", nrow(sce), "genes x", ncol(sce), "spots\n")
+
+  # 2. Spatial coordinates
+  spatial_coords <- as.matrix(reducedDim(sce, "spatial"))
+  colnames(spatial_coords) <- c("x", "y")
+
+  # 3. Cell2Location abundance matrix from reducedDims/obsm
+  available_obsm <- reducedDimNames(sce)
+  cat("  Available obsm slots:", paste(available_obsm, collapse = ", "), "\n")
+
+  c2l_name <- grep("means_cell_abundance_w_sf|mean_cell_abundance",
+                   available_obsm, value = TRUE, ignore.case = TRUE)
+
+  if (length(c2l_name) == 0) {
+    stop("No Cell2Location abundance matrix found in obsm for sample ", sample_id,
+         "\nAvailable obsm: ", paste(available_obsm, collapse = ", "))
+  }
+
+  cat("  Using obsm slot:", c2l_name[1], "\n")
+  c2l_matrix <- as.matrix(reducedDim(sce, c2l_name[1]))
+
+  cat("  Cell2Location matrix:", nrow(c2l_matrix), "spots x",
+      ncol(c2l_matrix), "cell types\n")
+  cat("  Column names (first 5):",
+      paste(head(colnames(c2l_matrix), 5), collapse = ", "), "\n")
+
+  # 4. Map columns to consolidated types
+  col_mapping <- sapply(colnames(c2l_matrix), map_c2l_to_celltype)
+  cat("  Cell type mapping:\n")
+  print(table(col_mapping))
+
+  # 5. Aggregate
+  unique_types <- unique(col_mapping)
+  agg_matrix <- matrix(0, nrow = nrow(c2l_matrix), ncol = length(unique_types))
+  colnames(agg_matrix) <- unique_types
+  rownames(agg_matrix) <- rownames(c2l_matrix)
+
+  for (ct in unique_types) {
+    cols_for_ct <- which(col_mapping == ct)
+    if (length(cols_for_ct) == 1) {
+      agg_matrix[, ct] <- c2l_matrix[, cols_for_ct]
+    } else {
+      agg_matrix[, ct] <- rowSums(c2l_matrix[, cols_for_ct, drop = FALSE])
+    }
+  }
+
+  # 6. Winner-take-all + immune rescue
+  dominant_type <- apply(agg_matrix, 1, function(row) {
+    colnames(agg_matrix)[which.max(row)]
+  })
+  names(dominant_type) <- rownames(agg_matrix)
+
+  immune_types <- c("CD8_T", "CD8_T_exhausted", "CD4_T", "Treg",
+                    "Macrophage", "DC", "NK", "B_cell")
+
+  n_rescued <- 0
+  for (spot in names(dominant_type)) {
+    if (dominant_type[spot] %in% immune_types) next
+
+    immune_cols <- intersect(colnames(agg_matrix), immune_types)
+    if (length(immune_cols) == 0) next
+
+    immune_vals <- agg_matrix[spot, immune_cols]
+    top_immune <- names(immune_vals)[which.max(immune_vals)]
+    top_immune_val <- max(immune_vals)
+    total_val <- sum(agg_matrix[spot, ])
+
+    if (total_val > 0 && (top_immune_val / total_val) > immune_rescue_threshold) {
+      dominant_type[spot] <- top_immune
+      n_rescued <- n_rescued + 1
+    }
+  }
+
+  cat("  Immune rescue: relabeled", n_rescued,
+      "spots (threshold:", immune_rescue_threshold, ")\n")
+
+  # 7. Histology
+  if ("histology" %in% colnames(cd)) {
+    histology <- cd$histology
+    names(histology) <- rownames(cd)
+    cat("  Histology column found\n")
+  } else {
+    histology <- rep("unknown", nrow(cd))
+    names(histology) <- rownames(cd)
+  }
+
+  # 8. Report/filter
+  type_counts <- sort(table(dominant_type), decreasing = TRUE)
+  cat("  Cell type distribution (after immune rescue):\n")
+  print(type_counts)
+
+  rare_types <- names(type_counts[type_counts < min_spots_per_type])
+  if (length(rare_types) > 0) {
+    cat("  Merging rare types (<", min_spots_per_type, "spots):",
+        paste(rare_types, collapse = ", "), "\n")
+    dominant_type[dominant_type %in% rare_types] <- "Other"
+  }
+
+  keep <- dominant_type != "Other"
+  cat("  Keeping", sum(keep), "of", length(keep), "spots\n")
+
+  if (sum(keep) < 50) {
+    warning("Sample ", sample_id, " has very few usable spots (", sum(keep), ")")
+  }
+
+  counts_use <- spatial_counts[, keep, drop = FALSE]
+  coords_use <- spatial_coords[keep, , drop = FALSE]
+  meta_use   <- data.frame(
+    labels    = dominant_type[keep],
+    histology = histology[keep],
+    row.names = names(dominant_type)[keep]
+  )
+
+  # 9. Stratified downsampling
+  keep_indices <- c()
+  for (ct in unique(meta_use$labels)) {
+    ct_idx <- which(meta_use$labels == ct)
+    if (length(ct_idx) > max_spots_per_type) {
+      set.seed(42)
+      ct_idx <- sample(ct_idx, max_spots_per_type)
+    }
+    keep_indices <- c(keep_indices, ct_idx)
+  }
+
+  counts_use <- counts_use[, keep_indices, drop = FALSE]
+  coords_use <- coords_use[keep_indices, , drop = FALSE]
+  meta_use   <- meta_use[keep_indices, , drop = FALSE]
+
+  cat("  Downsampled from", sum(keep), "to", length(keep_indices), "spots\n")
+  cat("  Post-downsample distribution:\n")
+  print(table(meta_use$labels))
+
+  # 10. Normalize
+  seu <- CreateSeuratObject(counts = counts_use, meta.data = meta_use)
+  seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 10000)
+
+  # Seurat v5 compatibility
+  data_norm <- tryCatch(
+    GetAssayData(seu, layer = "data", assay = "RNA"),
+    error = function(e) GetAssayData(seu, slot = "data", assay = "RNA")
+  )
+
+  # 11. Spatial factors
+  spot_size_um <- 65
+  conversion_factor <- 0.5686331
+
+  spatial_factors <- data.frame(
+    ratio = as.numeric(conversion_factor),
+    tol   = as.numeric(spot_size_um / 2)
+  )
+
+  return(list(
+    data            = data_norm,
+    meta            = meta_use,
+    coords          = coords_use,
+    spatial_factors = spatial_factors,
+    sample_id       = sample_id,
+    seu             = seu,
+    c2l_agg         = agg_matrix[keep, , drop = FALSE][keep_indices, , drop = FALSE]
+  ))
+}
+
+# ============================================================
+# PROCESS ALL SAMPLES AND SAVE
+# ============================================================
+failed_samples <- c()
+
+for (sid in sample_ids) {
+  tryCatch({
+    prep <- load_and_prepare_sample(
+      sample_id               = sid,
+      base_dir                = base_dir,
+      min_spots_per_type      = 10,
+      immune_rescue_threshold = 0.10,
+      max_spots_per_type      = 500
+    )
+
+    saveRDS(prep, file.path(output_dir, paste0("prep_", sid, ".rds")))
+    cat("✓ Sample", sid, "saved\n")
+
+  }, error = function(e) {
+    cat("✗ Sample", sid, "FAILED:", conditionMessage(e), "\n")
+    failed_samples <<- c(failed_samples, sid)
+  })
+}
+
+cat("\n========================================\n")
+cat("Completed:", length(sample_ids) - length(failed_samples),
+    "of", length(sample_ids), "samples\n")
+if (length(failed_samples) > 0) {
+  cat("Failed:", paste(failed_samples, collapse = ", "), "\n")
+  writeLines(failed_samples, file.path(output_dir, "failed_samples.txt"))
+}
+cat("Prepped RDS files saved to:", output_dir, "\n")
+cat("\nNext: copy the prepped_samples/ folder to the HPC and run 02_cellchat_hpc.R\n")
+```
+
+
+Diagnostic 
+```{r warning=FALSE}
+
+library(zellkonverter)
+library(SingleCellExperiment)
+
+base_dir <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/"
+
+# Your mapping function
+map_c2l_to_celltype <- function(col_name) {
+  clean <- gsub("meanscell_abundance_w_sf_", "", col_name)
+  clean <- gsub("means_cell_abundance_w_sf_", "", clean)
+  if (grepl("^Tumor", clean)) return("Tumor")
+  if (grepl("^cE", clean)) return("Epithelial")
+  if (grepl("^cS", clean)) {
+    num <- as.integer(gsub("\\D", "", sub("\\s.*", "", clean)))
+    if (!is.na(num)) {
+      if (num >= 1 & num <= 14) return("Endothelial")
+      if (num == 32) return("Smooth_muscle")
+      if (num %in% c(27, 28, 29, 30, 31)) return("CAF")
+      if (num == 26) return("Myofibroblast")
+      if (num %in% c(22, 25)) return("Fibroblast")
+      if (num %in% c(15, 16, 17, 18, 19, 20)) return("Pericyte")
+      if (num == 33) return("Schwann")
+    }
+    return("Fibroblast")
+  }
+  if (grepl("^cB", clean)) return("B_cell")
+  if (grepl("^cP", clean)) return("Plasma")
+  if (grepl("^cMA", clean)) return("Mast")
+  if (grepl("^cM", clean)) {
+    if (grepl("cM10", clean)) return("Granulocyte")
+    if (grepl("cM01|cM02", clean)) return("Macrophage")
+    return("DC")
+  }
+  if (grepl("^cTNI", clean)) {
+    num <- as.integer(gsub("\\D", "", sub("\\s.*", "", clean)))
+    if (!is.na(num)) {
+      if (num >= 1 & num <= 7) return("CD4_T")
+      if (num %in% c(8, 9)) return("Treg")
+      if (num %in% c(10, 11, 12, 13)) return("CD8_T")
+      if (num %in% c(14, 15, 16)) return("CD8_T_exhausted")
+      if (num %in% c(17, 18)) return("gdT")
+      if (num %in% c(19, 20, 21, 22)) return("Other_T")
+      if (num %in% c(23, 24, 25)) return("NK")
+      if (num == 26) return("ILC")
+    }
+    return("Other_T")
+  }
+  return("Other")
+}
+
+# Exclude files
+all_h5ad <- list.files(base_dir, pattern = "\\.h5ad$", full.names = FALSE)
+exclude_files <- c("Colon_cell_atlas.h5ad", "data_0_adata.h5ad",
+                    "reference.h5ad", "SP18_16438_A3.h5ad", "SP18_56_A19.h5ad")
+sample_h5ad <- setdiff(all_h5ad, exclude_files)
+sample_ids <- gsub("\\.h5ad$", "", sample_h5ad)
+
+immune_types <- c("CD8_T", "CD8_T_exhausted", "CD4_T", "Treg",
+                  "Macrophage", "DC", "NK", "B_cell")
+
+results <- list()
+
+for (sid in sample_ids) {
+  cat("Processing:", sid, "\n")
+  tryCatch({
+    sce <- readH5AD(file.path(base_dir, paste0(sid, ".h5ad")))
+    c2l <- as.matrix(reducedDim(sce, "means_cell_abundance_w_sf"))
+    col_mapping <- sapply(colnames(c2l), map_c2l_to_celltype)
+
+    # Aggregate by cell type
+    unique_types <- unique(col_mapping)
+    agg <- sapply(unique_types, function(ct) {
+      cols <- which(col_mapping == ct)
+      if (length(cols) == 1) c2l[, cols] else rowSums(c2l[, cols, drop = FALSE])
+    })
+
+    total <- rowSums(agg)
+
+    # CD8_T stats
+    cd8_prop <- if ("CD8_T" %in% colnames(agg)) agg[, "CD8_T"] / total else rep(0, nrow(agg))
+    cd8exh_prop <- if ("CD8_T_exhausted" %in% colnames(agg)) agg[, "CD8_T_exhausted"] / total else rep(0, nrow(agg))
+
+    # Where is CD8 the top immune type?
+    immune_cols <- intersect(colnames(agg), immune_types)
+    if (length(immune_cols) > 0) {
+      immune_mat <- agg[, immune_cols, drop = FALSE]
+      top_immune <- colnames(immune_mat)[apply(immune_mat, 1, which.max)]
+      cd8_is_top <- sum(top_immune == "CD8_T")
+      cd8exh_is_top <- sum(top_immune == "CD8_T_exhausted")
+      cd8_top_props <- cd8_prop[top_immune == "CD8_T"]
+    } else {
+      cd8_is_top <- 0
+      cd8exh_is_top <- 0
+      cd8_top_props <- numeric(0)
+    }
+
+    results[[sid]] <- data.frame(
+      sample = sid,
+      n_spots = nrow(agg),
+      cd8_gt_003 = sum(cd8_prop > 0.03),
+      cd8_gt_005 = sum(cd8_prop > 0.05),
+      cd8_gt_010 = sum(cd8_prop > 0.10),
+      cd8exh_gt_003 = sum(cd8exh_prop > 0.03),
+      cd8exh_gt_005 = sum(cd8exh_prop > 0.05),
+      cd8exh_gt_010 = sum(cd8exh_prop > 0.10),
+      cd8_top_immune_spots = cd8_is_top,
+      cd8exh_top_immune_spots = cd8exh_is_top,
+      cd8_top_median_prop = if (length(cd8_top_props) > 0) median(cd8_top_props) else NA,
+      cd8_top_mean_prop = if (length(cd8_top_props) > 0) mean(cd8_top_props) else NA
+    )
+  }, error = function(e) {
+    cat("  FAILED:", conditionMessage(e), "\n")
+  })
+}
+
+df <- do.call(rbind, results)
+print(df, row.names = FALSE)
+
+cat("\n=== TOTALS ACROSS ALL SAMPLES ===\n")
+cat("Spots where CD8_T proportion > 0.03:", sum(df$cd8_gt_003), "\n")
+cat("Spots where CD8_T proportion > 0.05:", sum(df$cd8_gt_005), "\n")
+cat("Spots where CD8_T proportion > 0.10:", sum(df$cd8_gt_010), "\n")
+cat("Spots where CD8_T is top immune type:", sum(df$cd8_top_immune_spots), "\n")
+cat("Spots where CD8_T_exhausted is top immune:", sum(df$cd8exh_top_immune_spots), "\n")
+cat("Median CD8 proportion (where CD8 is top immune):", median(df$cd8_top_median_prop, na.rm = TRUE), "\n")
+```
+
+
+
+
+

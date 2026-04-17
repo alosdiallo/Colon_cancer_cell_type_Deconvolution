@@ -18,10 +18,10 @@ library(SingleCellExperiment)
 library(patchwork)
 library(SeuratData)
 options(timeout = 1000) 
-InstallData('pbmc3k')
-InstallData("pbmcMultiome")
+InstallData('pbmc3k.SeuratData')
+#InstallData("pbmcMultiome.SeuratData")
 #https://github.com/satijalab/seurat/issues/5333
-library(pbmcMultiome.SeuratData)
+#library(pbmcMultiome.SeuratData)
 library(pbmc3k.SeuratData)
 
 #Run if below does not work
@@ -56,7 +56,7 @@ library(pbmc3k.SeuratData)
 Getting PBMC reference data
 ```{r message=FALSE, warning=FALSE, include=FALSE}
 
-pbmc.rna <- LoadData("pbmcMultiome", "pbmc.rna")
+pbmc.rna <- LoadData("pbmc.rna")
 pbmc.rna <- subset(pbmc.rna, seurat_annotations != "filtered")
 pbmc.rna <- NormalizeData(pbmc.rna)
 pbmc.rna <- FindVariableFeatures(pbmc.rna)
@@ -68,12 +68,12 @@ holder = pbmc.rna
 ```
 
 ```{r}
-options(future.globals.maxSize = 10 * 1024^3)  # 10 GB
+options(future.globals.maxSize = 70 * 1024^3)  # 10 GB
 ```
 
 ```{r}
 # Read the .h5ad file
-sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/127_A8-6_0_adata.h5ad")
+sce <- readH5AD("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/127.h5ad")
 hires_image <- metadata(sce)$spatial$X127_A8.6$images$hires
 
 # Assuming the image matrix is normalized, scale it to 0-255
@@ -146,7 +146,7 @@ Atlas
 ```{r}
 
 # Load the Seurat object from an RDS file
-atlas <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/atlas_data.rds")
+atlas <- readRDS("/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples/atlas_data.rds")
 
 # Normalize the atlas data using LogNormalize
 atlas <- NormalizeData(atlas, normalization.method = "LogNormalize", scale.factor = 10000)

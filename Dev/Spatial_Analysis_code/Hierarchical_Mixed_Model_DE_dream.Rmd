@@ -1,0 +1,462 @@
+---
+title: " Hierarchical Mixed Model DE — dream"
+author: "Alos Diallo"
+date: "2026-03-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ==============================================================================
+# Hierarchical Mixed Model DE — dream (variancePartition)
+# Run per cell type on Mac
+# ==============================================================================
+
+library(variancePartition)
+library(edgeR)
+library(limma)
+
+# ==============================================================================
+# 1. CONFIGURATION — change cell_type to run each one
+# ==============================================================================
+
+base_dir <- "/Users/adiallo/Desktop/Thesis/Results/AIM_2_Results/Differential_analysis"
+
+cell_types <- c("01_Tumor", "02_CD8_exhausted", "03_CD8_intermediate",
+                "04_CD8_progenitor", "05_CD8_all", "06_CAF",
+                "07_DC1", "08_DC2", "09_Macrophage", "10_Treg")
+
+for (cell_type in cell_types) {
+    
+    cat("\n", paste(rep("=", 70), collapse=""), "\n")
+    cat("Processing:", cell_type, "\n")
+    cat(paste(rep("=", 70), collapse=""), "\n")
+    
+    input_dir <- file.path(base_dir, cell_type)
+    output_dir <- file.path(input_dir, "dream_results")
+    dir.create(output_dir, showWarnings = FALSE)
+    
+    # ==============================================================================
+    # 2. LOAD DATA
+    # ==============================================================================
+    
+    counts_file <- file.path(input_dir, "pseudobulk_counts.csv")
+    meta_file <- file.path(input_dir, "pseudobulk_metadata.csv")
+    
+    if (!file.exists(counts_file) || !file.exists(meta_file)) {
+        cat("  Missing files, skipping\n")
+        next
+    }
+    
+    counts_df <- read.csv(counts_file, row.names = 1, check.names = FALSE)
+    meta_df <- read.csv(meta_file, row.names = 1)
+    
+    # Counts are samples-as-rows, genes-as-columns — need to transpose
+    counts_mat <- t(as.matrix(counts_df))
+    
+    # Ensure alignment
+    shared <- intersect(colnames(counts_mat), rownames(meta_df))
+    counts_mat <- counts_mat[, shared]
+    meta_df <- meta_df[shared, ]
+    
+    cat("  Samples:", ncol(counts_mat), "\n")
+    cat("  Genes:", nrow(counts_mat), "\n")
+    cat("  Patients:", length(unique(meta_df$patient_id)), "\n")
+    
+    # ==============================================================================
+    # 3. SETUP FACTORS
+    # ==============================================================================
+    
+    meta_df$patient_id <- as.factor(as.character(meta_df$patient_id))
+    meta_df$region <- factor(meta_df$region, levels = c("CT", "IM", "Stroma"))
+    meta_df$mets_status <- factor(meta_df$mets_status, levels = c("No_Mets", "LN_Mets", "Distant_Mets"))
+    meta_df$sex <- as.factor(meta_df$sex)
+    meta_df$MLH1 <- as.factor(meta_df$MLH1)
+    meta_df$log_n_spots <- log(meta_df$n_spots)
+    
+    cat("\n  Region x Mets:\n")
+    print(table(meta_df$region, meta_df$mets_status))
+    
+    # Check: need at least 2 regions and 2 patients per region
+    if (length(unique(meta_df$region)) < 2) {
+        cat("  Only 1 region, skipping\n")
+        next
+    }
+    
+    # ==============================================================================
+    # 4. FILTER AND NORMALIZE
+    # ==============================================================================
+    
+    dge <- DGEList(counts = counts_mat)
+    
+    # Filter lowly expressed genes
+    keep <- filterByExpr(dge, group = meta_df$region)
+    dge <- dge[keep, , keep.lib.sizes = FALSE]
+    cat("  Genes after filtering:", nrow(dge), "\n")
+    
+    dge <- calcNormFactors(dge)
+    
+    # ==============================================================================
+    # 5. FIT HIERARCHICAL MODEL
+    # ==============================================================================
+    
+    cat("  Fitting dream model...\n")
+    
+    # Formula with patient random intercept
+    form <- ~ region + mets_status + region:mets_status + MLH1 + age + sex + log_n_spots + (1|patient_id)
+    
+    # Try fitting — may fail if design is rank-deficient for small cell types
+    tryCatch({
+        vobjDream <- voomWithDreamWeights(dge, form, meta_df)
+        fitmm <- dream(vobjDream, form, meta_df)
+        fitmm <- eBayes(fitmm)
+        
+        cat("  Model fit successfully\n")
+        cat("  Coefficients:", paste(colnames(coef(fitmm)), collapse=", "), "\n")
+        
+        # ==============================================================
+        # 6. EXTRACT ALL CONTRASTS
+        # ==============================================================
+        
+        all_coefs <- colnames(coef(fitmm))
+        summary_rows <- list()
+        
+        for (coef_name in all_coefs) {
+            if (coef_name == "(Intercept)") next
+            
+            res <- topTable(fitmm, coef = coef_name, number = Inf, sort.by = "P")
+            res$gene <- rownames(res)
+            res$contrast <- coef_name
+            
+            n_sig <- sum(res$adj.P.Val < 0.05, na.rm = TRUE)
+            n_up <- sum(res$adj.P.Val < 0.05 & res$logFC > 0, na.rm = TRUE)
+            n_down <- sum(res$adj.P.Val < 0.05 & res$logFC < 0, na.rm = TRUE)
+            
+            # Top gene
+            top <- res[1, ]
+            
+            cat(sprintf("    %s: %d DE genes (up=%d, down=%d) | top: %s (padj=%.2e, lfc=%.2f)\n",
+                        coef_name, n_sig, n_up, n_down, top$gene, top$adj.P.Val, top$logFC))
+            
+            # Clean filename
+            clean_name <- gsub(":", "_x_", coef_name)
+            clean_name <- gsub(" ", "", clean_name)
+            write.csv(res, file.path(output_dir, paste0("dream_", clean_name, ".csv")), row.names = FALSE)
+            
+            summary_rows[[coef_name]] <- data.frame(
+                cell_type = cell_type,
+                contrast = coef_name,
+                n_sig_005 = n_sig,
+                n_up = n_up,
+                n_down = n_down,
+                top_gene = top$gene,
+                top_padj = top$adj.P.Val,
+                top_lfc = top$logFC,
+                stringsAsFactors = FALSE
+            )
+        }
+        
+        # Save summary
+        summary_df <- do.call(rbind, summary_rows)
+        write.csv(summary_df, file.path(output_dir, "dream_summary.csv"), row.names = FALSE)
+        
+        # ==============================================================
+        # 7. ALSO FIT SIMPLER MODEL FOR COMPARISON
+        # ==============================================================
+        # Regional contrasts only (no interaction) — cleaner for main effects
+        
+        cat("  Fitting simplified model (no interaction)...\n")
+        form_simple <- ~ region + mets_status + MLH1 + age + sex + log_n_spots + (1|patient_id)
+        
+        vobjSimple <- voomWithDreamWeights(dge, form_simple, meta_df)
+        fitSimple <- dream(vobjSimple, form_simple, meta_df)
+        fitSimple <- eBayes(fitSimple)
+        
+        # Extract main effects
+        for (coef_name in c("regionIM", "regionStroma", "mets_statusLN_Mets", "mets_statusDistant_Mets")) {
+            if (!(coef_name %in% colnames(coef(fitSimple)))) next
+            
+            res <- topTable(fitSimple, coef = coef_name, number = Inf, sort.by = "P")
+            res$gene <- rownames(res)
+            n_sig <- sum(res$adj.P.Val < 0.05, na.rm = TRUE)
+            cat(sprintf("    [simple] %s: %d DE genes\n", coef_name, n_sig))
+            
+            clean_name <- gsub(":", "_x_", coef_name)
+            write.csv(res, file.path(output_dir, paste0("dream_simple_", clean_name, ".csv")), row.names = FALSE)
+        }
+        
+        # ==============================================================
+        # 8. COMPARISON: dream vs DESeq2 gene counts
+        # ==============================================================
+        
+        # Load DESeq2 summary if available
+        deseq_summary_file <- file.path(input_dir, "DE_summary.csv")
+        if (file.exists(deseq_summary_file)) {
+            deseq_summary <- read.csv(deseq_summary_file)
+            cat("\n  DESeq2 vs dream comparison:\n")
+            cat(sprintf("    %-30s %8s %8s\n", "Contrast", "DESeq2", "dream"))
+            cat(paste(rep("-", 50), collapse=""), "\n")
+            
+            # Map DESeq2 contrast names to dream coefficient names
+            contrast_map <- list(
+                "IM_vs_CT__No_Mets" = "regionIM",
+                "Stroma_vs_CT__No_Mets" = "regionStroma",
+                "LN_vs_No__CT" = "mets_statusLN_Mets",
+                "Distant_vs_No__CT" = "mets_statusDistant_Mets"
+            )
+            
+            for (deseq_name in names(contrast_map)) {
+                dream_name <- contrast_map[[deseq_name]]
+                
+                deseq_n <- deseq_summary$n_sig_005[deseq_summary$contrast == deseq_name]
+                dream_n <- summary_df$n_sig_005[summary_df$contrast == dream_name]
+                
+                if (length(deseq_n) > 0 && length(dream_n) > 0) {
+                    cat(sprintf("    %-30s %8d %8d\n", deseq_name, deseq_n, dream_n))
+                }
+            }
+        }
+        
+    }, error = function(e) {
+        cat("  ERROR:", conditionMessage(e), "\n")
+        cat("  This can happen with small sample sizes or rank-deficient designs.\n")
+        cat("  Try the simplified model without interaction terms.\n")
+        
+        # Fallback: simpler model
+        tryCatch({
+            form_fallback <- ~ region + mets_status + MLH1 + age + sex + (1|patient_id)
+            vobjFB <- voomWithDreamWeights(dge, form_fallback, meta_df)
+            fitFB <- dream(vobjFB, form_fallback, meta_df)
+            fitFB <- eBayes(fitFB)
+            
+            for (coef_name in colnames(coef(fitFB))) {
+                if (coef_name == "(Intercept)") next
+                res <- topTable(fitFB, coef = coef_name, number = Inf, sort.by = "P")
+                n_sig <- sum(res$adj.P.Val < 0.05, na.rm = TRUE)
+                cat(sprintf("    [fallback] %s: %d DE genes\n", coef_name, n_sig))
+                res$gene <- rownames(res)
+                write.csv(res, file.path(output_dir, paste0("dream_fallback_", coef_name, ".csv")), row.names = FALSE)
+            }
+        }, error = function(e2) {
+            cat("  Fallback also failed:", conditionMessage(e2), "\n")
+        })
+    })
+}
+
+cat("\n\nAll cell types processed.\n")
+cat("Results saved in dream_results/ subdirectory of each cell type folder.\n")
+```
+
+
+
+```{r}
+# Check versions
+packageVersion("lme4")
+packageVersion("lmerTest")
+packageVersion("variancePartition")
+```
+
+```{r}
+# Alternative: limma with duplicateCorrelation (no lme4 dependency)
+library(edgeR)
+library(limma)
+
+base_dir <- "/Users/adiallo/Desktop/Thesis/Results/AIM_2_Results/Differential_analysis"
+
+cell_types <- c("01_Tumor", "02_CD8_exhausted", "03_CD8_intermediate",
+                "04_CD8_progenitor", "05_CD8_all", "06_CAF",
+                "07_DC1", "08_DC2", "09_Macrophage", "10_Treg")
+
+for (cell_type in cell_types) {
+    
+    cat("\n", paste(rep("=", 70), collapse=""), "\n")
+    cat("Processing:", cell_type, "\n")
+    cat(paste(rep("=", 70), collapse=""), "\n")
+    
+    input_dir <- file.path(base_dir, cell_type)
+    output_dir <- file.path(input_dir, "dream_results")
+    dir.create(output_dir, showWarnings = FALSE)
+    
+    counts_file <- file.path(input_dir, "pseudobulk_counts.csv")
+    meta_file <- file.path(input_dir, "pseudobulk_metadata.csv")
+    
+    if (!file.exists(counts_file) || !file.exists(meta_file)) {
+        cat("  Missing files, skipping\n")
+        next
+    }
+    
+    counts_df <- read.csv(counts_file, row.names = 1, check.names = FALSE)
+    meta_df <- read.csv(meta_file, row.names = 1)
+    
+    counts_mat <- t(as.matrix(counts_df))
+    
+    shared <- intersect(colnames(counts_mat), rownames(meta_df))
+    counts_mat <- counts_mat[, shared]
+    meta_df <- meta_df[shared, ]
+    
+    cat("  Samples:", ncol(counts_mat), "\n")
+    cat("  Genes:", nrow(counts_mat), "\n")
+    cat("  Patients:", length(unique(meta_df$patient_id)), "\n")
+    
+    # Setup factors
+    meta_df$patient_id <- as.factor(as.character(meta_df$patient_id))
+    meta_df$region <- factor(meta_df$region, levels = c("CT", "IM", "Stroma"))
+    meta_df$mets_status <- factor(meta_df$mets_status, levels = c("No_Mets", "LN_Mets", "Distant_Mets"))
+    meta_df$sex <- as.factor(meta_df$sex)
+    meta_df$MLH1 <- as.factor(meta_df$MLH1)
+    meta_df$log_n_spots <- log(meta_df$n_spots)
+    
+    cat("\n  Region x Mets:\n")
+    print(table(meta_df$region, meta_df$mets_status))
+    
+    if (length(unique(meta_df$region)) < 2) {
+        cat("  Only 1 region, skipping\n")
+        next
+    }
+    
+    # Filter and normalize
+    dge <- DGEList(counts = counts_mat)
+    keep <- filterByExpr(dge, group = meta_df$region)
+    dge <- dge[keep, , keep.lib.sizes = FALSE]
+    cat("  Genes after filtering:", nrow(dge), "\n")
+    dge <- calcNormFactors(dge)
+    
+    # ==============================================================
+    # FIT WITH duplicateCorrelation (limma's repeated measures)
+    # ==============================================================
+    
+    cat("  Fitting limma + duplicateCorrelation...\n")
+    
+    tryCatch({
+        # Fixed effects design matrix (no random effects here)
+        design <- model.matrix(~ region + mets_status + region:mets_status + 
+                                 MLH1 + age + sex + log_n_spots, data = meta_df)
+        
+        # Voom transform
+        v <- voom(dge, design)
+        
+        # Estimate within-patient correlation
+        corfit <- duplicateCorrelation(v, design, block = meta_df$patient_id)
+        cat("  Within-patient correlation:", round(corfit$consensus, 3), "\n")
+        
+        # Re-run voom with the correlation estimate
+        v <- voom(dge, design, block = meta_df$patient_id, correlation = corfit$consensus)
+        
+        # Re-estimate correlation on updated voom weights
+        corfit <- duplicateCorrelation(v, design, block = meta_df$patient_id)
+        cat("  Refined correlation:", round(corfit$consensus, 3), "\n")
+        
+        # Fit the model accounting for within-patient correlation
+        fit <- lmFit(v, design, block = meta_df$patient_id, correlation = corfit$consensus)
+        fit <- eBayes(fit)
+        
+        cat("  Model fit successfully\n")
+        cat("  Coefficients:", paste(colnames(coef(fit)), collapse=", "), "\n")
+        
+        # ==============================================================
+        # EXTRACT ALL CONTRASTS
+        # ==============================================================
+        
+        all_coefs <- colnames(coef(fit))
+        summary_rows <- list()
+        
+        for (coef_name in all_coefs) {
+            if (coef_name == "(Intercept)") next
+            
+            res <- topTable(fit, coef = coef_name, number = Inf, sort.by = "P")
+            res$gene <- rownames(res)
+            res$contrast <- coef_name
+            
+            n_sig <- sum(res$adj.P.Val < 0.05, na.rm = TRUE)
+            n_up <- sum(res$adj.P.Val < 0.05 & res$logFC > 0, na.rm = TRUE)
+            n_down <- sum(res$adj.P.Val < 0.05 & res$logFC < 0, na.rm = TRUE)
+            
+            top <- res[1, ]
+            
+            cat(sprintf("    %s: %d DE genes (up=%d, down=%d) | top: %s (padj=%.2e, lfc=%.2f)\n",
+                        coef_name, n_sig, n_up, n_down, top$gene, top$adj.P.Val, top$logFC))
+            
+            clean_name <- gsub(":", "_x_", coef_name)
+            clean_name <- gsub(" ", "", clean_name)
+            write.csv(res, file.path(output_dir, paste0("hierarchical_", clean_name, ".csv")), row.names = FALSE)
+            
+            summary_rows[[coef_name]] <- data.frame(
+                cell_type = cell_type,
+                contrast = coef_name,
+                n_sig_005 = n_sig,
+                n_up = n_up,
+                n_down = n_down,
+                top_gene = top$gene,
+                top_padj = top$adj.P.Val,
+                top_lfc = top$logFC,
+                stringsAsFactors = FALSE
+            )
+        }
+        
+        summary_df <- do.call(rbind, summary_rows)
+        write.csv(summary_df, file.path(output_dir, "hierarchical_summary.csv"), row.names = FALSE)
+        
+        # ==============================================================
+        # ALSO FIT SIMPLER MODEL (no interaction)
+        # ==============================================================
+        
+        cat("  Fitting simplified model (no interaction)...\n")
+        design_simple <- model.matrix(~ region + mets_status + MLH1 + age + sex + log_n_spots, data = meta_df)
+        
+        v_s <- voom(dge, design_simple)
+        corfit_s <- duplicateCorrelation(v_s, design_simple, block = meta_df$patient_id)
+        v_s <- voom(dge, design_simple, block = meta_df$patient_id, correlation = corfit_s$consensus)
+        corfit_s <- duplicateCorrelation(v_s, design_simple, block = meta_df$patient_id)
+        
+        fit_s <- lmFit(v_s, design_simple, block = meta_df$patient_id, correlation = corfit_s$consensus)
+        fit_s <- eBayes(fit_s)
+        
+        for (coef_name in c("regionIM", "regionStroma", "mets_statusLN_Mets", "mets_statusDistant_Mets")) {
+            if (!(coef_name %in% colnames(coef(fit_s)))) next
+            res <- topTable(fit_s, coef = coef_name, number = Inf, sort.by = "P")
+            res$gene <- rownames(res)
+            n_sig <- sum(res$adj.P.Val < 0.05, na.rm = TRUE)
+            cat(sprintf("    [simple] %s: %d DE genes\n", coef_name, n_sig))
+            write.csv(res, file.path(output_dir, paste0("hierarchical_simple_", coef_name, ".csv")), row.names = FALSE)
+        }
+        
+        # ==============================================================
+        # COMPARISON: hierarchical vs DESeq2
+        # ==============================================================
+        
+        deseq_summary_file <- file.path(input_dir, "DE_summary.csv")
+        if (file.exists(deseq_summary_file)) {
+            deseq_summary <- read.csv(deseq_summary_file)
+            cat("\n  DESeq2 vs hierarchical comparison:\n")
+            cat(sprintf("    %-35s %8s %8s\n", "Contrast", "DESeq2", "Hierarch"))
+            cat(paste(rep("-", 55), collapse=""), "\n")
+            
+            contrast_map <- list(
+                "IM_vs_CT__No_Mets" = "regionIM",
+                "Stroma_vs_CT__No_Mets" = "regionStroma",
+                "LN_vs_No__CT" = "mets_statusLN_Mets",
+                "Distant_vs_No__CT" = "mets_statusDistant_Mets"
+            )
+            
+            for (deseq_name in names(contrast_map)) {
+                hier_name <- contrast_map[[deseq_name]]
+                deseq_n <- deseq_summary$n_sig_005[deseq_summary$contrast == deseq_name]
+                hier_n <- summary_df$n_sig_005[summary_df$contrast == hier_name]
+                
+                if (length(deseq_n) > 0 && length(hier_n) > 0) {
+                    cat(sprintf("    %-35s %8d %8d\n", deseq_name, deseq_n[1], hier_n[1]))
+                }
+            }
+        }
+        
+    }, error = function(e) {
+        cat("  ERROR:", conditionMessage(e), "\n")
+    })
+}
+
+cat("\n\nAll cell types processed.\n")
+```
+

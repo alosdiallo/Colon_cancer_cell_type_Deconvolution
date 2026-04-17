@@ -1,0 +1,220 @@
+---
+title: "Untitled"
+author: "Alos Diallo"
+date: "2026-03-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ==============================================================
+# RCTD + C-SIDE Test on One Sample (127)
+# ==============================================================
+# Run this from R/RStudio
+# ==============================================================
+
+library(spacexr)
+library(Seurat)
+library(Matrix)
+library(zellkonverter)
+library(SingleCellExperiment)
+
+base_dir   <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples"
+sample_id  <- "127"
+
+# ==============================================================
+# STEP 1: Build RCTD Reference from atlas
+# ==============================================================
+cat("=== Step 1: Building Reference ===\n")
+
+atlas <- readRDS(file.path(base_dir, "atlas_data.rds"))
+
+# Extract raw counts — RCTD needs raw counts, not normalized
+counts_ref <- GetAssayData(atlas, layer = "counts")
+
+# If counts layer is empty, try slot approach for older Seurat
+if (ncol(counts_ref) == 0 || nrow(counts_ref) == 0) {
+  counts_ref <- atlas@assays$RNA@counts
+}
+
+cat("  Atlas dimensions:", nrow(counts_ref), "genes x", ncol(counts_ref), "cells\n")
+
+# Cell type annotations
+cell_types <- as.factor(atlas@meta.data$cl295v11SubFull)
+names(cell_types) <- colnames(atlas)
+
+cat("  Cell types:", nlevels(cell_types), "unique types\n")
+cat("  Top 10 most common:\n")
+print(head(sort(table(cell_types), decreasing = TRUE), 10))
+
+# Create Reference object
+# nUMI = total counts per cell (RCTD uses this internally)
+nUMI_ref <- colSums(counts_ref)
+# Fix cell type names — replace / with _
+cell_types <- as.factor(gsub("/", "_", as.character(cell_types)))
+names(cell_types) <- colnames(counts_ref)
+
+# Check what was fixed
+grep("_", levels(cell_types), value = TRUE)
+reference <- Reference(counts_ref, cell_types, nUMI_ref)
+cat("  Reference created successfully\n\n")
+
+# Free memory
+rm(atlas)
+gc()
+
+# ==============================================================
+# STEP 2: Load Visium sample 127
+# ==============================================================
+cat("=== Step 2: Loading Visium sample", sample_id, "===\n")
+
+sce <- readH5AD(file.path(base_dir, paste0(sample_id, ".h5ad")))
+
+# Raw counts
+counts_vis <- assay(sce, "X")
+if (!inherits(counts_vis, "dgCMatrix")) {
+  counts_vis <- as(counts_vis, "dgCMatrix")
+}
+cat("  Visium dimensions:", nrow(counts_vis), "genes x", ncol(counts_vis), "spots\n")
+
+# Spatial coordinates
+coords <- as.data.frame(reducedDim(sce, "spatial"))
+colnames(coords) <- c("x", "y")
+rownames(coords) <- colnames(sce)
+cat("  Coordinates loaded:", nrow(coords), "spots\n")
+
+# nUMI per spot
+nUMI_vis <- colSums(counts_vis)
+
+# Create SpatialRNA object
+spatial_rna <- SpatialRNA(coords, counts_vis, nUMI_vis)
+cat("  SpatialRNA created\n\n")
+
+# ==============================================================
+# STEP 3: Run RCTD
+# ==============================================================
+cat("=== Step 3: Running RCTD ===\n")
+cat("  This may take a few minutes...\n")
+
+rctd <- create.RCTD(spatial_rna, reference, max_cores = 4)
+
+# full mode: estimates all cell types per spot (best for Visium with mixed spots)
+rctd <- run.RCTD(rctd, doublet_mode = "full")
+
+cat("  RCTD complete\n")
+
+# Inspect results
+weights <- rctd@results$weights
+cat("  Weight matrix:", nrow(weights), "spots x", ncol(weights), "cell types\n")
+cat("  Cell types found:\n")
+print(colnames(weights))
+
+# Normalize weights to proportions
+weights_norm <- sweep(weights, 1, rowSums(weights), "/")
+cat("\n  Mean proportions (top 10):\n")
+means <- sort(colMeans(weights_norm), decreasing = TRUE)
+print(head(means, 10))
+
+# Save RCTD result
+saveRDS(rctd, file.path(base_dir, paste0("rctd_", sample_id, ".rds")))
+cat("  Saved to rctd_", sample_id, ".rds\n\n")
+
+# ==============================================================
+# STEP 4: Run C-SIDE (single sample test)
+# ==============================================================
+cat("=== Step 4: Running C-SIDE ===\n")
+# Define region covariate from histology
+histology <- colData(sce)$histology
+if (is.null(histology)) {
+  cat("  WARNING: No histology column found. Skipping C-SIDE.\n")
+  cat("  You'll need to add region labels manually.\n")
+} else {
+  # Binary covariate: CT = 1, non-CT = 0
+  region_binary <- as.numeric(histology == "cancer_cancer")
+  names(region_binary) <- colnames(sce)
+  
+  cat("  Region covariate: CT =", sum(region_binary == 1), 
+      "spots, non-CT =", sum(region_binary == 0), "spots\n")
+  
+  # Pick cell types to test — start with abundant ones
+  cat("\n  Checking cell type representation...\n")
+  for (ct in colnames(weights_norm)[1:min(10, ncol(weights_norm))]) {
+    n_spots_above_5pct <- sum(weights_norm[, ct] > 0.05)
+    cat(sprintf("    %s: %d spots > 5%%\n", ct, n_spots_above_5pct))
+  }
+  
+  tryCatch({
+    available_types <- colnames(weights_norm)
+    
+    # Find types with good representation
+    good_types <- c()
+    for (ct in available_types) {
+      if (sum(weights_norm[, ct] > 0.05) > 100) {
+        good_types <- c(good_types, ct)
+      }
+    }
+    cat("\n  Cell types with >100 spots above 5%:", paste(good_types, collapse = ", "), "\n")
+    
+    if (length(good_types) > 0) {
+      test_type <- good_types[1]
+      cat("  Running C-SIDE on:", test_type, "\n")
+      
+      # Build design matrix: X is n_barcodes x 1, rows = barcodes, col = covariate
+      barcodes_use <- colnames(rctd@spatialRNA@counts)
+      X <- matrix(region_binary[barcodes_use], ncol = 1)
+      rownames(X) <- barcodes_use
+      colnames(X) <- "CT_vs_nonCT"
+      
+      rctd_cside <- run.CSIDE(
+        myRCTD = rctd,
+        X = X,
+        barcodes = barcodes_use,
+        cell_types = test_type,
+        cell_type_threshold = 100,
+        test_mode = "individual",
+        doublet_mode = TRUE,
+        fdr = 0.05
+      )
+      
+      cat("  C-SIDE complete!\n")
+      
+      # Extract DE results
+      de_results <- rctd_cside@de_results$res_gene_list
+      cat("  DE results for", test_type, ":\n")
+      if (length(de_results) > 0) {
+        for (ct_name in names(de_results)) {
+          sig_genes <- de_results[[ct_name]]
+          n_sig <- nrow(sig_genes)
+          cat(sprintf("    %s: %d significant genes\n", ct_name, n_sig))
+          if (n_sig > 0) {
+            print(head(sig_genes, 10))
+          }
+        }
+      }
+      
+      saveRDS(rctd_cside, file.path(base_dir, paste0("cside_test_", sample_id, ".rds")))
+      cat("  Saved C-SIDE results\n")
+    } else {
+      cat("  No cell types with enough representation. Try lowering the threshold.\n")
+    }
+    
+  }, error = function(e) {
+    cat("  C-SIDE error:", conditionMessage(e), "\n")
+    cat("  This is expected for a first run — we may need to adjust parameters.\n")
+  })
+}
+
+cat("\n=== Done ===\n")
+cat("If RCTD worked (Step 3), the deconvolution is feasible.\n")
+cat("If C-SIDE worked (Step 4), cell-type-specific DE on spatial data is feasible.\n")
+cat("Next step: scale to all 41 samples with multi-sample meta-regression.\n")
+```
+
+
+```{r}
+
+```
+

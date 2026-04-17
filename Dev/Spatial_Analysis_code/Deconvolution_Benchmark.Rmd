@@ -1,0 +1,995 @@
+---
+title: "Deconvolution Benchmark: Cell2Location vs RCTD vs SpatialDecon"
+author: "Alos Diallo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 7)
+```
+
+# Overview
+
+This notebook benchmarks three spatial transcriptomics deconvolution methods
+— Cell2Location (C2L), RCTD, and SpatialDecon — on six Visium CRC samples
+(two per metastasis group). The goal is to compare how each method's cell-type
+estimates affect downstream pseudobulk differential expression.
+
+**Samples:** 0 (LN_Mets), 10 (No_Mets), 11 (Distant_Mets), 38 (No_Mets), 80 (Distant_Mets), 97 (LN_Mets)
+
+# 1. Configuration
+
+```{r config}
+samples_dir <- "/Users/adiallo/Desktop/Thesis/Data_Documents/All_Data/Visium_samples/Visium_Data/samples"
+prep_dir    <- file.path(samples_dir, "prepped_samples")
+rctd_dir    <- file.path(samples_dir, "RCTD_file")
+atlas_path  <- file.path(samples_dir, "atlas_data.rds")
+meta_path   <- "/Users/adiallo/Desktop/Thesis/Data_Documents/data_all.csv"
+
+benchmark_sids <- c("0", "10", "11", "38", "80", "97")
+
+output_dir <- file.path(samples_dir, "decon_benchmark")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r libraries}
+library(spacexr)
+library(SpatialDecon)
+library(Seurat)
+library(Matrix)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+library(UpSetR)
+library(patchwork)
+```
+
+# 2. Cell Type Mapping
+
+This mapping collapses the fine-grained c295 atlas labels into the broad
+categories used for DE analysis. Same mapping as the CellChat/RCTD pipelines.
+
+**Note on Tumor mapping:** The c295 atlas separates tumor cells from normal
+epithelium based on 10x channel loading (tumor vs adjacent normal tissue) and
+CNV-based classification — not expression clustering. Tumor cells are labeled
+`Tumor cE01`, `Tumor cE02`, etc. in the C2L reference (caught by `^Tumor`).
+In RCTD/SpatialDecon, the reference only has the non-neoplastic `cE01-cE11`
+profiles. Since our Visium tissue is CRC and the CT/IM regions are
+predominantly neoplastic, we map `cE*` → Tumor for all three methods. This is
+a pragmatic assumption — RCTD and SpatialDecon cannot truly distinguish
+malignant from non-malignant epithelium with this reference.
+
+```{r cell_type_mapping}
+map_c2l_to_celltype <- function(col_name) {
+  clean <- gsub("meanscell_abundance_w_sf_", "", col_name)
+  clean <- gsub("means_cell_abundance_w_sf_", "", clean)
+  if (grepl("^Tumor", clean)) return("Tumor")
+  # cE* (non-neoplastic epithelial subtypes) -> Tumor
+
+  # In CRC Visium, epithelial signal in CT/IM is predominantly neoplastic.
+  # The atlas does not cluster tumor cells into cE subtypes (see Pelka et al.);
+  # tumor identity comes from sample-of-origin metadata and CNV classification.
+  if (grepl("^cE", clean)) return("Tumor")
+  if (grepl("^cS", clean)) {
+    num <- as.integer(gsub("\\D", "", sub("\\s.*", "", clean)))
+    if (!is.na(num)) {
+      if (num >= 1 & num <= 14) return("Endothelial")
+      if (num == 32) return("Smooth_muscle")
+      if (num %in% c(27:31)) return("CAF")
+      if (num == 26) return("Myofibroblast")
+      if (num %in% c(22, 25)) return("Fibroblast")
+      if (num %in% c(15:20)) return("Pericyte")
+      if (num == 33) return("Schwann")
+    }
+    return("Fibroblast")
+  }
+  if (grepl("^cB", clean)) return("B_cell")
+  if (grepl("^cP", clean)) return("Plasma")
+  if (grepl("^cMA", clean)) return("Mast")
+  if (grepl("^cM", clean)) {
+    if (grepl("cM10", clean)) return("Granulocyte")
+    if (grepl("cM01|cM02", clean)) return("Macrophage")
+    return("DC")
+  }
+  if (grepl("^cTNI", clean)) {
+    num <- as.integer(gsub("\\D", "", sub("\\s.*", "", clean)))
+    if (!is.na(num)) {
+      if (num >= 1 & num <= 7) return("CD4_T")
+      if (num %in% c(8, 9)) return("Treg")
+      if (num %in% c(10:13)) return("CD8_T")
+      if (num %in% c(14:16)) return("CD8_T_exhausted")
+      if (num %in% c(17, 18)) return("gdT")
+      if (num %in% c(19:22)) return("Other_T")
+      if (num %in% c(23:25)) return("NK")
+      if (num == 26) return("ILC")
+    }
+    return("Other_T")
+  }
+  return("Other")
+}
+```
+
+# 3. Load Data
+
+## 3a. Load region annotations from h5ad-derived lookup
+
+Region annotations (CT/IM/Stroma/Other) live in the h5ad files and were not
+carried into the prepped `.rds` objects. We load them from a pre-generated
+lookup CSV.
+
+```{r load_regions}
+region_lookup <- read.csv(file.path(output_dir, "region_lookup.csv"),
+                          colClasses = c("character", "character", "character", "character"))
+cat("Region lookup:", nrow(region_lookup), "rows\n")
+cat("Samples:", paste(unique(region_lookup$sample_id), collapse = ", "), "\n")
+print(table(region_lookup$region))
+```
+
+## 3b. Prepped samples — extract C2L abundances
+
+```{r load_prepped}
+prepped <- list()
+c2l_all <- list()
+
+for (sid in benchmark_sids) {
+  cat("Loading prepped sample:", sid, "\n")
+  prep <- readRDS(file.path(prep_dir, paste0("prep_", sid, ".rds")))
+  prepped[[sid]] <- prep
+
+  # C2L aggregated abundances (already broad categories from prep pipeline)
+  c2l_agg <- as.data.frame(prep$c2l_agg)
+  c2l_agg$barcode <- rownames(c2l_agg)
+  c2l_agg$sample_id <- sid
+
+  # Attach region from lookup
+  rl <- region_lookup[region_lookup$sample_id == sid, ]
+  region_vec <- rl$region
+  names(region_vec) <- rl$barcode
+  c2l_agg$region <- region_vec[c2l_agg$barcode]
+
+  c2l_all[[sid]] <- c2l_agg
+  cat("  Spots:", nrow(c2l_agg), " | C2L cell types:", ncol(prep$c2l_agg),
+      " | IM spots:", sum(c2l_agg$region == "IM", na.rm = TRUE), "\n")
+}
+
+cat("\nC2L column names (broad cell types):\n")
+ct_cols <- setdiff(colnames(c2l_all[[1]]), c("barcode", "sample_id", "region"))
+print(ct_cols)
+```
+
+## 3b. RCTD results — extract proportions
+
+```{r load_rctd}
+rctd_all <- list()
+
+for (sid in benchmark_sids) {
+  cat("Loading RCTD for sample:", sid, "\n")
+  rctd_obj <- readRDS(file.path(rctd_dir, paste0("rctd_", sid, ".rds")))
+
+  # Extract weights and normalize to proportions
+  weights <- rctd_obj@results$weights
+  weights_norm <- sweep(weights, 1, rowSums(weights), "/")
+  weights_df <- as.data.frame(as.matrix(weights_norm))
+
+  # Map fine c295 labels to broad categories
+  fine_names <- colnames(weights_df)
+  broad_names <- sapply(fine_names, map_c2l_to_celltype, USE.NAMES = FALSE)
+
+  # Aggregate proportions by broad category
+  weights_broad <- data.frame(row.names = rownames(weights_df))
+  for (bt in unique(broad_names)) {
+    cols <- fine_names[broad_names == bt]
+    if (length(cols) == 1) {
+      weights_broad[[bt]] <- weights_df[[cols]]
+    } else {
+      weights_broad[[bt]] <- rowSums(weights_df[, cols, drop = FALSE])
+    }
+  }
+
+  weights_broad$barcode <- rownames(weights_broad)
+  weights_broad$sample_id <- sid
+
+  # Attach region from lookup
+  rl <- region_lookup[region_lookup$sample_id == sid, ]
+  region_vec <- rl$region
+  names(region_vec) <- rl$barcode
+  weights_broad$region <- region_vec[weights_broad$barcode]
+
+  rctd_all[[sid]] <- weights_broad
+  cat("  Spots:", nrow(weights_broad), " | Broad types:",
+      ncol(weights_broad) - 3, "\n")
+}
+
+cat("\nRCTD broad categories:\n")
+print(setdiff(colnames(rctd_all[[1]]), c("barcode", "sample_id", "region")))
+```
+
+## 3c. Build SpatialDecon profile matrix from atlas
+
+```{r build_spatialdecon_profile}
+cat("Loading atlas...\n")
+atlas <- readRDS(atlas_path)
+
+# Extract raw counts
+counts_ref <- tryCatch(
+  GetAssayData(atlas, layer = "counts"),
+  error = function(e) atlas@assays$RNA@counts
+)
+if (ncol(counts_ref) == 0 || nrow(counts_ref) == 0) {
+  counts_ref <- atlas@assays$RNA@counts
+}
+cat("Atlas:", nrow(counts_ref), "genes x", ncol(counts_ref), "cells\n")
+
+# Map fine labels to broad
+fine_labels <- as.character(atlas@meta.data$cl295v11SubFull)
+fine_labels <- gsub("/", "_", fine_labels)
+broad_labels <- sapply(fine_labels, map_c2l_to_celltype, USE.NAMES = FALSE)
+names(broad_labels) <- colnames(counts_ref)
+
+cat("Broad cell types in atlas:", length(unique(broad_labels)), "\n")
+print(sort(table(broad_labels), decreasing = TRUE))
+
+# Profile matrix: mean expression per broad cell type (genes x cell_types)
+cat("\nBuilding profile matrix...\n")
+unique_types <- sort(unique(broad_labels))
+profile_matrix <- matrix(0, nrow = nrow(counts_ref), ncol = length(unique_types),
+                         dimnames = list(rownames(counts_ref), unique_types))
+
+for (ct in unique_types) {
+  ct_cells <- which(broad_labels == ct)
+  if (length(ct_cells) > 0) {
+    profile_matrix[, ct] <- Matrix::rowMeans(counts_ref[, ct_cells, drop = FALSE])
+  }
+}
+
+cat("Profile matrix:", nrow(profile_matrix), "genes x", ncol(profile_matrix), "types\n")
+rm(atlas, counts_ref, fine_labels, broad_labels); gc()
+```
+
+## 3d. Run SpatialDecon
+
+```{r run_spatialdecon}
+spatialdecon_all <- list()
+
+for (sid in benchmark_sids) {
+  cat("\n=== SpatialDecon on sample:", sid, "===\n")
+  prep <- prepped[[sid]]
+
+  # Normalized counts from Seurat
+  norm_data <- tryCatch(
+    as.matrix(GetAssayData(prep$seu, layer = "data", assay = "RNA")),
+    error = function(e) as.matrix(GetAssayData(prep$seu, slot = "data", assay = "RNA"))
+  )
+  cat("  Norm data:", nrow(norm_data), "x", ncol(norm_data), "\n")
+
+  # Intersect genes
+  shared_genes <- intersect(rownames(profile_matrix), rownames(norm_data))
+  cat("  Shared genes:", length(shared_genes), "\n")
+
+  norm_sub <- norm_data[shared_genes, ]
+  profile_sub <- profile_matrix[shared_genes, ]
+
+  # Background estimate: small constant for Visium
+  # SpatialDecon was designed for GeoMx where negative probes provide
+  # background directly. For Visium, a small constant is standard practice.
+  bg <- matrix(0.01, nrow = nrow(norm_sub), ncol = ncol(norm_sub),
+               dimnames = dimnames(norm_sub))
+
+  cat("  Running spatialdecon...\n")
+  res <- tryCatch({
+    spatialdecon(norm = norm_sub, bg = bg, X = profile_sub, align_genes = TRUE)
+  }, error = function(e) {
+    cat("  ERROR:", conditionMessage(e), "\n")
+    NULL
+  })
+
+  if (is.null(res)) next
+
+  # beta: cell_types x spots -> transpose to spots x cell_types
+  beta <- as.data.frame(t(res$beta))
+  row_sums <- rowSums(beta); row_sums[row_sums == 0] <- 1
+  beta_prop <- beta / row_sums
+
+  beta_prop$barcode <- rownames(beta_prop)
+  beta_prop$sample_id <- sid
+  rl <- region_lookup[region_lookup$sample_id == sid, ]
+  region_vec <- rl$region
+  names(region_vec) <- rl$barcode
+  beta_prop$region <- region_vec[beta_prop$barcode]
+
+  spatialdecon_all[[sid]] <- beta_prop
+  cat("  Done:", nrow(beta_prop), "spots,", ncol(beta_prop) - 3, "cell types\n")
+
+  # Save full result (includes reverseDecon residuals)
+  saveRDS(res, file.path(output_dir, paste0("spatialdecon_full_", sid, ".rds")))
+}
+```
+
+# 4. Sanity Check: Marker Gene Correlation
+
+Verify that each method's cell-type scores correlate with canonical marker
+gene expression at the spot level.
+
+```{r marker_correlation, fig.width=12, fig.height=8}
+markers <- list(
+  Tumor             = c("EPCAM", "KRT20", "CDH1"),
+  CD8_T             = c("CD8A", "CD8B", "TCF7", "IL7R", "LEF1", "SELL"),
+  CD8_T_exhausted   = c("CXCL13", "TOX", "ENTPD1", "HAVCR2", "TIGIT", "PDCD1"),
+  Macrophage        = c("CD68", "CD163", "CSF1R"),
+  CAF               = c("FAP", "ACTA2", "COL1A1", "COL3A1"),
+  DC                = c("CLEC9A", "CD1C", "FCER1A"),
+  Treg              = c("FOXP3", "IL2RA", "CTLA4", "TIGIT")
+)
+
+cor_results <- list()
+
+for (sid in benchmark_sids) {
+  prep <- prepped[[sid]]
+  expr <- tryCatch(
+    as.matrix(GetAssayData(prep$seu, layer = "data", assay = "RNA")),
+    error = function(e) as.matrix(GetAssayData(prep$seu, slot = "data", assay = "RNA"))
+  )
+
+  for (ct in names(markers)) {
+    avail <- intersect(markers[[ct]], rownames(expr))
+    if (length(avail) == 0) next
+    marker_score <- if (length(avail) == 1) expr[avail, ] else colMeans(expr[avail, , drop = FALSE])
+
+    for (method in c("C2L", "RCTD", "SpatialDecon")) {
+      df <- switch(method,
+                   "C2L" = c2l_all[[sid]],
+                   "RCTD" = rctd_all[[sid]],
+                   "SpatialDecon" = spatialdecon_all[[sid]])
+      if (is.null(df) || !(ct %in% colnames(df))) next
+
+      shared_bc <- intersect(names(marker_score), df$barcode)
+      if (length(shared_bc) < 50) next
+
+      r <- cor(df[[ct]][match(shared_bc, df$barcode)],
+               marker_score[shared_bc],
+               method = "spearman", use = "complete.obs")
+
+      cor_results[[length(cor_results) + 1]] <- data.frame(
+        sample = sid, cell_type = ct, method = method, spearman_r = r,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+cor_df <- do.call(rbind, cor_results)
+
+ggplot(cor_df, aes(x = method, y = spearman_r, fill = method)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1.5) +
+  facet_wrap(~cell_type, scales = "free_y", ncol = 4) +
+  theme_bw() +
+  labs(title = "Marker Gene Correlation by Method",
+       subtitle = "Spearman r: deconvolution score vs mean marker expression per spot",
+       y = "Spearman r", x = "") +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(output_dir, "marker_correlation_boxplot.pdf"), width = 12, height = 8)
+
+cor_df %>%
+  group_by(cell_type, method) %>%
+  summarise(mean_r = round(mean(spearman_r, na.rm = TRUE), 3),
+            sd_r = round(sd(spearman_r, na.rm = TRUE), 3), .groups = "drop") %>%
+  pivot_wider(names_from = method, values_from = c(mean_r, sd_r)) %>%
+  print()
+```
+
+# 5. Pathology Validation: Tumor Deconvolution vs Pathologist Annotations
+
+The pathologist annotated each spot with a histology label (`cancer_cancer`
+for tumor). This is independent of all three deconvolution methods and serves
+as external ground truth. For each method, we ask: in spots the pathologist
+called cancer, how much of the deconvolution signal is attributed to Tumor?
+And conversely, in spots called benign, is the Tumor score low?
+
+This directly validates whether mapping `cE*` → Tumor is reasonable.
+
+```{r pathology_validation, fig.width=12, fig.height=10}
+path_results <- list()
+
+for (sid in benchmark_sids) {
+  prep <- prepped[[sid]]
+  
+  # Pathologist histology labels
+  histology <- prep$meta$histology
+  names(histology) <- rownames(prep$meta)
+  
+  # Binary: cancer vs non-cancer
+  is_cancer <- rep("Non-cancer", length(histology))
+  is_cancer[histology == "cancer_cancer"] <- "Cancer"
+  names(is_cancer) <- names(histology)
+  
+  for (method in c("C2L", "RCTD", "SpatialDecon")) {
+    df <- switch(method,
+                 "C2L" = c2l_all[[sid]],
+                 "RCTD" = rctd_all[[sid]],
+                 "SpatialDecon" = spatialdecon_all[[sid]])
+    if (is.null(df) || !("Tumor" %in% colnames(df))) next
+    
+    shared_bc <- intersect(names(is_cancer), df$barcode)
+    if (length(shared_bc) < 50) next
+    
+    tumor_score <- df$Tumor[match(shared_bc, df$barcode)]
+    path_label <- is_cancer[shared_bc]
+    
+    path_results[[length(path_results) + 1]] <- data.frame(
+      sample = sid,
+      method = method,
+      barcode = shared_bc,
+      pathology = path_label,
+      tumor_score = tumor_score,
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+path_df <- do.call(rbind, path_results)
+
+# --- Box plot: Tumor score by pathology label and method ---
+ggplot(path_df, aes(x = pathology, y = tumor_score, fill = method)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.3, outlier.alpha = 0.2) +
+  facet_wrap(~sample, ncol = 3) +
+  theme_bw() +
+  labs(title = "Tumor Deconvolution Score vs Pathologist Annotation",
+       subtitle = "Spots labeled 'cancer_cancer' by pathologist should have higher Tumor scores",
+       y = "Tumor score (proportion or abundance)", x = "Pathologist label") +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(output_dir, "pathology_validation_boxplot.pdf"), width = 12, height = 10)
+
+# --- ROC-like analysis: can each method's Tumor score discriminate cancer? ---
+library(pROC)
+
+auc_results <- list()
+
+for (sid in benchmark_sids) {
+  for (method in c("C2L", "RCTD", "SpatialDecon")) {
+    sub <- path_df[path_df$sample == sid & path_df$method == method, ]
+    if (nrow(sub) < 50 || length(unique(sub$pathology)) < 2) next
+    
+    binary <- ifelse(sub$pathology == "Cancer", 1, 0)
+    
+    roc_obj <- tryCatch(
+      roc(binary, sub$tumor_score, quiet = TRUE),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(roc_obj)) {
+      auc_results[[length(auc_results) + 1]] <- data.frame(
+        sample = sid, method = method,
+        auc = round(as.numeric(auc(roc_obj)), 3),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+if (length(auc_results) > 0) {
+  auc_df <- do.call(rbind, auc_results)
+  
+  cat("\nAUC: Tumor score predicting pathologist cancer label\n")
+  print(auc_df)
+  
+  ggplot(auc_df, aes(x = method, y = auc, fill = method)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.2, size = 2) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+    ylim(0.4, 1.0) +
+    theme_bw() +
+    labs(title = "AUC: Tumor Score vs Pathologist Cancer Annotation",
+         subtitle = "Higher AUC = better agreement with pathology ground truth",
+         y = "AUC", x = "") +
+    theme(legend.position = "bottom")
+  
+  ggsave(file.path(output_dir, "pathology_validation_auc.pdf"), width = 8, height = 6)
+  write.csv(auc_df, file.path(output_dir, "pathology_validation_auc.csv"), row.names = FALSE)
+  
+  # Summary by method
+  auc_df %>%
+    group_by(method) %>%
+    summarise(mean_auc = round(mean(auc), 3),
+              sd_auc = round(sd(auc), 3),
+              min_auc = min(auc),
+              max_auc = max(auc), .groups = "drop") %>%
+    print()
+}
+```
+
+# 6. Build Pseudobulk (IM Region)
+
+Weight raw counts by cell-type proportions within the IM, aggregate per sample.
+
+```{r pseudobulk}
+de_types <- c("Tumor", "CD8_T_exhausted", "CD8_T", "CAF", "DC", "Macrophage", "Treg")
+
+build_pseudobulk <- function(method_list, de_types, prepped) {
+  pb_counts <- list()
+  pb_meta   <- list()
+
+  for (ct in de_types) {
+    cat("  Pseudobulk:", ct, "\n")
+    ct_counts <- list()
+    ct_meta   <- list()
+
+    for (sid in names(method_list)) {
+      df <- method_list[[sid]]
+      prep <- prepped[[sid]]
+      if (!(ct %in% colnames(df))) next
+
+      im_mask <- !is.na(df$region) & df$region == "IM"
+      df_im <- df[im_mask, ]
+      if (nrow(df_im) < 10) next
+
+      raw <- tryCatch(
+        GetAssayData(prep$seu, layer = "counts", assay = "RNA"),
+        error = function(e) GetAssayData(prep$seu, slot = "counts", assay = "RNA")
+      )
+
+      shared_bc <- intersect(df_im$barcode, colnames(raw))
+      if (length(shared_bc) < 10) next
+
+      w <- df_im[[ct]][match(shared_bc, df_im$barcode)]
+      w[is.na(w)] <- 0
+      if (sum(w) == 0) next
+
+      pb <- as.numeric(raw[, shared_bc, drop = FALSE] %*% w)
+      names(pb) <- rownames(raw)
+
+      lab <- paste0(sid, "_IM")
+      ct_counts[[lab]] <- pb
+      ct_meta[[lab]] <- data.frame(
+        sample_label = lab, patient_id = sid, region = "IM",
+        n_spots = length(shared_bc), sum_weight = sum(w),
+        stringsAsFactors = FALSE
+      )
+    }
+
+    if (length(ct_counts) >= 4) {
+      pb_counts[[ct]] <- do.call(cbind, ct_counts)
+      pb_meta[[ct]]   <- do.call(rbind, ct_meta)
+    } else {
+      cat("    <4 samples, skipping\n")
+    }
+  }
+  list(counts = pb_counts, meta = pb_meta)
+}
+
+cat("=== C2L ===\n");          pb_c2l    <- build_pseudobulk(c2l_all, de_types, prepped)
+cat("\n=== RCTD ===\n");       pb_rctd   <- build_pseudobulk(rctd_all, de_types, prepped)
+cat("\n=== SpatialDecon ===\n"); pb_sdecon <- build_pseudobulk(spatialdecon_all, de_types, prepped)
+```
+
+# 7. Differential Expression
+
+Simplified limma model (n=6 is too small for the full interaction model).
+
+```{r de_analysis}
+clinical <- read.csv(meta_path)
+
+# Derive mets_status from Distant_Mets and ln_only (same logic as Table 1 notebook)
+clinical$mets <- ifelse(toupper(as.character(clinical$Distant_Mets)) %in% c("TRUE", "T"), "Distant_Mets",
+                 ifelse(toupper(as.character(clinical$ln_only)) %in% c("TRUE", "T"), "LN_Mets",
+                        "No_Mets"))
+
+# Sample ID column
+clinical$sid <- as.character(clinical$deident)
+
+cat("Mets distribution:\n")
+print(table(clinical$mets))
+
+run_de <- function(count_mat, meta_df, clinical) {
+  meta_df$mets_status <- clinical$mets[match(meta_df$patient_id, clinical$sid)]
+  meta_df$mets_status <- factor(meta_df$mets_status,
+                                 levels = c("No_Mets", "LN_Mets", "Distant_Mets"))
+  meta_df$log_n_spots <- log(meta_df$n_spots)
+
+  dge <- DGEList(counts = count_mat)
+  keep <- filterByExpr(dge, group = meta_df$mets_status)
+  dge <- dge[keep, , keep.lib.sizes = FALSE]
+  dge <- calcNormFactors(dge)
+  if (nrow(dge) < 50) return(NULL)
+
+  design <- model.matrix(~ mets_status + log_n_spots, data = meta_df)
+  v <- voom(dge, design)
+  fit <- lmFit(v, design)
+  fit <- eBayes(fit)
+
+  results <- list()
+  for (coef_name in colnames(coef(fit))) {
+    if (coef_name %in% c("(Intercept)", "log_n_spots")) next
+    res <- topTable(fit, coef = coef_name, number = Inf, sort.by = "P")
+    res$gene <- rownames(res)
+    res$contrast <- coef_name
+    results[[coef_name]] <- res
+  }
+  results
+}
+
+de_results <- list()
+
+for (ct in de_types) {
+  cat("\n--- DE:", ct, "---\n")
+  for (mn in c("C2L", "RCTD", "SpatialDecon")) {
+    pb <- switch(mn, "C2L" = pb_c2l, "RCTD" = pb_rctd, "SpatialDecon" = pb_sdecon)
+    if (is.null(pb$counts[[ct]])) { cat("  ", mn, ": skipped\n"); next }
+
+    cat("  ", mn, ":")
+    res <- tryCatch(run_de(pb$counts[[ct]], pb$meta[[ct]], clinical),
+                    error = function(e) { cat(" ERROR\n"); NULL })
+    if (!is.null(res)) {
+      for (k in names(res)) {
+        n <- sum(res[[k]]$adj.P.Val < 0.05, na.rm = TRUE)
+        cat(" ", k, "=", n, ";")
+      }
+      cat("\n")
+      de_results[[paste0(ct, "__", mn)]] <- res
+    }
+  }
+}
+```
+
+# 8. Gene List Overlap (Jaccard)
+
+```{r gene_overlap}
+overlap_rows <- list()
+
+for (ct in de_types) {
+  for (contrast in c("mets_statusLN_Mets", "mets_statusDistant_Mets")) {
+    gl <- list()
+    for (m in c("C2L", "RCTD", "SpatialDecon")) {
+      key <- paste0(ct, "__", m)
+      if (!is.null(de_results[[key]][[contrast]])) {
+        sig <- de_results[[key]][[contrast]]$gene[
+          de_results[[key]][[contrast]]$adj.P.Val < 0.05]
+        if (length(sig) > 0) gl[[m]] <- sig
+      }
+    }
+
+    if (length(gl) >= 2) {
+      ms <- names(gl)
+      for (i in 1:(length(ms)-1)) for (j in (i+1):length(ms)) {
+        a <- gl[[ms[i]]]; b <- gl[[ms[j]]]
+        overlap_rows[[length(overlap_rows)+1]] <- data.frame(
+          cell_type = ct, contrast = contrast,
+          method_a = ms[i], method_b = ms[j],
+          n_a = length(a), n_b = length(b),
+          n_shared = length(intersect(a, b)),
+          jaccard = round(length(intersect(a,b)) / length(union(a,b)), 3),
+          stringsAsFactors = FALSE
+        )
+      }
+
+      # UpSet if 3 methods
+      if (length(gl) == 3) {
+        all_g <- unique(unlist(gl))
+        ud <- data.frame(row.names = all_g)
+        for (m in names(gl)) ud[[m]] <- as.integer(all_g %in% gl[[m]])
+        if (nrow(ud) > 0) {
+          tryCatch(print(upset(ud, sets = names(gl), order.by = "freq",
+                               main.bar.color = "steelblue",
+                               text.scale = 1.3)),
+                   error = function(e) NULL)
+        }
+      }
+    }
+  }
+}
+
+if (length(overlap_rows) > 0) {
+  overlap_df <- do.call(rbind, overlap_rows)
+  print(overlap_df)
+  write.csv(overlap_df, file.path(output_dir, "gene_overlap_jaccard.csv"), row.names = FALSE)
+}
+```
+
+# 9. Effect Size Correlation
+
+```{r lfc_correlation, fig.width=8, fig.height=6}
+lfc_all <- list()
+
+for (ct in de_types) {
+  for (contrast in c("mets_statusLN_Mets", "mets_statusDistant_Mets")) {
+    lfc_list <- list()
+    for (m in c("C2L", "RCTD", "SpatialDecon")) {
+      key <- paste0(ct, "__", m)
+      if (!is.null(de_results[[key]][[contrast]])) {
+        d <- de_results[[key]][[contrast]][, c("gene", "logFC", "adj.P.Val")]
+        colnames(d)[2:3] <- paste0(c("logFC_", "padj_"), m)
+        lfc_list[[m]] <- d
+      }
+    }
+    if (length(lfc_list) < 2) next
+
+    merged <- lfc_list[[1]]
+    for (i in 2:length(lfc_list)) merged <- merge(merged, lfc_list[[i]], by = "gene")
+    if (nrow(merged) < 50) next
+
+    merged$cell_type <- ct; merged$contrast <- contrast
+    lfc_all[[length(lfc_all)+1]] <- merged
+
+    # Scatter plots
+    ms <- names(lfc_list)
+    for (i in 1:(length(ms)-1)) for (j in (i+1):length(ms)) {
+      c1 <- paste0("logFC_", ms[i]); c2 <- paste0("logFC_", ms[j])
+      r <- cor(merged[[c1]], merged[[c2]], use = "complete.obs")
+      p <- ggplot(merged, aes(.data[[c1]], .data[[c2]])) +
+        geom_point(alpha = 0.3, size = 0.8) +
+        geom_abline(slope = 1, intercept = 0, lty = 2, color = "red") +
+        geom_smooth(method = "lm", se = FALSE, color = "blue", linewidth = 0.5) +
+        labs(title = paste0(ct, " | ", gsub("mets_status", "", contrast)),
+             subtitle = paste0(ms[i], " vs ", ms[j], " | r = ", round(r, 3))) +
+        theme_bw()
+      print(p)
+    }
+  }
+}
+
+if (length(lfc_all) > 0) {
+  write.csv(do.call(rbind, lfc_all),
+            file.path(output_dir, "lfc_comparison.csv"), row.names = FALSE)
+}
+```
+
+# 10. Summary Table
+
+```{r summary_table, fig.width=10, fig.height=8}
+rows <- list()
+for (ct in de_types) {
+  for (contrast in c("mets_statusLN_Mets", "mets_statusDistant_Mets")) {
+    for (m in c("C2L", "RCTD", "SpatialDecon")) {
+      key <- paste0(ct, "__", m)
+      if (!is.null(de_results[[key]][[contrast]])) {
+        r <- de_results[[key]][[contrast]]
+        ns <- sum(r$adj.P.Val < 0.05, na.rm = TRUE)
+        top <- r[1, ]
+        rows[[length(rows)+1]] <- data.frame(
+          cell_type = ct, contrast = contrast, method = m,
+          n_sig = ns,
+          n_up = sum(r$adj.P.Val < 0.05 & r$logFC > 0, na.rm = TRUE),
+          n_down = sum(r$adj.P.Val < 0.05 & r$logFC < 0, na.rm = TRUE),
+          top_gene = top$gene,
+          top_padj = signif(top$adj.P.Val, 3),
+          top_lfc = round(top$logFC, 2),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+}
+
+if (length(rows) > 0) {
+  summary_df <- do.call(rbind, rows)
+  print(summary_df)
+  write.csv(summary_df, file.path(output_dir, "de_summary_comparison.csv"), row.names = FALSE)
+
+  # Heatmap
+  summary_df %>%
+    mutate(label = paste0(cell_type, "\n", gsub("mets_status", "", contrast))) %>%
+    select(label, method, n_sig) %>%
+    pivot_wider(names_from = method, values_from = n_sig, values_fill = 0) -> sw
+
+  mat <- as.matrix(sw[, -1]); rownames(mat) <- sw$label
+  pheatmap(mat, cluster_rows = FALSE, cluster_cols = FALSE,
+           display_numbers = TRUE, number_format = "%d",
+           main = "DE Genes (FDR < 0.05) by Method",
+           color = colorRampPalette(c("white", "steelblue", "darkblue"))(50))
+}
+```
+
+# 11. reverseDecon: Cell-Mixing vs Within-Cell-Type Variation
+
+```{r reverse_decon, fig.width=8, fig.height=6}
+for (sid in benchmark_sids) {
+  rds_path <- file.path(output_dir, paste0("spatialdecon_full_", sid, ".rds"))
+  if (!file.exists(rds_path)) next
+
+  res <- readRDS(rds_path)
+  if (is.null(res$resids) || is.null(res$yhat)) next
+
+  cat("\n=== reverseDecon: sample", sid, "===\n")
+
+  observed <- res$yhat + res$resids
+  fitted <- res$yhat
+
+  gene_cors <- sapply(seq_len(nrow(observed)), function(i)
+    cor(observed[i,], fitted[i,], use = "complete.obs"))
+  names(gene_cors) <- rownames(observed)
+  resid_sd <- apply(res$resids, 1, sd, na.rm = TRUE)
+
+  rdf <- data.frame(gene = names(gene_cors),
+                     mixing_cor = gene_cors,
+                     resid_sd = resid_sd[names(gene_cors)])
+
+  p <- ggplot(rdf, aes(mixing_cor, resid_sd)) +
+    geom_point(alpha = 0.2, size = 0.5) +
+    labs(title = paste("Sample", sid, "— reverseDecon"),
+         x = "Correlation with cell-mixing prediction",
+         y = "Residual SD") +
+    theme_bw()
+
+  # Highlight DE genes
+  for (ct in de_types) {
+    key <- paste0(ct, "__SpatialDecon")
+    if (!is.null(de_results[[key]])) {
+      for (cn in names(de_results[[key]])) {
+        top_de <- de_results[[key]][[cn]]$gene[de_results[[key]][[cn]]$adj.P.Val < 0.05]
+        hl <- rdf[rdf$gene %in% head(top_de, 10), ]
+        if (nrow(hl) > 0) {
+          p <- p + geom_point(data = hl, color = "red", size = 2) +
+            ggrepel::geom_text_repel(data = hl, aes(label = gene),
+                                      color = "red", size = 3, max.overlaps = 15)
+        }
+      }
+    }
+  }
+  print(p)
+  ggsave(file.path(output_dir, paste0("reversedecon_", sid, ".pdf")), p, width = 8, height = 6)
+}
+```
+
+# 12. Spatial Validation: Where Are the Top DE Genes Expressed?
+
+For each method's top DE genes, plot their expression on the tissue alongside
+the region annotations. If a gene is called DE in the IM, it should be
+spatially enriched in the IM — not scattered uniformly or concentrated in the
+CT. This is the architectural sanity check.
+
+```{r spatial_validation, fig.width=16, fig.height=20}
+n_top_genes <- 5  # top DE genes to plot per method/contrast
+
+for (ct in de_types) {
+  for (contrast in c("mets_statusLN_Mets", "mets_statusDistant_Mets")) {
+
+    # Collect top genes from each method
+    top_genes_by_method <- list()
+    for (m in c("C2L", "RCTD", "SpatialDecon")) {
+      key <- paste0(ct, "__", m)
+      if (!is.null(de_results[[key]][[contrast]])) {
+        res <- de_results[[key]][[contrast]]
+        sig <- res[res$adj.P.Val < 0.05, ]
+        if (nrow(sig) > 0) {
+          sig <- sig[order(sig$adj.P.Val), ]
+          top_genes_by_method[[m]] <- head(sig$gene, n_top_genes)
+        }
+      }
+    }
+
+    if (length(top_genes_by_method) == 0) next
+
+    # Union of all top genes across methods
+    all_top <- unique(unlist(top_genes_by_method))
+    if (length(all_top) == 0) next
+
+    cat("\n=== Spatial plots:", ct, "|", contrast, "===\n")
+    cat("  Genes:", paste(all_top, collapse = ", "), "\n")
+
+    # Which methods nominated each gene
+    gene_source <- sapply(all_top, function(g) {
+      paste(names(top_genes_by_method)[sapply(top_genes_by_method, function(x) g %in% x)],
+            collapse = "+")
+    })
+
+    # Plot on each benchmark sample
+    for (sid in benchmark_sids) {
+      prep <- prepped[[sid]]
+
+      expr <- tryCatch(
+        as.matrix(GetAssayData(prep$seu, layer = "data", assay = "RNA")),
+        error = function(e) as.matrix(GetAssayData(prep$seu, slot = "data", assay = "RNA"))
+      )
+
+      coords <- as.data.frame(prep$coords)
+      colnames(coords)[1:2] <- c("x", "y")
+      coords$barcode <- rownames(coords)
+
+      meta <- region_lookup[region_lookup$sample_id == sid, c("barcode", "region")]
+
+      # Merge coords + region
+      plot_base <- merge(coords, meta[, c("barcode", "region")], by = "barcode")
+
+      # Check which genes are available
+      available <- intersect(all_top, rownames(expr))
+      if (length(available) == 0) next
+
+      # Get mets group for this sample
+      mets_grp <- clinical$mets[match(sid, clinical$sid)]
+
+      # Build plot list: region map + one per gene
+      plot_list <- list()
+
+      # Region reference map
+      p_region <- ggplot(plot_base, aes(x = x, y = -y, color = region)) +
+        geom_point(size = 0.3) +
+        scale_color_manual(values = c("CT" = "#E41A1C", "IM" = "#FF7F00",
+                                       "Stroma" = "#377EB8", "Other" = "grey70")) +
+        labs(title = paste0("Sample ", sid, " (", mets_grp, ") — Regions")) +
+        theme_void() + theme(legend.position = "bottom",
+                              plot.title = element_text(size = 10, face = "bold")) +
+        coord_fixed()
+      plot_list[["region"]] <- p_region
+
+      # Gene expression maps
+      for (gene in available) {
+        gexpr <- expr[gene, ]
+        gdf <- data.frame(barcode = names(gexpr), expression = as.numeric(gexpr))
+        gdf <- merge(plot_base, gdf, by = "barcode")
+
+        source_label <- gene_source[gene]
+
+        p_gene <- ggplot(gdf, aes(x = x, y = -y, color = expression)) +
+          geom_point(size = 0.3) +
+          scale_color_viridis_c(option = "inferno") +
+          labs(title = paste0(gene, " [", source_label, "]"),
+               color = "log-norm\nexpr") +
+          theme_void() + theme(legend.position = "right",
+                                plot.title = element_text(size = 9)) +
+          coord_fixed()
+
+        # Overlay IM boundary as a subtle outline
+        im_spots <- plot_base[plot_base$region == "IM", ]
+        if (nrow(im_spots) > 10) {
+          p_gene <- p_gene +
+            geom_point(data = im_spots, aes(x = x, y = -y),
+                       color = "white", size = 0.5, shape = 1, alpha = 0.3,
+                       inherit.aes = FALSE)
+        }
+
+        plot_list[[gene]] <- p_gene
+      }
+
+      # Arrange: region map + gene maps
+      n_plots <- length(plot_list)
+      ncols <- min(4, n_plots)
+      nrows <- ceiling(n_plots / ncols)
+
+      combined <- wrap_plots(plot_list, ncol = ncols) +
+        plot_annotation(
+          title = paste0(ct, " DE genes | ", gsub("mets_status", "", contrast),
+                         " | Sample ", sid, " (", mets_grp, ")"),
+          theme = theme(plot.title = element_text(size = 12, face = "bold"))
+        )
+      print(combined)
+
+      ggsave(file.path(output_dir,
+                        paste0("spatial_DE_", ct, "_", gsub("mets_status", "", contrast),
+                               "_sample", sid, ".pdf")),
+             combined, width = 16, height = 4 * nrows)
+    }
+  }
+}
+```
+
+# 13. Save Results
+
+```{r save}
+save(de_results, cor_df, pb_c2l, pb_rctd, pb_sdecon,
+     c2l_all, rctd_all, spatialdecon_all,
+     file = file.path(output_dir, "benchmark_results.RData"))
+
+cat("\nResults saved to:", output_dir, "\n")
+cat("  de_summary_comparison.csv\n")
+cat("  gene_overlap_jaccard.csv\n")
+cat("  lfc_comparison.csv\n")
+cat("  marker_correlation_boxplot.pdf\n")
+cat("  reversedecon_*.pdf\n")
+cat("  spatial_DE_*.pdf\n")
+cat("  benchmark_results.RData\n")
+```
+
+```{r session_info}
+sessionInfo()
+```
